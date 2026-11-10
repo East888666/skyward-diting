@@ -1,0 +1,150 @@
+[device]
+codename = "diting"
+brand = "Redmi"
+model = "Redmi K50 Ultra"
+ab = true
+soc = { hans = "第一代骁龙®8+移动平台", hant = "Snapdragon® 8+ Gen 1 行動平台", en = "Snapdragon® 8+ Gen 1 Mobile Platform" }
+os_version_prop = "ro.mi.os.version.incremental"
+
+[display]
+# ro.vendor.display.default_size in the stock recovery's prop.default.
+width = 1220
+height = 2712
+density = 480
+diagonal = 6.67
+
+# The recovery's charger_fstab.qti already mounts modem at
+# /vendor/firmware_mnt; init.recovery.hardware.rc binds its image folder
+# over /vendor/firmware. No additional [firmware] mount is needed.
+# Its ramdisk also already carries libsysutils.so and libcap.so for logd.
+
+[modules]
+# vendor_boot carries a generic goodix_core without the L12 binding.
+# Prefer this build's vendor_dlkm modules, whose ST and Goodix drivers
+# both handle xiaomi,l12-spi and detect which controller is fitted. Their
+# dependencies include xiaomi_touch. The stock modules.load lists both.
+sources = ["vendor_dlkm", "vendor_boot", "vendor"]
+load = ["goodix_core", "fts_touch_spi", "qcom-hv-haptics"]
+# First-stage init loads the generic Goodix module before Skyward. Replace
+# that unbound copy with the L12 driver, unless it already owns a device.
+reload = ["goodix_core"]
+# The modem image mounted over /vendor/firmware hides these files. Read
+# them from the vendor partition without its child mounts before probing.
+firmware = [
+    { name = "goodix_cfg_group_l12.bin", partition = "vendor", path = "firmware/goodix_cfg_group_l12.bin" },
+    { name = "goodix_cfg_group_l12_new.bin", partition = "vendor", path = "firmware/goodix_cfg_group_l12_new.bin" },
+    { name = "goodix_firmware_l12.bin", partition = "vendor", path = "firmware/goodix_firmware_l12.bin" },
+    { name = "goodix_firmware_l12_new.bin", partition = "vendor", path = "firmware/goodix_firmware_l12_new.bin" },
+    { name = "st_fts_l12.ftb", partition = "vendor", path = "firmware/st_fts_l12.ftb" },
+]
+
+# The L12 drivers report touches themselves. This vendor/odm has neither
+# touch_report nor touchsensor, even though its shared init script names
+# them. No host touch-processing service is started.
+
+# Persist is listed in vendor_boot's fstab.qcom, but not the recovery's
+# charger fstab. qseecomd's secure-storage listeners use it.
+[partitions]
+mounted = ["persist"]
+
+# This stock recovery carries no Binder service directory. Start the
+# installed system's directory before KeyMint tries to register with it.
+[[service]]
+path = "/mnt/system/system/bin/servicemanager"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_property = "servicemanager.ready"
+user = "system"
+groups = ["system", "readproc"]
+
+# Run the stock CPU/power setup with the accounts from init.qti.kernel.rc.
+[[service]]
+path = "/vendor/bin/sh"
+args = ["/vendor/bin/init.kernel.post_boot.sh"]
+libraries = ["/system/lib64", "/vendor/lib64"]
+oneshot = true
+user = "root"
+groups = ["root", "system", "wakelock", "graphics"]
+
+[[service]]
+path = "/vendor/bin/qseecomd"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_property = "vendor.sys.listeners.registered"
+user = "root"
+groups = ["root", "drmrpc"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+# libbinder_ndk is absent from the recovery. Use the installed system's
+# Binder and its matching libc/loader for this NDK service.
+libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+user = "system"
+groups = ["system", "drmrpc"]
+
+# The installed system's directory for the HIDL gatekeeper, boot control
+# and WLAN supplicant. Its own init script runs it as system:readproc.
+[[service]]
+path = "/mnt/system_ext/bin/hwservicemanager"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_property = "hwservicemanager.ready"
+# The supplicant's HIDL manifest lists interface/instance separately, so
+# publish it explicitly before the hardware directory starts.
+description = "/vendor/etc/vintf/manifest/android.hardware.wifi.supplicant.xml"
+user = "system"
+groups = ["system", "readproc"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+user = "system"
+groups = ["system"]
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot@1.2-service"
+libraries = ["/system/lib64", "/vendor/lib64"]
+ready_hardware_service = "android.hardware.boot@1.2::IBootControl/default"
+user = "root"
+groups = ["root"]
+
+# QCA6490 is identified in prop.default and the vendor_boot device tree.
+# init.target.rc writes fs_ready. The recovery covers /vendor/firmware
+# with modem's image folder, so restore the driver's INI and MAC through
+# the firmware loader. Keep the MAC at the stock link's persist location.
+# The supplicant is HIDL 1.4 on this build, not the newer AIDL service.
+[wlan]
+modules = ["qca_cld3_qca6490"]
+writes = [{ path = "/sys/kernel/cnss/fs_ready", value = "1" }]
+firmware = [
+    { name = "wlan/qca_cld/qca6490/WCNSS_qcom_cfg.ini", path = "/vendor/etc/wifi/qca6490/WCNSS_qcom_cfg.ini" },
+    { name = "wlan/qca_cld/qca6490/wlan_mac.bin", partition = "persist", path = "qca6490/wlan_mac.bin" },
+]
+interface = "wlan0"
+supplicant = "/vendor/bin/hw/wpa_supplicant"
+# Pair the installed libc with its loader; retain the vendor's BoringSSL
+# ABI (sk_dup) rather than Android 17's incompatible crypto libraries.
+loader = "/system/bin/bootstrap/linker64"
+preload = ["/apex/com.android.vndk.v31/lib64/libcrypto.so", "/apex/com.android.vndk.v31/lib64/libssl.so"]
+# The keystore engine also needs the installed system's libbinder_ndk.
+libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+service = "android.hardware.wifi.supplicant@1.4::ISupplicant/default"
+probe = "http://connect.rom.miui.com/generate_204"
+
+[update]
+server = "https://update.miui.com/updates/miotaV3.php"
+
+# The version is recorded in the recovery ramdisk's prop.default.
+# This is the SHA-256 of the entire supplied
+# 100 MiB recovery.img, including its AVB footer, not the ZIP checksum.
+[stock]
+version = "OS3.0.3.0.VLFCNXM"
+package = "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com/OS3.0.3.0.VLFCNXM/diting-ota_full-OS3.0.3.0.VLFCNXM-user-15.0-04006cfe4c.zip"
+recovery = "58289942fdc5958dd301f9e940c2bfb274558500ec0c1678d1e9a157fbd7705f"
+
+# The L12 overlay in dtbo enables qcom,hv-haptics, with preloaded effect 0.
+# The driver exports lra_frequency_hz. Strengths follow the existing
+# Qualcomm profiles and still need to be checked on the phone.
+[haptics]
+click = 0
+resonance = "/sys/class/qcom-haptics/lra_frequency_hz"
+strength = { lightest = 0.5, strongest = 1.0 }
