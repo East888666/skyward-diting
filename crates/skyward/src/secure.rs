@@ -104,6 +104,13 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
         fs::remove_file(loader).with_context(|| format!("take away {}", loader.display()))?;
     }
     std::os::unix::fs::symlink(&from, loader).with_context(|| format!("point {} at {}", loader.display(), from.display()))?;
+    // Recent libhidlbase checks these standard executable paths before it
+    // talks to a hardware directory, even when that directory is running.
+    let hardware_program = Path::new("/system/bin/hwservicemanager");
+    let installed_hardware = Path::new("/mnt/system_ext/bin/hwservicemanager");
+    if !hardware_program.exists() && installed_hardware.is_file() {
+        std::os::unix::fs::symlink(installed_hardware, hardware_program).context("expose installed hardware service directory")?;
+    }
     let driver = Path::new(HARDWARE_DRIVER);
     if !driver.exists() {
         std::os::unix::fs::symlink(HARDWARE_DRIVER_NODE, driver)
@@ -115,15 +122,24 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // as the users their init scripts name.
     fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
         .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
-    let from = Path::new(SERVICE_LABELS);
-    let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
     fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
     // The directory reads both of these as the user its init script names,
     // and what the recovery makes under its own umask is root's alone: they
     // are given the modes the system's own copies have.
     fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    let mut labels = vec![Path::new(SERVICE_LABELS)];
+    if !Path::new(DIRECTORY_PROGRAM).is_file() {
+        labels.push(Path::new("/mnt/system/system/etc/selinux/plat_service_contexts"));
+    }
+    for from in labels {
+        let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
+        fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    }
+    fs::create_dir_all(RECOVERY_DESCRIPTIONS).context("make recovery service description directory")?;
+    let manifest_dir = Path::new(RECOVERY_MANIFEST).parent().expect("manifest directory");
+    fs::set_permissions(manifest_dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .context("let service directories traverse recovery VINTF directory")?;
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
@@ -241,7 +257,7 @@ pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize
         take(from, &fs::read_to_string(from).with_context(|| format!("read {file}"))?)?;
     }
     let rewritten = say_framework(into)?;
-    if copied > 0 || rewritten > 0 {
+    if (copied > 0 || rewritten > 0) && Path::new(DIRECTORY_PROGRAM).is_file() {
         // The directory reads the descriptions once and keeps to them, so
         // it has to start again to see these. It comes back knowing nothing
         // of what had registered with it, and nothing registers again by
@@ -254,6 +270,31 @@ pub fn publish_descriptions(wanted: &[String], files: &[String]) -> Result<usize
         register_again(&registered)?;
     }
     Ok(copied)
+}
+
+/// Match Binder's protocol to the executable selected by the configuration.
+/// Keep the recovery's SDK property intact for its other programs.
+pub fn select_directory(services: &[skyward_config::Service]) -> Result<()> {
+    let installed = services
+        .iter()
+        .any(|s| s.path == "/mnt/system/system/bin/servicemanager");
+    let sdk = if installed {
+        let file = "/mnt/system/system/build.prop";
+        let props = fs::read_to_string(file).with_context(|| format!("read {file}"))?;
+        props
+            .lines()
+            .find_map(|line| line.strip_prefix("ro.build.version.sdk="))
+            .context("installed system gives no SDK version")?
+            .trim()
+            .to_string()
+    } else {
+        skyward_sys::prop("ro.build.version.sdk").context("recovery gives no SDK version")?
+    };
+    let _: u32 = sdk
+        .parse()
+        .context("service directory SDK is not a number")?;
+    skyward_sys::set_prop("skyward.servicemanager.sdk", &sdk)?;
+    skyward_sys::set_prop("skyward.binder.header", if installed { "SYST" } else { "RECO" })
 }
 
 /// What has registered with the service directory, each with the init

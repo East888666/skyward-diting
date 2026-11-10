@@ -163,6 +163,38 @@ pub fn insmod(path: impl AsRef<Path>, params: &str) -> Result<()> {
     }
 }
 
+/// Remove a configured first-stage module only while it owns no hardware.
+/// The kernel's normal reference checks still apply; unloading is never forced.
+#[cfg(target_os = "android")]
+pub fn unload_unbound(name: &str) -> Result<bool> {
+    let name = modprobe::canonical(name).context("a module name")?;
+    let module = Path::new("/sys/module").join(&name);
+    if !module.exists() {
+        return Ok(false);
+    }
+    let drivers = match fs::read_dir(module.join("drivers")) {
+        Ok(drivers) => Some(drivers),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("inspect {name} drivers")),
+    };
+    if let Some(drivers) = drivers {
+        for driver in drivers {
+            for entry in fs::read_dir(driver?.path())? {
+                let path = entry?.path();
+                if fs::canonicalize(&path).with_context(|| format!("inspect {}", path.display()))?.starts_with("/sys/devices") {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    let c = std::ffi::CString::new(name.clone())?;
+    if unsafe { libc::syscall(libc::SYS_delete_module, c.as_ptr(), libc::O_NONBLOCK) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("remove unbound {name}"));
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

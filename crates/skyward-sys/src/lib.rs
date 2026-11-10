@@ -6,6 +6,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub mod bcb;
+#[cfg(target_os = "android")]
+pub mod binder;
 pub mod clock;
 pub mod control;
 pub mod cpu;

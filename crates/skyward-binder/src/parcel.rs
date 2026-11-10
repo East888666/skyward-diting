@@ -2,8 +2,17 @@ use anyhow::{bail, Context, Result};
 
 /// The mark libbinder writes into every call header. Both ends have to agree
 /// on it: it tells apart the copies of libbinder a phone carries, and the one
-/// the recovery's own programs are built from is the recovery copy.
+/// the recovery's own programs are built from is normally the recovery copy.
+/// An installed system's service directory and services use SYST instead.
 const HEADER: i32 = i32::from_be_bytes(*b"RECO");
+
+fn header() -> i32 {
+    #[cfg(target_os = "android")]
+    if skyward_sys::prop("skyward.binder.header").as_deref() == Some("SYST") {
+        return i32::from_be_bytes(*b"SYST");
+    }
+    HEADER
+}
 
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
@@ -50,7 +59,7 @@ impl Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(header());
         p.string(interface);
         p
     }

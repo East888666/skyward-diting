@@ -12,9 +12,8 @@ const DIRECTORY: &str = "android.os.IServiceManager";
 
 /// What the directory numbers the methods it is asked by here. It numbers
 /// its methods in the order its interface declares them, and Android 16
-/// declared two lookups of its own ahead of the rest; the directory is the
-/// recovery's own program, so the version the recovery was built as says
-/// which numbering it keeps.
+/// declared two lookups of its own ahead of the rest. The version of the
+/// configured directory's executable determines which numbering it keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Methods {
     /// Ask for a service without waiting for one that has not registered
@@ -43,7 +42,8 @@ fn methods_of(sdk: u32) -> Methods {
 const SDK: &str = "ro.build.version.sdk";
 
 fn methods() -> Result<Methods> {
-    let sdk = skyward_sys::prop(SDK).with_context(|| format!("the recovery says no {SDK}"))?;
+    // The configured directory may be from the installed system.
+    let sdk = skyward_sys::prop("skyward.servicemanager.sdk").or_else(|| skyward_sys::prop(SDK)).with_context(|| format!("the recovery says no {SDK}"))?;
     Ok(methods_of(sdk.parse().with_context(|| format!("{SDK} is {sdk:?}"))?))
 }
 

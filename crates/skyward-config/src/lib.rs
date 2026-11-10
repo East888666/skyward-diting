@@ -118,6 +118,12 @@ pub struct Wlan {
     pub interface: String,
     /// The phone's own wpa_supplicant.
     pub supplicant: String,
+    /// Optional matching runtime loader for an installed-system library set.
+    #[serde(default)]
+    pub loader: Option<String>,
+    /// Libraries that must retain the vendor ABI despite newer system libraries.
+    #[serde(default)]
+    pub preload: Vec<String>,
     /// Directories for its LD_LIBRARY_PATH, searched in order and before
     /// the libraries of the vendor interface the phone was built against.
     #[serde(default)]
@@ -157,8 +163,8 @@ pub struct Firmware {
     /// Where the file is: a path in the running recovery, or from the top
     /// of `partition`.
     pub path: String,
-    /// A partition the recovery does not keep mounted, which is mounted
-    /// read-only while the file is read.
+    /// Read a private view of this partition, reusing an existing mount
+    /// without child mounts, or mounting it read-only while the file is read.
     #[serde(default)]
     pub partition: Option<String>,
 }
@@ -300,11 +306,17 @@ pub struct Modules {
     /// source's modules.dep and load first.
     #[serde(default)]
     pub load: Vec<String>,
+    /// Replace an unbound first-stage copy from the selected module source.
+    #[serde(default)]
+    pub reload: Vec<String>,
+    /// Firmware made visible before these modules probe their hardware.
+    #[serde(default)]
+    pub firmware: Vec<Firmware>,
 }
 
 impl Default for Modules {
     fn default() -> Self {
-        Self { sources: default_module_sources(), load: Vec::new() }
+        Self { sources: default_module_sources(), load: Vec::new(), reload: Vec::new(), firmware: Vec::new() }
     }
 }
 
@@ -503,6 +515,14 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        for name in &cfg.modules.reload {
+            ensure!(cfg.modules.load.contains(name), "[modules] reload: {name} is not in load");
+            ensure!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "[modules] reload: {name} is not a module name");
+        }
+        for file in &cfg.modules.firmware {
+            validate_firmware(file)?;
+        }
         for log in &cfg.wipe.logs {
             let path = Path::new(log);
             let plain = path.components().all(|c| matches!(c, std::path::Component::RootDir | std::path::Component::Normal(_)));
@@ -586,27 +606,35 @@ impl DeviceConfig {
             );
         }
         if let Some(wlan) = &cfg.wlan {
+            for path in wlan.loader.iter().chain(&wlan.preload) {
+                ensure!(Path::new(path).is_absolute(), "[wlan] loader/preload: {path} is not an absolute path");
+            }
             ensure!(wlan.probe.starts_with("http://"), "[wlan] probe: {} is not a plain HTTP address", wlan.probe);
             for file in &wlan.firmware {
-                let name = Path::new(&file.name);
-                let plain = name.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-                ensure!(plain && !file.name.is_empty(), "[wlan] firmware: {} is not a name from the top of the loader's folders", file.name);
-                let path = Path::new(&file.path);
-                match &file.partition {
-                    Some(partition) => {
-                        let plain = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
-                        ensure!(
-                            !partition.is_empty() && !partition.contains('/'),
-                            "[wlan] firmware: {partition} is not a partition's name"
-                        );
-                        ensure!(plain && !file.path.is_empty(), "[wlan] firmware: {} is not a path from the top of {partition}", file.path);
-                    }
-                    None => ensure!(path.is_absolute(), "[wlan] firmware: {} is not an absolute path", file.path),
-                }
+                validate_firmware(file)?;
             }
         }
         Ok(cfg)
     }
+}
+
+fn validate_firmware(file: &Firmware) -> Result<()> {
+    let name = Path::new(&file.name);
+    let plain = name.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    ensure!(plain && !file.name.is_empty(), "firmware: {} is not a name from the top of the loader's folders", file.name);
+    let path = Path::new(&file.path);
+    match &file.partition {
+        Some(partition) => {
+            let plain = path.components().all(|c| matches!(c, std::path::Component::Normal(_)));
+            ensure!(
+                !partition.is_empty() && !partition.contains('/'),
+                "firmware: {partition} is not a partition's name"
+            );
+            ensure!(plain && !file.path.is_empty(), "firmware: {} is not a path from the top of {partition}", file.path);
+        }
+        None => ensure!(path.is_absolute(), "firmware: {} is not an absolute path", file.path),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -837,6 +865,7 @@ mod tests {
             (include_str!("../../../devices/myron.toml"), "OS4.0.4.0.XPMCNXM"),
             (include_str!("../../../devices/songyuan.toml"), "OS4.0.4.0.XGNCNXM"),
             (include_str!("../../../devices/athens.toml"), "OS4.0.4.0.XPICNXM"),
+            (include_str!("../../../devices/diting.toml"), "OS3.0.3.0.VLFCNXM"),
             (include_str!("../../../devices/fuxi.toml"), "OS3.0.309.0.WMCCNXM"),
             (include_str!("../../../devices/nuwa.toml"), "OS3.0.312.0.WMBCNXM"),
             (include_str!("../../../devices/houji.toml"), "OS3.0.307.0.WNCCNXM"),
@@ -1012,6 +1041,29 @@ mod tests {
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+    }
+
+    #[test]
+    fn module_preparation_requires_explicit_names_and_valid_firmware_paths() {
+        let with = |body: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[modules]\n{body}"));
+        assert!(with("load = [\"goodix_core\"]\nreload = [\"goodix_core\"]").is_ok());
+        assert!(with("load = []\nreload = [\"goodix_core\"]").is_err());
+        assert!(with("load = [\"../driver\"]\nreload = [\"../driver\"]").is_err());
+        assert!(with("load = [\"\"]\nreload = [\"\"]").is_err());
+        assert!(with("firmware = [{ name = \"panel.bin\", partition = \"vendor\", path = \"firmware/panel.bin\" }]").is_ok());
+        assert!(with("firmware = [{ name = \"../panel.bin\", path = \"/vendor/panel.bin\" }]").is_err());
+        assert!(with("firmware = [{ name = \"panel.bin\", partition = \"vendor\", path = \"../panel.bin\" }]").is_err());
+    }
+
+    #[test]
+    fn wlan_runtime_overrides_are_optional_and_absolute() {
+        let base = "[device]\ncodename = \"x\"\n[wlan]\nmodules = []\ninterface = \"wlan0\"\nsupplicant = \"/s\"\nservice = \"a/b\"\nprobe = \"http://p/\"\n";
+        let cfg = DeviceConfig::parse(base).unwrap();
+        let wlan = cfg.wlan.unwrap();
+        assert!(wlan.loader.is_none() && wlan.preload.is_empty());
+        assert!(DeviceConfig::parse(&format!("{base}loader = \"/system/bin/bootstrap/linker64\"\npreload = [\"/apex/ssl.so\"]")).is_ok());
+        assert!(DeviceConfig::parse(&format!("{base}loader = \"linker64\"")).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}preload = [\"ssl.so\"]")).is_err());
     }
 
     #[test]

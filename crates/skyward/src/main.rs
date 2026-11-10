@@ -10,6 +10,8 @@ mod backup;
 #[cfg(target_os = "android")]
 mod decrypt;
 #[cfg(target_os = "android")]
+mod firmware;
+#[cfg(target_os = "android")]
 mod filework;
 #[cfg(target_os = "android")]
 mod haptics;
@@ -110,8 +112,8 @@ enum Cmd {
     /// merge where it has not begun, and follow it to its end.
     #[cfg(target_os = "android")]
     Merge,
-    /// Keep the configuration's services that this phone runs going until
-    /// stopped.
+    /// Prepare the configured drivers and Binder directories, and keep the
+    /// phone's configured services running until stopped.
     #[cfg(target_os = "android")]
     Services {
         #[arg(long, default_value = "/skyward/device.toml")]
@@ -275,10 +277,8 @@ fn main() -> Result<()> {
         Cmd::Umount => skyward_vab::unmount_partitions(booted_slot()?),
         #[cfg(target_os = "android")]
         Cmd::Services { config } => {
-            let props = skyward_info::installed_props(booted_slot()?)?;
-            let mut services = DeviceConfig::load(&config)?.services;
-            services.retain(|s| s.runs_on(&props));
-            services::start(&services, secure::libraries()?.as_deref())?;
+            let cfg = DeviceConfig::load(&config)?;
+            bring_up(&cfg, booted_slot()?)?;
             loop {
                 std::thread::park();
             }
@@ -499,6 +499,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         }
     }
     let services: Vec<_> = cfg.services.iter().filter(|s| s.runs_on(&props)).cloned().collect();
+    secure::select_directory(&services)?;
     // The drivers ask for their firmware by name, and the kernel looks only
     // in folders of its own unless told to pass on what it does not find
     // there to ueventd, which looks in the recovery's firmware folders.
@@ -510,9 +511,18 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot) -> Result<()> {
         let at = skyward_block::fstab::mount(name)?;
         skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
     }
+    for file in &cfg.modules.firmware {
+        firmware::place(file)?;
+    }
+    for name in &cfg.modules.reload {
+        if skyward_modules::unload_unbound(name)? {
+            skyward_sys::kmsg(&format!("removed the unbound first-stage {name} before loading the configured driver"))?;
+        }
+    }
     for path in load_modules(cfg, &cfg.modules.load)? {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
+    skyward_sys::binder::prepare()?;
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;

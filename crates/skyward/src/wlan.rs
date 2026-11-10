@@ -4,7 +4,7 @@
 //! stand each time that changes.
 
 use anyhow::{bail, ensure, Context, Result};
-use skyward_config::{Firmware, Wlan as Config};
+use skyward_config::Wlan as Config;
 use skyward_net::dhcp::{self, Kept, Lease};
 use skyward_net::http::Servers;
 use skyward_net::iface;
@@ -22,13 +22,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-/// The first folder the firmware loader looks in that a recovery can
-/// write.
-const FIRMWARE: &str = "/etc/firmware";
-
-/// Where a partition a firmware file is read from is mounted meanwhile.
-const PARTITIONS: &str = "/skyward/wlan";
 
 /// The supplicant's settings, and the folder of its control socket, in the
 /// recovery service's own folder.
@@ -671,7 +664,7 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
     if !net.exists() {
         for file in &cfg.firmware {
-            place(file)?;
+            crate::firmware::place(file)?;
         }
         for path in skyward_modules::load(modules, &cfg.modules)? {
             skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
@@ -686,25 +679,6 @@ fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
         }
     }
     iface::set_up(&cfg.interface, true)
-}
-
-/// Put a file the driver asks for where the firmware loader looks.
-fn place(file: &Firmware) -> Result<()> {
-    let to = Path::new(FIRMWARE).join(&file.name);
-    let dir = to.parent().expect("a firmware file is in a folder");
-    fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
-    let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
-        Some(partition) => {
-            let at = Path::new(PARTITIONS).join(partition);
-            fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-            skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join(partition), &at)?;
-            let read = fs::read(at.join(&file.path)).with_context(|| format!("read {} on {partition}", file.path));
-            skyward_block::mount::umount(&at)?;
-            read?
-        }
-    };
-    fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
 }
 
 /// Start the supplicant on the interface, and wait for its control socket.
@@ -728,7 +702,14 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
-    let mut child = Process::new(&cfg.supplicant)
+    let mut process = Process::new(cfg.loader.as_deref().unwrap_or(&cfg.supplicant));
+    if cfg.loader.is_some() {
+        process.arg(&cfg.supplicant);
+    }
+    if !cfg.preload.is_empty() {
+        process.env("LD_PRELOAD", cfg.preload.join(":"));
+    }
+    let mut child = process
         .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
         .env("LD_LIBRARY_PATH", path.join(":"))
