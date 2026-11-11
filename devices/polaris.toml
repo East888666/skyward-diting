@@ -1,0 +1,243 @@
+# Xiaomi MIX 2S / polaris, based on the supplied MIUI 12.5 recovery and
+# the Polaris device trees appended to boot.img.
+# Reference: https://github.com/juezhi6668/skyward/blob/main/devices/chiron.toml
+#
+# Requires this tree's non-A/B implementation (not just a TOML copy into
+# an unmodified upstream checkout). See polaris-notes.md for validation.
+# For the 64 MiB recovery partition, use --no-default-features and the
+# subset font described there; the full-font image exceeds this capacity.
+# Freshly formatted data also requires the plain-filesystem initialization
+# fix in skyward-crypto; TOML alone cannot create the missing media/0.
+# Both plain and legacy FBE data paths also require the journal fix:
+# replay before inspecting directories, then mount with normal fstab
+# options. Writing through rw,norecovery was observed after legacy unlock.
+# Script installs require this tree's stop-before-unmount path: installed
+# hardware services use system/vendor files and runtime APEX loop mounts.
+# It retires their supervisors, releases those bundles, then normally
+# unmounts the partitions; a busy mount still aborts before the installer
+# writes. A fresh recovery boot is needed to restart these services.
+
+[device]
+codename = "polaris"
+brand = "Xiaomi"
+model = "MIX 2S"
+ab = false
+soc = { hans = "骁龙®845移动平台", hant = "Snapdragon® 845 行動平台", en = "Snapdragon® 845 Mobile Platform" }
+os_version_prop = "ro.build.version.incremental"
+
+[recovery]
+# Stock Android 10 otherwise loads Android 12's libc++ after /system_root
+# is mounted, breaking adb shell with missing _Unwind_RaiseException.
+ramdisk_libraries_first = true
+# Android 12's libnetd_client uses relocations Android 10's linker cannot
+# apply. Exclude installed fallback libraries from stock recovery programs;
+# installed HALs must explicitly use their matching loader/library paths.
+ramdisk_libraries_only = true
+# Stock init sends recovery stdout/stderr to /dev/null and ships no logd.
+# Keep real Skyward and child-service diagnostics in /skyward/run/recovery.log.
+# Export without data/logd: `adb shell /system/bin/recovery logs`, then
+# `adb pull /skyward/run/logs`. These files live in RAM until reboot.
+# Requires the CLI dispatch fix: older binaries named recovery ignore
+# subcommands and would start a second service instead. On those images,
+# use adb pull /skyward/run/recovery.log and adb shell dmesg directly.
+capture_stdio = true
+# Match the installed boot header and system build, not the older stock
+# recovery: Android 12 / 2022-09. The packer sets BOTH the legacy header
+# and properties. A RAM-only update cannot change the booted header.
+# Cold-boot logs now show the configured hardware services start. Encrypted
+# CE/DE unlock remains unverified; opening formatted plain data is separate.
+legacy_version = { release = "12.0.0", security_patch = "2022-09-05" }
+
+[firmware]
+partition = "modem"
+
+# Run installed services with their own runtime rather than stock's linker.
+# These paths were checked against the installed MIUI 12.5 vendor image.
+# They have not been validated against crDroid 10.1 / Android 14. The latest
+# interrupted flash left system ext4 errors; do not guess library paths or
+# change the legacy boot version from files on that incomplete system.
+[[service]]
+path = "/system_root/system/bin/hwservicemanager"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "system"
+groups = ["system", "readproc"]
+ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
+
+[[service]]
+path = "/vendor/bin/qseecomd"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "root"
+groups = ["root"]
+ready_property = "vendor.sys.listeners.registered"
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.keymaster@3.0-service-qti"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "system"
+groups = ["system", "drmrpc"]
+ready_hardware_service = "android.hardware.keymaster@3.0::IKeymasterDevice/default"
+
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "system"
+groups = ["system"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+
+[[owners]]
+paths = ["/dev/qseecom"]
+user = "system"
+group = "drmrpc"
+mode = 0o660
+
+[[owners]]
+paths = ["/dev/ion"]
+user = "system"
+group = "system"
+mode = 0o664
+
+# The supplied 4.9 kernel exposes KMS. This tree's display-event reader
+# accepts legacy flip events with crtc_id=0, avoiding the drm crate panic.
+[display]
+width = 1080
+height = 2160
+# ro.sf.lcd_density and persist.miui.density_v2 in prop.default.
+density = 440
+diagonal = 5.99
+# Verified on the phone: panel0-backlight/max_brightness and the JDI
+# panel's qcom,mdss-dsi-bl-max-level both give 4095. The boot parameter
+# names a display object rather than that panel's device-tree node.
+normal_max_brightness = 4095
+# Diagnostic workaround for black screens/reboots around panel power cycles.
+# Keep KMS powered behind a black frame; this also prevents system suspend.
+# Higher idle power use; root cause and long-term stability remain unverified.
+keep_powered = true
+# A captured install crash hit drm_send_event_locked from the SDE vblank
+# interrupt with a poisoned list pointer (dead000000000100). Avoid userspace
+# page-flip event allocation for initial modesets, mode switches and frames.
+# This requires the matching skyward-ui source change. It is a workaround
+# for the supplied kernel, pending cold-boot and sustained-install testing.
+blocking_commits = true
+# Overlap drawing with the same blocking ioctl on one dedicated worker.
+# Still no NONBLOCK/PAGE_FLIP_EVENT; wait for completion before submitting
+# another frame, changing panel power, or releasing scanout buffers.
+# Candidate optimization for the 32-33 ms frame times captured on 60 Hz KMS.
+pipelined_commits = true
+
+[modules]
+# CONFIG_TOUCHSCREEN_SYNAPTICS_DSX_*_FORCE=y in the supplied kernel.
+# There is no vendor_boot or vendor_dlkm on this stock device. No external
+# touchscreen module is needed; any later module lookup uses vendor.
+sources = ["vendor"]
+load = []
+
+# Chiron's /proc/touchpanel reset/suspend knobs have not been established
+# for this kernel. Do not write those paths merely because both devices
+# have a Synaptics driver. Touch and the display work after rebooting into the fixed recovery.
+
+# Verified live: the QPNP LED driver accepts duration/activate. The
+# kernel chooses motor voltage; only the short pulse length is adjusted.
+[haptics]
+timed = "/sys/class/leds/vibrator"
+drive = 40
+strength = { lightest = 0.5, strongest = 1.0 }
+
+[backup]
+# Only the boot/recovery images and filesystems named by recovery.fstab.
+# Vendor and cust are separate partitions on polaris. The supplied images
+# do not establish the GPT names of persist/modem/EFS; add them only after
+# checking the actual device's by-name links.
+partitions = ["boot", "recovery", "system", "vendor", "cust", "cache", "data"]
+
+[wipe]
+# No metadata line exists in the supplied tables. Do not alias oops or
+# another partition to metadata using Chiron's device-specific workaround.
+formats = ["data", "cache", "system", "vendor"]
+
+# The boot device trees name system and vendor on the UFS controller
+# 1d84000.ufshc; every Polaris variant in boot.img agrees on those entries.
+# Use the stock recovery's bootdevice aliases and preserve its options.
+# formattable is an explicit recovery permission for the four wipe targets.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/system"
+mount_point = "/system"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,avb,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/vendor"
+mount_point = "/vendor"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,avb,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1,data=ordered"
+extras = "wait,check,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/userdata"
+mount_point = "/data"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1,data=ordered,noauto_da_alloc"
+extras = "wait,check,encryptable=footer,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cust"
+mount_point = "/cust"
+filesystem = "ext4"
+options = "ro,nosuid,nodev,barrier=1,data=ordered"
+extras = "wait,check"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/boot"
+mount_point = "/boot"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/recovery"
+mount_point = "/recovery"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/misc"
+mount_point = "/misc"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+# Confirmed in the installed vendor fstab and by-name links on the phone.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/modem"
+mount_point = "/vendor/firmware_mnt"
+filesystem = "vfat"
+options = "ro,shortname=lower,uid=0,gid=1000,dmask=227,fmask=337,context=u:object_r:firmware_file:s0"
+extras = "wait"
+
+# The stock recovery's mmcblk0p1 /sdcard entry is not included: it does
+# not establish an external card on this UFS phone without a card slot.
+# The mount-list source fix must also filter the original ramdisk entry;
+# omitting it from this file alone does not remove the stock placeholder.
+# MTP requires this tree's FunctionFS init/packer fixes. A temporary USB
+# switching test still rebooted the phone; full-image validation is pending.
+#
+# Wi-Fi remains disabled in the small build. The legacy Keymaster path
+# still needs end-to-end data unlock validation; haptics above uses the
+# verified LED-class driver rather than a force-feedback input device.
+#
+# Stock properties identify V12.5.1.0.QDGCNXM / Android 10 (SDK 29).
+# There is no [stock] block until the matching full OTA URL and full
+# recovery-partition hash are verified. The supplied image has no AVBf
+# footer; this tree packs it through the legacy unsigned-image path.
