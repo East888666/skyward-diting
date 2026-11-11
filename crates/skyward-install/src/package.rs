@@ -29,7 +29,11 @@ pub enum Package {
     Script,
     /// A system to install beside the installed one.
     System(skyward_systems::package::Contents),
-    Unknown,
+    /// Nothing this recovery installs, and what was looked at to tell: the
+    /// bytes a file starts with, or the shape of a zip that holds neither an
+    /// update nor a script. What the recovery says when it refuses is the
+    /// evidence the next round works from.
+    Unknown(String),
 }
 
 /// An A/B update package: the payload update_engine applies, where it
@@ -83,7 +87,16 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     let mut head = Vec::with_capacity(HEAD);
     (&mut file).take(HEAD as u64).read_to_end(&mut head).context("read the package's first bytes")?;
     if !head.starts_with(b"PK\x03\x04") {
-        return Ok(image::detect(&mut file, &head)?.map_or(Package::Unknown, Package::Image));
+        // What a file starts with is the evidence the next round works
+        // from: a filesystem no probe knows, a sparse image with its own
+        // header over the filesystem inside it, and nothing at all each
+        // read differently here.
+        let seen = head[..head.len().min(16)]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<String>>()
+            .join(" ");
+        return Ok(image::detect(&mut file, &head)?.map_or(Package::Unknown(format!("its first bytes are {seen}")), Package::Image));
     }
     file.seek(SeekFrom::Start(0)).context("rewind the package")?;
     let mut zip = ZipArchive::new(file).context("read the zip directory")?;
@@ -96,7 +109,9 @@ pub fn identify<R: Read + Seek>(mut file: R) -> Result<Package> {
     if zip.index_for_name(UPDATE_BINARY).is_some() {
         return Ok(Package::Script);
     }
-    Ok(Package::Unknown)
+    Ok(Package::Unknown(
+        "a zip with neither an update nor an install script".into(),
+    ))
 }
 
 fn update<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<Update> {
@@ -158,7 +173,8 @@ pub fn check(update: &Update, phone: &Phone) -> Result<(), Refusal> {
     if m.get("pre-build").is_some() || m.get("pre-build-incremental").is_some() {
         return Err(Refusal::Incremental);
     }
-    let Some(build) = &phone.installed else { return Ok(()) };
+    let Some(build) = &phone.installed else { return Ok(());
+    };
     // A full package may install the version already there again; going
     // back needs a package made for the build it leaves, an incremental
     // one.
@@ -299,8 +315,10 @@ METADATA_SIZE=1024
         let payload = b"CrAU\0\0\0\0\0\0\0\x02rest of the payload";
         let bytes = zip_with(&[
             ("payload.bin", payload, CompressionMethod::Stored),
-            ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
-            ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Deflated),
+            ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored,
+            ),
+            ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Deflated,
+            ),
         ]);
         let Package::Update(u) = identify(Cursor::new(&bytes)).unwrap() else { panic!("an update package") };
         let at = u.payload_offset as usize;
@@ -312,16 +330,24 @@ METADATA_SIZE=1024
 
     #[test]
     fn script_zips_compressed_payloads_and_other_files_are_told_apart() {
-        let script = zip_with(&[("META-INF/com/google/android/update-binary", b"#!/sbin/sh\n", CompressionMethod::Deflated)]);
+        let script = zip_with(&[("META-INF/com/google/android/update-binary", b"#!/sbin/sh\n", CompressionMethod::Deflated,
+        )]);
         assert_eq!(identify(Cursor::new(script)).unwrap(), Package::Script);
         let squeezed = zip_with(&[
             ("payload.bin", &[7u8; 4096], CompressionMethod::Deflated),
-            ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored),
-            ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Stored),
+            ("payload_properties.txt", PROPERTIES_TEXT.as_bytes(), CompressionMethod::Stored,
+            ),
+            ("META-INF/com/android/metadata", METADATA_TEXT.as_bytes(), CompressionMethod::Stored,
+            ),
         ]);
         assert!(identify(Cursor::new(squeezed)).is_err());
         let other = zip_with(&[("readme.txt", b"hello", CompressionMethod::Stored)]);
-        assert_eq!(identify(Cursor::new(other)).unwrap(), Package::Unknown);
-        assert_eq!(identify(Cursor::new(b"just some text".to_vec())).unwrap(), Package::Unknown);
+        assert!(matches!(identify(Cursor::new(other)).unwrap(), Package::Unknown(_)));
+        let text = identify(Cursor::new(b"just some text".to_vec())).unwrap();
+        // The bytes it names are the file's own start: "just".
+        assert!(
+            matches!(&text, Package::Unknown(why) if why.contains("6a 75 73 74")),
+            "{text:?}"
+        );
     }
 }

@@ -34,6 +34,9 @@ pub mod ramdisk {
     pub const TASK_PROFILES: &str = "system/etc/task_profiles.json";
     /// The init rules that set up file transfer's USB function.
     pub const MTP_RC: &str = "system/etc/init/skyward-mtp.rc";
+    /// Table lines this recovery adds of its own, for a partition the
+    /// phone's table says nothing about.
+    pub const FSTAB: &str = "system/etc/skyward.fstab";
 
     /// Whether the running root is Skyward's recovery ramdisk.
     pub fn in_recovery() -> bool {
@@ -44,6 +47,9 @@ pub mod ramdisk {
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeviceConfig {
     pub device: Device,
+    /// Compatibility choices applied while packing the stock ramdisk.
+    #[serde(default)]
+    pub recovery: Recovery,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -52,6 +58,12 @@ pub struct DeviceConfig {
     pub touch: Touch,
     #[serde(default)]
     pub partitions: Partitions,
+    /// Table lines the phone's own table lacks, which the packer writes to
+    /// the ramdisk so that the recovery's table has them. A phone that
+    /// keeps no partition for something every recovery asks for -- a
+    /// metadata partition, say -- names the one that answers for it here.
+    #[serde(default)]
+    pub fstab: Vec<FstabLine>,
     /// Where the firmware the phone's drivers ask for is, on phones whose
     /// recovery leaves it out of their reach.
     #[serde(default)]
@@ -84,6 +96,50 @@ pub struct DeviceConfig {
     /// The stock build the recovery is made on.
     #[serde(default)]
     pub stock: Option<Stock>,
+}
+
+/// Opt-in changes to the stock recovery runtime.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Recovery {
+    /// Keep recovery's own libraries ahead of a different installed Android
+    /// release in the stock ld.config.txt recovery namespace.
+    #[serde(default)]
+    pub ramdisk_libraries_first: bool,
+    /// Use only ramdisk libraries for stock recovery executables. A newer
+    /// installed library may be ABI-incompatible even when ramdisk wins
+    /// the search for every library that both builds carry.
+    #[serde(default)]
+    pub ramdisk_libraries_only: bool,
+    /// Retain stdout/stderr from recovery and its child services in the
+    /// diagnostic log when stock init connects them to /dev/null.
+    #[serde(default)]
+    pub capture_stdio: bool,
+    /// Set matching legacy header and Keymaster version properties.
+    /// Applies only to non-A/B, v0-v2 recovery images.
+    #[serde(default)]
+    pub legacy_version: Option<LegacyRecoveryVersion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LegacyRecoveryVersion {
+    pub release: String,
+    pub security_patch: String,
+}
+
+impl LegacyRecoveryVersion {
+    /// The legacy header's 7+7+7 version bits and 7+4 patch bits.
+    pub fn encoded(&self) -> Result<u32> {
+        let version: Vec<u32> = self.release.split('.').map(str::parse).collect::<std::result::Result<_, _>>().context("legacy release must be three numbers")?;
+        ensure!(version.len() == 3 && version.iter().all(|n| *n <= 127), "legacy release needs three components in 0..127");
+        let patch: Vec<u32> = self.security_patch.split('-').map(str::parse).collect::<std::result::Result<_, _>>().context("legacy patch must be YYYY-MM-DD")?;
+        ensure!(self.security_patch.len() == 10 && patch.len() == 3, "legacy patch must be YYYY-MM-DD");
+        let [year, month, day] = patch[..] else { unreachable!() };
+        ensure!((2000..=2127).contains(&year) && (1..=12).contains(&month), "legacy patch year/month outside header limits");
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days = match month { 2 if leap => 29, 2 => 28, 4 | 6 | 9 | 11 => 30, _ => 31 };
+        ensure!((1..=days).contains(&day), "legacy patch day is invalid");
+        Ok((version[0] << 25) | (version[1] << 18) | (version[2] << 11) | ((year - 2000) << 4) | month)
+    }
 }
 
 /// The stock build a recovery is made on: the phone maker's full update
@@ -185,12 +241,46 @@ pub struct Backup {
     /// own identity, and the sensors' calibration.
     #[serde(default)]
     pub efs: Vec<String>,
+    /// The partitions a backup can take, in the order to offer them. Where
+    /// this names none, the phone's own table and its boot partitions say:
+    /// a phone that keeps its vendor files under another name, or has no
+    /// use for backing one partition up, is said here rather than guessed.
+    #[serde(default)]
+    pub partitions: Vec<String>,
     /// Folders in the data partition, from its top, that the phone's own
     /// secure world keeps in step with itself, as its own storage and the
     /// fingerprint templates: an older copy written back would not open.
     /// A `*` stands for any one name.
     #[serde(default)]
     pub data_skipped: Vec<String>,
+}
+
+/// One line of the recovery's own table: a partition, where it is mounted,
+/// what it holds, and how to mount it -- the five fields a recovery's table
+/// is read as, and no fewer, since a line of fewer is no entry at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FstabLine {
+    pub device: String,
+    pub mount_point: String,
+    pub filesystem: String,
+    #[serde(default = "FstabLine::as_defaults")]
+    pub options: String,
+    #[serde(default = "FstabLine::as_defaults")]
+    pub extras: String,
+}
+
+impl FstabLine {
+    fn as_defaults() -> String {
+        "defaults".into()
+    }
+
+    /// The line as a recovery's table writes it.
+    pub fn text(&self) -> String {
+        format!(
+            "{} {} {} {} {}",
+            self.device, self.mount_point, self.filesystem, self.options, self.extras
+        )
+    }
 }
 
 /// What erasing on the wipe page takes in beyond the places every Android
@@ -202,6 +292,15 @@ pub struct Wipe {
     /// records, the folders staying.
     #[serde(default)]
     pub logs: Vec<String>,
+    /// The partitions the wipe page offers to make afresh, in the order to
+    /// offer them: `data`, `cache`, `metadata`, `system`, `vendor`. A name
+    /// the phone's own table has no line for is not offered, so a phone
+    /// whose vendor files are in a partition of another name, or that has
+    /// no metadata partition at all, says it here rather than in the page.
+    /// Where this names none, every one of them is offered, as far as the
+    /// phone has it.
+    #[serde(default)]
+    pub formats: Vec<String>,
 }
 
 /// The data partition, which the folders erasing takes in are in.
@@ -210,7 +309,9 @@ const DATA: &str = "/data";
 /// The vibration motor, played through the kernel's force-feedback events:
 /// its click, a waveform its driver keeps or one made from samples at the
 /// motor's resonant frequency, which the driver plays as they are given,
-/// and the ticks of the screen going off by the power key, made too.
+/// and the ticks of the screen going off by the power key, made too; or,
+/// where the kernel's input devices take no force-feedback effects at all,
+/// as a timed drive written into the driver's own folder.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Haptics {
     /// The driver's number for a click waveform it keeps, on phones whose
@@ -218,9 +319,30 @@ pub struct Haptics {
     #[serde(default)]
     pub click: Option<i16>,
     /// The file the driver says the motor's resonant frequency in, in
-    /// tenths of a hertz whatever its label.
-    pub resonance: String,
+    /// tenths of a hertz whatever its label, on phones whose click is made
+    /// from samples.
+    #[serde(default)]
+    pub resonance: Option<String>,
+    /// A driver reached through a folder of its own rather than through the
+    /// kernel's force-feedback events, which plays a timed drive: the folder
+    /// holding `duration` and `activate`. On these the input devices report
+    /// no force-feedback capability at all, so a click of samples could not
+    /// be loaded even if the motor's frequency were known.
+    #[serde(default)]
+    pub timed: Option<String>,
+    /// How long a drive lasts at the slider's fullest, in whole
+    /// milliseconds, for such a driver.
+    #[serde(default = "Haptics::shortest_drive")]
+    pub drive: u32,
     pub strength: Strength,
+}
+
+impl Haptics {
+    /// A drive long enough to be felt as a click and short enough not to be
+    /// a buzz under the finger.
+    fn shortest_drive() -> u32 {
+        40
+    }
 }
 
 /// How strongly the click plays, each as a share of the most its waveform
@@ -290,6 +412,24 @@ pub struct Display {
     /// Marketed screen diagonal in inches.
     #[serde(default)]
     pub diagonal: Option<f32>,
+    /// Optional normal maximum in the backlight sysfs scale, for panels
+    /// whose boot display name cannot be resolved to the brightness node.
+    /// With no override, discover the normal limit from the device tree.
+    #[serde(default)]
+    pub normal_max_brightness: Option<u32>,
+    /// Keep the display controller powered while showing a black frame.
+    /// For older drivers whose panel power cycle can hang recovery. This
+    /// also prevents system suspend and uses more power with the screen off.
+    #[serde(default)]
+    pub keep_powered: bool,
+    /// Use blocking KMS commits without userspace page-flip events. Some
+    /// older Qualcomm kernels crash while delivering those events.
+    #[serde(default)]
+    pub blocking_commits: bool,
+    /// Run blocking commits on a dedicated thread so drawing the next
+    /// frame can overlap the ioctl. Requires blocking_commits.
+    #[serde(default)]
+    pub pipelined_commits: bool,
     /// How round the screen's corners are, as a radius in pixels; a page
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
@@ -347,6 +487,10 @@ pub struct Partitions {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Service {
     pub path: String,
+    /// Explicit dynamic loader matching this program's libraries, when
+    /// the recovery loader belongs to an older Android release.
+    #[serde(default)]
+    pub loader: Option<String>,
     /// What the program is given after its own path, as init gives a
     /// service the words after its path.
     #[serde(default)]
@@ -515,6 +659,14 @@ impl DeviceConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let cfg: DeviceConfig = toml::from_str(text).context("parse device config")?;
+        if let Some(version) = &cfg.recovery.legacy_version {
+            ensure!(!cfg.device.ab, "legacy_version is only for non-A/B recovery");
+            version.encoded()?;
+        }
+        ensure!(cfg.display.normal_max_brightness != Some(0),
+            "[display] normal_max_brightness must be greater than zero");
+        ensure!(!cfg.display.pipelined_commits || cfg.display.blocking_commits,
+            "[display] pipelined_commits requires blocking_commits");
         for name in &cfg.modules.reload {
             ensure!(cfg.modules.load.contains(name), "[modules] reload: {name} is not in load");
             ensure!(!name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
@@ -564,8 +716,32 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            let file = &haptics.resonance;
-            ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            // A motor is reached one of two ways: through the kernel's
+            // force-feedback events, where its click is a waveform the
+            // driver keeps or samples made at the motor's resonant
+            // frequency, or through a driver folder of its own that plays
+            // a timed drive. The ticks are made from samples where the
+            // frequency is known, and are the click's own waveform where
+            // it is not.
+            let events = haptics.click.is_some() || haptics.resonance.is_some();
+            let kinds = [events, haptics.timed.is_some()].into_iter().filter(|has| *has).count();
+            ensure!(
+                kinds == 1,
+                "[haptics] names a motor reached one way: a kept waveform, the file it says the motor's resonant frequency in, or a driver folder to write a timed drive to"
+            );
+            if let Some(file) = &haptics.resonance {
+                ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
+            }
+            if let Some(folder) = &haptics.timed {
+                ensure!(
+                    Path::new(folder).is_absolute(),
+                    "[haptics] timed: {folder} is not an absolute path"
+                );
+                ensure!(
+                    haptics.drive > 0,
+                    "[haptics] drive: a drive of no milliseconds is no click"
+                );
+            }
             let Strength { lightest, strongest } = haptics.strength;
             ensure!(
                 0.0 < lightest && lightest < strongest && strongest <= 1.0,
@@ -642,6 +818,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_version_matches_the_reference_header_and_rejects_overflow() {
+        let version = |release: &str, patch: &str| LegacyRecoveryVersion { release: release.into(), security_patch: patch.into() };
+        assert_eq!(version("99.87.36", "2099-12-31").encoded().unwrap(), 0xc75d263c);
+        for (release, patch) in [("128.0.0", "2020-12-01"), ("10", "2020-12-01"), ("1.0.0", "2128-01-01"), ("1.0.0", "2023-02-29"), ("1.0.0", "2024-13-01")] {
+            assert!(version(release, patch).encoded().is_err());
+        }
+        assert!(version("1.0.0", "2024-02-29").encoded().is_ok());
+    }
+
+    #[test]
+    fn polaris_uses_unslotted_partitions_and_keeps_vendor_separate_from_cust() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
+        assert!(config.recovery.ramdisk_libraries_first);
+        assert_eq!(config.display.normal_max_brightness, Some(4095));
+        assert!(config.display.keep_powered);
+        assert!(config.display.blocking_commits);
+        assert!(config.display.pipelined_commits);
+        assert!(!config.device.ab);
+        assert_eq!(config.fstab.len(), 9);
+        assert_eq!(config.firmware.as_ref().unwrap().partition, "modem");
+        assert_eq!(config.recovery.legacy_version.as_ref().unwrap().release, "12.0.0");
+        assert!(config.services.iter().any(|service| service.ready_hardware_service.as_deref()
+            == Some("android.hardware.keymaster@3.0::IKeymasterDevice/default")));
+        let vendor = config.fstab.iter().find(|e| e.mount_point == "/vendor").unwrap();
+        assert!(vendor.device.ends_with("/vendor"));
+        assert!(config.fstab.iter().any(|e| e.mount_point == "/cust" && e.device.ends_with("/cust")));
+        assert!(!config.fstab.iter().any(|e| e.mount_point == "/metadata"));
+        assert_eq!(config.wipe.formats, ["data", "cache", "system", "vendor"]);
+        assert!(config.backup.partitions.iter().any(|p| p == "recovery"));
+        assert_eq!(config.modules.reload, Vec::<String>::new());
+    }
+
+    #[test]
     fn the_commands_sit_beside_the_recovery_service_binary() {
         let folder = |path: &str| Path::new(path).parent().map(Path::to_path_buf);
         for command in ramdisk::COMMANDS {
@@ -650,10 +859,22 @@ mod tests {
     }
 
     #[test]
+    fn pipelined_display_keeps_blocking_commits_enabled() {
+        let base = "[device]\ncodename = \"polaris\"\n[display]\npipelined_commits = true\n";
+        assert!(DeviceConfig::parse(base).is_err());
+        assert!(DeviceConfig::parse(&format!("{base}blocking_commits = false\n")).is_err());
+        let cfg = DeviceConfig::parse(&format!("{base}blocking_commits = true\n")).unwrap();
+        assert!(cfg.display.blocking_commits && cfg.display.pipelined_commits);
+    }
+
+    #[test]
     fn parses_minimal() {
         let cfg = DeviceConfig::parse("[device]\ncodename = \"nezha\"\n").unwrap();
         assert_eq!(cfg.device.codename, "nezha");
         assert!(cfg.device.ab);
+        assert!(!cfg.display.keep_powered);
+        assert!(!cfg.display.blocking_commits);
+        assert!(!cfg.display.pipelined_commits);
         assert_eq!(cfg.device.os_version_prop, "ro.build.display.id");
         assert_eq!(cfg.modules.sources, default_module_sources());
         assert!(cfg.modules.load.is_empty());
@@ -674,18 +895,33 @@ mod tests {
     fn ishtar_clicks_with_a_waveform_its_driver_keeps() {
         let cfg = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap();
         let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
-        assert_eq!((haptics.click, haptics.resonance.as_str()), (Some(0), "/sys/class/qcom-haptics/lra_frequency_hz"));
+        assert_eq!((haptics.click, haptics.resonance.as_deref()), (Some(0), Some("/sys/class/qcom-haptics/lra_frequency_hz")));
         assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
     }
 
     #[test]
     fn a_click_is_kept_or_made_and_its_strengths_rise() {
         let with = |body: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[haptics]\n{body}\n"));
-        let (strength, resonance) = ("strength = { lightest = 0.25, strongest = 1.0 }", "resonance = \"/sys/class/qcom-haptics/lra_frequency_hz\"");
+        let (strength, resonance) = ("strength = { lightest = 0.25, strongest = 1.0 }", "resonance = \"/sys/class/qcom-haptics/lra_frequency_hz\"",
+        );
         assert!(with(&format!("{resonance}\n{strength}")).is_ok(), "a click made");
         assert!(with(&format!("click = 0\n{resonance}\n{strength}")).is_ok(), "a click kept");
-        assert!(with(&format!("click = 0\n{strength}")).is_err(), "no motor's resonance to make the ticks at");
+        assert!(with(&format!("click = 0\n{strength}")).is_ok(),
+            "a kept waveform plays for the screen going off too"
+        );
+        assert!(with(&format!("timed = \"/sys/class/leds/vibrator\"\n{strength}")).is_ok(),
+            "a click of a timed drive"
+        );
+        assert!(
+            with(&format!("click = 0\ntimed = \"/sys/class/leds/vibrator\"\n{strength}")).is_err(),
+            "a motor reached both ways"
+        );
+        assert!(
+            with(&format!("timed = \"/sys/class/leds/vibrator\"\ndrive = 0\n{strength}")).is_err(),
+            "a drive of no milliseconds"
+        );
         assert!(with(&format!("resonance = \"sys/f\"\n{strength}")).is_err(), "a file named from nowhere");
+        assert!(with(strength).is_err(), "a motor reached neither way");
         assert!(with(resonance).is_err(), "a click without its strengths");
         for (lightest, strongest) in [(0.0, 0.5), (0.5, 0.5), (0.5, 0.25), (0.25, 1.5)] {
             let s = format!("{resonance}\nstrength = {{ lightest = {lightest:?}, strongest = {strongest:?} }}");
@@ -695,7 +931,9 @@ mod tests {
 
     #[test]
     fn a_library_for_logd_is_an_absolute_path_to_a_file() {
-        let with = |library: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[logd]\nlibraries = [\"{library}\"]\n"));
+        let with = |library: &str| {
+            DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[logd]\nlibraries = [\"{library}\"]\n"))
+        };
         assert!(with("/mnt/system/system/lib64/libcap.so").is_ok());
         for bad in ["lib64/libcap.so", "/", "/mnt/system/../lib64/libcap.so", ""] {
             assert!(with(bad).is_err(), "{bad} is refused");
@@ -767,7 +1005,7 @@ mod tests {
         assert_eq!(weaver.ready_service.as_deref(), Some("android.hardware.weaver.IWeaver/default"));
         assert_eq!(boot.ready_service.as_deref(), Some("android.hardware.boot.IBootControl/default"));
         let haptics = cfg.haptics.expect("the 17 Ultra has a motor");
-        assert_eq!((haptics.click, haptics.resonance.as_str()), (None, "/sys/class/qcom-haptics/lra_frequency_hz"), "its click is made");
+        assert_eq!((haptics.click, haptics.resonance.as_deref()), (None, Some("/sys/class/qcom-haptics/lra_frequency_hz")), "its click is made");
         assert_eq!(haptics.strength, Strength { lightest: 0.25, strongest: 0.75 }, "past three quarters the motor rattles");
         assert_eq!(cfg.backup.efs, ["modemst1", "modemst2", "fsg", "fsc", "persist"]);
         assert!(cfg.backup.data_skipped.contains(&"vendor/goodix".to_string()));
@@ -910,7 +1148,9 @@ mod tests {
 
     #[test]
     fn a_partition_mounted_as_the_phone_mounts_it_is_named_plainly() {
-        let with = |name: &str| DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[partitions]\nmounted = [\"{name}\"]\n"));
+        let with = |name: &str| {
+            DeviceConfig::parse(&format!("[device]\ncodename = \"x\"\n[partitions]\nmounted = [\"{name}\"]\n"))
+        };
         assert_eq!(with("persist").unwrap().partitions.mounted, ["persist"]);
         assert!(with("by-name/persist").is_err());
         assert!(with("").is_err());

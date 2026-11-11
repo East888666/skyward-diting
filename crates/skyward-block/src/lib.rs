@@ -16,6 +16,25 @@ pub mod usb;
 
 pub const BY_NAME: &str = "/dev/block/by-name";
 
+/// Older recovery init exposes only bootdevice/by-name. Supply the common
+/// alias used by runtime code, without replacing an existing directory or
+/// link (including a dangling link whose target may still be appearing).
+pub fn prepare_by_name() -> Result<()> {
+    alias_by_name(Path::new(BY_NAME), Path::new("/dev/block/bootdevice/by-name"))
+}
+
+fn alias_by_name(at: &Path, source: &Path) -> Result<()> {
+    match fs::symlink_metadata(at) {
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("stat {}", at.display())),
+    }
+    if source.is_dir() {
+        std::os::unix::fs::symlink(source, at).with_context(|| format!("link {} to {}", at.display(), source.display()))?;
+    }
+    Ok(())
+}
+
 /// A bootloader parameter such as `androidboot.slot_suffix`, from bootconfig
 /// or, on kernels without it, the command line. Root tools can rewrite the
 /// matching `ro.boot.*` properties; these files come from the kernel.
@@ -143,6 +162,22 @@ pub fn drop_cache(_: &fs::File) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn older_partition_aliases_do_not_replace_existing_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("bootdevice-by-name");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("misc"), b"original").unwrap();
+        let at = dir.path().join("by-name");
+        alias_by_name(&at, &source).unwrap();
+        assert_eq!(fs::read(at.join("misc")).unwrap(), b"original");
+        fs::remove_file(&at).unwrap();
+        let other = dir.path().join("not-ready");
+        std::os::unix::fs::symlink(&other, &at).unwrap();
+        alias_by_name(&at, &source).unwrap();
+        assert_eq!(fs::read_link(&at).unwrap(), other);
+    }
 
     #[test]
     fn parses_slot_from_cmdline() {

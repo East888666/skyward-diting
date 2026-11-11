@@ -89,8 +89,7 @@ impl Service {
         let thread = thread::Builder::new()
             .name("mtp".into())
             .spawn(move || {
-                let mut port = port;
-                let served = serve(&mut port, responder, mail);
+                let served = serve(port, responder, mail);
                 if let Err(e) = &served {
                     let _ = kmsg(&format!("mtp: file transfer stops: {e:#}"));
                     // The port loses the function with its descriptors, and
@@ -102,7 +101,6 @@ impl Service {
                         }
                     }
                 }
-                drop(port);
                 served
             })
             .context("start the MTP thread")?;
@@ -144,7 +142,8 @@ impl Service {
     }
 
     fn end(&mut self) -> Result<()> {
-        let Some(thread) = self.thread.take() else { return Ok(()) };
+        let Some(thread) = self.thread.take() else { return Ok(());
+        };
         self.stop.store(true, Ordering::Relaxed);
         // A thread that has ended already says why when joined.
         let _ = self.send(Message::Stop);
@@ -171,17 +170,29 @@ enum Ended {
 
 /// The thread: wait for the computer, answer it while it stays, and do what
 /// the phone asks in between, until it asks the thread to stop.
-fn serve(port: &mut Port, mut r: Responder, mut mail: Mailbox) -> Result<()> {
+fn serve(mut port: Port, mut r: Responder, mut mail: Mailbox) -> Result<()> {
     loop {
+        // **A function that was let go of is taken again from the top**
+        // before the computer is waited for. The gadget is unbound and bound
+        // again whenever the port is bound, which is what the cable coming
+        // out and going back in comes to here; everything open on the
+        // function goes with that binding, and the kernel binds a function
+        // only once its descriptors have been given again. adbd does this
+        // with its own function, which is why adb came back and file
+        // transfer did not.
+        if port.let_go() {
+            kmsg("mtp: the function was let go of, and is taken again")?;
+            port = port.taken_again()?;
+        }
         if !port.enabled() && !port.wait_enabled()? {
             mail.collect();
-            if attend(port, &mut r, &mut mail, 0)? {
+            if attend(&mut port, &mut r, &mut mail, 0)? {
                 return Ok(());
             }
             continue;
         }
         kmsg("mtp: the computer configured the function")?;
-        let ended = session(port, &mut r, &mut mail);
+        let ended = session(&mut port, &mut r, &mut mail);
         r.disconnected();
         port.disconnected().context("give up what was under way")?;
         match ended? {
@@ -216,6 +227,11 @@ fn attend(port: &mut Port, r: &mut Responder, mail: &mut Mailbox, transaction: u
 /// computer has read are told as they come.
 fn session(port: &mut Port, r: &mut Responder, mail: &mut Mailbox) -> Result<Ended> {
     let mut transaction = 0;
+    // How many reads in a row have broken off without a command coming
+    // between them. A break that keeps breaking is the function going away,
+    // and saying so every 25 microseconds buries the console the rest of the
+    // recovery needs to be heard on.
+    let mut broke = 0;
     loop {
         let bytes = match port.command(r.fd()) {
             Ok(Next::Command(bytes)) => bytes,
@@ -233,18 +249,27 @@ fn session(port: &mut Port, r: &mut Responder, mail: &mut Mailbox) -> Result<End
                 continue;
             }
             Err(Halt::Disconnected) => return Ok(Ended::Disconnected),
-            // A read the bus broke off is started again.
+            // A read the bus broke off is started again, three times at
+            // most in a row: past that the break is not a hiccup.
             Err(Halt::Aborted(e)) => {
-                kmsg(&format!("mtp: reading a command broke off: {e}"))?;
+                broke += 1;
+                kmsg(&format!("mtp: reading a command broke off ({broke} of 3): {e}"))?;
+                if broke == 3 {
+                    kmsg("mtp: the reads keep breaking off, and the function is let go")?;
+                    return Ok(Ended::Disconnected);
+                }
                 continue;
             }
             Err(Halt::Failed(e)) => return Err(e).context("read a command"),
-            Err(halt @ (Halt::Cancelled | Halt::Stopped)) => unreachable!("waiting for a command is no transaction to end: {halt:?}"),
+            Err(halt @ (Halt::Cancelled | Halt::Stopped)) => {
+                unreachable!("waiting for a command is no transaction to end: {halt:?}")
+        }
         };
         let Some(cmd) = Command::read(&bytes) else {
             kmsg(&format!("mtp: {} bytes came that are no command", bytes.len()))?;
             continue;
         };
+        broke = 0;
         transaction = cmd.transaction;
         match answer(port, r, mail, &cmd) {
             Ok(()) => {}
@@ -318,7 +343,9 @@ fn answer(port: &mut Port, r: &mut Responder, mail: &mut Mailbox, cmd: &Command)
     }
     match reply.data {
         Some(Outgoing::Dataset(bytes)) => port.send_data(cmd.code, cmd.transaction, &bytes, &mut stop)?,
-        Some(Outgoing::File { file, offset, length }) => port.send_file(cmd.code, cmd.transaction, &file, offset, length, &mut stop)?,
+        Some(Outgoing::File { file, offset, length }) => {
+            port.send_file(cmd.code, cmd.transaction, &file, offset, length, &mut stop)?
+        }
         None => {}
     }
     port.send_response(reply.code, cmd.transaction, &reply.params, &mut stop)

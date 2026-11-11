@@ -15,6 +15,9 @@ mod android {
 
     const GET_FREE: u32 = 0x4C82;
     const CONFIGURE: u32 = 0x4C0A;
+    const SET_FD: u32 = 0x4C00;
+    const CLR_FD: u32 = 0x4C01;
+    const SET_STATUS64: u32 = 0x4C04;
 
     /// The device only ever reads. It stays pointed at the file until the
     /// recovery ends, which is as long as anything mounted from it lasts.
@@ -48,8 +51,7 @@ mod android {
     }
 
     /// Open `file` from `offset` for `length` bytes as a block device, and
-    /// give its path. The device goes away once whatever is mounted from it
-    /// is unmounted.
+    /// give its path. The association stays until detached or rebooted.
     pub fn attach(file: &Path, offset: u64, length: u64) -> Result<PathBuf> {
         let backing = File::open(file).with_context(|| format!("open {}", file.display()))?;
         let control = File::open(CONTROL).with_context(|| format!("open {CONTROL}"))?;
@@ -69,9 +71,33 @@ mod android {
         config.info.size_limit = length;
         config.info.flags = READ_ONLY;
         if unsafe { libc::ioctl(device.as_raw_fd(), CONFIGURE as libc::Ioctl, &mut config) } < 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| format!("point {} at {}", path.display(), file.display()));
+            let error = std::io::Error::last_os_error();
+            // LOOP_CONFIGURE arrived after the 4.9 kernels used by older
+            // recoveries. They report EINVAL or ENOTTY for this command.
+            if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOTTY | libc::ENOSYS)) {
+                return Err(error).with_context(|| format!("point {} at {}", path.display(), file.display()));
+            }
+            if unsafe { libc::ioctl(device.as_raw_fd(), SET_FD as libc::Ioctl, backing.as_raw_fd()) } < 0 {
+                return Err(std::io::Error::last_os_error()).context("attach legacy loop backing file");
+            }
+            if unsafe { libc::ioctl(device.as_raw_fd(), SET_STATUS64 as libc::Ioctl, &config.info) } < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe { libc::ioctl(device.as_raw_fd(), CLR_FD as libc::Ioctl, 0) };
+                return Err(error).context("set legacy loop offset, size and read-only flag");
+            }
         }
         Ok(path)
+    }
+
+    /// Release an association after every mount of this loop has gone.
+    /// No autoclear/lazy detach: a live user must still block installation.
+    pub fn detach(path: &Path) -> Result<()> {
+        let device = File::options().read(true).write(true).open(path)
+            .with_context(|| format!("open {}", path.display()))?;
+        if unsafe { libc::ioctl(device.as_raw_fd(), CLR_FD as libc::Ioctl, 0) } < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("release loop {}", path.display()));
+        }
+        Ok(())
     }
 
     /// Where the kernel put the loop device it just handed out: Android

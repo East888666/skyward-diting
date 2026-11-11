@@ -1,11 +1,39 @@
 //! The table a phone keeps of its own filesystems: where each one is, what
 //! it holds, and how it is encrypted.
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// Where the phone's own partitions keep the table.
-pub const FILES: [&str; 2] = ["/vendor/etc/fstab.qcom", "/odm/etc/fstab.qcom"];
+/// The recovery table is authoritative before vendor/odm are mounted.
+/// The packer writes device-specific additions alongside that stock table.
+pub const ADDED: &str = "/system/etc/skyward.fstab";
+
+pub const FILES: [&str; 4] = [
+    "/system/etc/recovery.fstab",
+    ADDED,
+    "/vendor/etc/fstab.qcom",
+    "/odm/etc/fstab.qcom",
+];
+
+/// What a table entry can name that is not a filesystem to put anywhere:
+/// these partitions the recovery reads and writes whole, so a mount page has
+/// nothing to ask of them.
+pub const RAW: [&str; 4] = ["emmc", "mtd", "swap", "tmpfs"];
+
+/// Where a system whose whole layout starts at its own root is mounted in a
+/// recovery: the recovery runs from the ramdisk at `/`, and mounting over it
+/// would hide the programs it is running.
+pub const SYSTEM_ROOT: &str = "/system_root";
+
+/// Where an entry of the table goes.
+pub fn point(mount_point: &str) -> &str {
+    match mount_point {
+        // Never hide the ramdisk's executables and libraries under an
+        // installed system, whether it uses the old or system-as-root layout.
+        "/" | "/system" => SYSTEM_ROOT,
+        other => other,
+    }
+}
 
 /// One filesystem the phone knows about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,16 +81,45 @@ pub fn entries(text: &str) -> Vec<Entry> {
 
 /// Every entry of the phone's own table, read from wherever the table is.
 fn table() -> Result<Vec<Entry>> {
+    let slotted = crate::slot_suffix()?.is_some();
     let mut out = Vec::new();
-    for file in FILES {
+    let order = if slotted {
+        // Keep A/B decryption reading the installed vendor's current
+        // encryption flags, not the older recovery's data entry.
+        [FILES[2], FILES[3], FILES[0], ADDED]
+    } else {
+        [FILES[0], FILES[2], FILES[3], ADDED]
+    };
+    for file in order {
         let text = match std::fs::read_to_string(file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e).with_context(|| format!("read {file}")),
         };
-        out.extend(entries(&text));
+        add_table(&mut out, entries(&text), file == ADDED, slotted && file == FILES[0]);
     }
     Ok(out)
+}
+
+fn add_table(out: &mut Vec<Entry>, mut fresh: Vec<Entry>, replacing: bool, fallback: bool) {
+    if fallback {
+        fresh.retain(|e| !out.iter().any(|had| had.mount_point == e.mount_point));
+    }
+    merge(out, fresh, replacing);
+}
+
+/// Config lines replace the same partition/filesystem or an old mount
+/// point. Keep alternate filesystems at the same point as fallbacks.
+fn merge(out: &mut Vec<Entry>, fresh: Vec<Entry>, replacing: bool) {
+    if replacing {
+        for entry in &fresh {
+            let Some(name) = partition_name(&entry.device) else {
+                continue;
+            };
+            out.retain(|had| !names(had, name) || (had.mount_point == entry.mount_point && had.filesystem != entry.filesystem));
+        }
+    }
+    out.extend(fresh);
 }
 
 /// What the phone's own table says about `mount_point`.
@@ -76,9 +133,23 @@ pub fn partition(name: &str) -> Result<Option<Entry>> {
     Ok(table()?.into_iter().find(|e| names(e, name)))
 }
 
+/// The partition an entry's device path names, such as `cust`.
+fn partition_name(device: &str) -> Option<&str> {
+    Path::new(device).file_name().and_then(|n| n.to_str())
+}
+
 /// Whether an entry is of the partition `name`.
 fn names(entry: &Entry, name: &str) -> bool {
-    Path::new(&entry.device).file_name().is_some_and(|n| n == name)
+    partition_name(&entry.device) == Some(name)
+}
+
+/// Whether an entry is about the partition `name`: reached by that name, or
+/// mounted where that name is what the partition is for. A partition that
+/// stands in for another answers to what it stands for: this phone's
+/// `oops` holds the metadata a phone with a metadata partition would keep
+/// there, and a recovery asked to mount `metadata` means that one.
+fn about(entry: &Entry, name: &str) -> bool {
+    names(entry, name) || entry.mount_point == name || entry.mount_point == format!("/{name}")
 }
 
 /// The partition an entry names, as it is reachable now: of the booted
@@ -100,23 +171,170 @@ pub fn device(entry: &Entry) -> Result<String> {
     anyhow::bail!("neither {path} nor {} is here", by_name.display())
 }
 
-/// Mount the partition `name` where and as the phone's own table mounts
-/// it, and say where. Whatever shows there already, as what an earlier run
-/// of the recovery service mounted does, is taken as it is.
+/// One partition the recovery can put a filesystem on, with every way the
+/// phone's own table says to mount it, in the order the table lists them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mountable {
+    /// The partition's name, as the path the table reaches it by ends: what
+    /// the mount page titles the row with and the runtime acts on.
+    pub name: String,
+    /// Where the table mounts it, as a recovery can reach it.
+    pub point: String,
+    pub ways: Vec<Entry>,
+}
+
+/// Every partition a recovery can mount, as the phone's own table says, read
+/// off wherever that table is. Nothing else is asked of the phone: a phone
+/// with one set of partitions has no slot to be named by, and its table is
+/// complete on its own.
+pub fn mountable() -> Result<Vec<Mountable>> {
+    Ok(mountable_entries(table()?))
+}
+
+fn mountable_entries(entries: Vec<Entry>) -> Vec<Mountable> {
+    let mut out: Vec<Mountable> = Vec::new();
+    for entry in entries {
+        // Skyward binds the owner's data/media at /sdcard. Old recovery
+        // tables carry a generic mmcblk0p1 placeholder there even on UFS
+        // phones without an SD slot. It must not become a mount/unmount
+        // control for the internal storage bind.
+        if RAW.contains(&entry.filesystem.as_str()) || entry.mount_point == "/sdcard" {
+            continue;
+        }
+        let Some(name) = Path::new(&entry.device)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+        else {
+            continue;
+        };
+        let point = point(&entry.mount_point).to_string();
+        match out.iter_mut().find(|one| one.name == name && one.point == point) {
+            Some(one) => one.ways.push(entry),
+            None => out.push(Mountable {
+                name,
+                point,
+                ways: vec![entry],
+            }),
+        }
+    }
+    out
+}
+
+/// Mount using the table's options; automatic driver preparation must not
+/// remount a read-only firmware or system partition writable.
 pub fn mount(name: &str) -> Result<PathBuf> {
-    let entry = partition(name)?.with_context(|| format!("the phone's own table does not mount {name}"))?;
-    let at = PathBuf::from(&entry.mount_point);
+    mount_with(name, false)
+}
+
+/// An explicit request from the mount page to work on a partition.
+pub fn mount_writable(name: &str) -> Result<PathBuf> {
+    mount_with(name, true)
+}
+
+fn mount_with(name: &str, write: bool) -> Result<PathBuf> {
+    let ways: Vec<Entry> = table()?.into_iter().filter(|e| about(e, name)).collect();
+    ensure!(!ways.is_empty(), "the phone's own table does not mount {name}");
+    let at = PathBuf::from(point(&ways[0].mount_point));
     if crate::mount::is_mount_point(&at)? {
+        // **Shown already is still this page's to make writable.** The
+        // phone's own init mounts the system partition read-only before the
+        // recovery starts, so a partition mounted from the page was often
+        // one that was already there — and returning here without a word is
+        // why it could never be written to.
+        if write { make_writable(&at); }
         return Ok(at);
     }
-    std::fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
-    crate::mount::mount(Path::new(&device(&entry)?), &at, &entry.filesystem, &entry.options)?;
-    Ok(at)
+    crate::mount::prepare(&at)?;
+    // The table may name one partition once for every filesystem it might
+    // hold, an ext4 cache before an f2fs one and an erofs system before an
+    // ext4 one, and only the phone knows which it was last written with.
+    // Each is tried in the order the table gives, and what the last of them
+    // answers is what is told.
+    let mut why = anyhow::anyhow!(
+        "{name} mounted as none of the {} filesystems the table names",
+        ways.len());
+    for entry in &ways {
+        let where_ = device(entry)?;
+        let path = Path::new(&where_);
+        // **Writable first.** The table names most of these read-only,
+        // because that is how the phone's own system mounts them; a
+        // partition mounted from a recovery is mounted to be worked on. One
+        // that will not go writable — a firmware image on a read-only
+        // partition, a filesystem that wants repairing first — is still
+        // better mounted than not, so the table's own words are the second
+        // try.
+        let options = if write { writable(&entry.options) } else { entry.options.clone() };
+        match crate::mount::mount(path, &at, &entry.filesystem, &options) {
+            Ok(()) => return Ok(at),
+            Err(e) => {
+                if crate::mount::mount(path, &at, &entry.filesystem, &entry.options).is_ok() {
+                    eprintln!("{where_} is mounted read-only: it would not go writable");
+                    return Ok(at);
+                }
+                why = e.context(format!("mount {where_} as {}", entry.filesystem));
+            }
+        }
+    }
+    Err(why)
+}
+
+/// Make what shows at `at` writable, saying so where it will not go: a
+/// partition that cannot be written is still one that can be read, and a
+/// recovery that refuses to show it is worse than one that says why.
+fn make_writable(at: &Path) {
+    if let Err(e) = crate::mount::remount_writable(at, true) {
+        eprintln!("{} stays read-only: {e:#}", at.display());
+    }
+}
+
+/// The table's own words for a mount, with `ro` taken out and `rw` in its
+/// place.
+fn writable(options: &[String]) -> Vec<String> {
+    let mut said: Vec<String> = options
+        .iter()
+        .filter(|said| !matches!(said.as_str(), "ro" | "rw"))
+        .cloned()
+        .collect();
+    said.push("rw".to_string());
+    said
+}
+
+/// Take the partition `name` off every place the phone's own table mounts
+/// it, since one partition may be read from more than one place at once.
+pub fn unmount(name: &str) -> Result<()> {
+    let ways: Vec<Entry> = table()?.into_iter().filter(|e| about(e, name)).collect();
+    ensure!(!ways.is_empty(), "the phone's own table does not mount {name}");
+    let mut failed = None;
+    for at in ways
+        .iter()
+        .map(|e| PathBuf::from(point(&e.mount_point)))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if !crate::mount::is_mount_point(&at)? {
+            continue;
+        }
+        if let Err(e) = crate::mount::umount(&at) {
+            failed = Some(e.context(format!("take {} off", at.display())));
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(())
+}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_sdcard_placeholders_do_not_become_internal_storage_mount_controls() {
+        let table = entries("/dev/block/bootdevice/by-name/userdata /data ext4 rw wait\n/dev/block/mmcblk0p1 /sdcard vfat defaults wait\n/dev/block/by-name/boot /boot emmc defaults defaults\n");
+        let rows = mountable_entries(table);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "userdata");
+        assert_eq!(rows[0].point, "/data");
+    }
 
     const TABLE: &str = "\
 # a comment
@@ -124,6 +342,62 @@ mod tests {
 /dev/block/bootdevice/by-name/userdata /data f2fs noatime,discard latemount,wait,fileencryption=aes-256-xts:aes-256-cts:v2,keydirectory=/metadata/vold/metadata_encryption,metadata_encryption=aes-256-xts:wrappedkey_v0,quota
 /dev/block/bootdevice/by-name/userdata /data mifs noatime,discard latemount,wait,keydirectory=/metadata/vold/metadata_encryption
 ";
+
+    #[test]
+    fn ab_recovery_tables_do_not_override_the_installed_encryption_flags() {
+        let mut all = entries("/dev/block/by-name/userdata /data f2fs rw wait,metadata_encryption=aes-256-xts:wrappedkey_v0\n");
+        add_table(&mut all, entries("/dev/block/by-name/userdata /data f2fs rw wait,fileencryption=ice\n/dev/block/by-name/cache /cache ext4 rw wait\n"), false, true);
+        assert_eq!(all.iter().filter(|e| e.mount_point == "/data").count(), 1);
+        assert_eq!(all[0].extra("metadata_encryption"), Some("aes-256-xts:wrappedkey_v0"));
+        assert!(all.iter().any(|e| e.mount_point == "/cache"));
+    }
+
+    #[test]
+    fn the_installed_system_never_lands_on_the_recovery_s_own_system() {
+        // Whatever the table calls it, the installed system is mounted at
+        // /system_root: /system is the ramdisk's, and the recovery runs from
+        // it. Both names are real — recovery.fstab says `/` and the phone's
+        // own vendor/etc/fstab.qcom says `/system`, and that second file
+        // only becomes readable once the vendor files are mounted, which is
+        // how mounting system after vendor used to take the recovery's own
+        // /system away from under it.
+        assert_eq!(point("/"), SYSTEM_ROOT);
+        assert_eq!(point("/system"), SYSTEM_ROOT);
+        // Everything else keeps the phone's own word for it.
+        assert_eq!(point("/vendor"), "/vendor");
+        assert_eq!(point("/data"), "/data");
+    }
+
+    #[test]
+    fn a_line_the_recovery_adds_replaces_the_phones_where_they_disagree() {
+        // This phone's `cust` holds the vendor files and its own table calls
+        // them `/cust`; the recovery adds the line that says `/vendor`, and
+        // the phone's line for that partition goes with it. A partition the
+        // table names twice at the *same* place keeps both, which is how a
+        // filesystem it might hold either way is offered as both.
+        let phone = entries(
+            "/dev/block/bootdevice/by-name/cust /cust ext4 noatime,data=ordered wait\n\
+             /dev/block/bootdevice/by-name/userdata /data ext4 ro wait\n",
+        );
+        let added = entries(
+            "/dev/block/bootdevice/by-name/cust /vendor ext4 ro,barrier=1 wait\n\
+             /dev/block/bootdevice/by-name/userdata /data f2fs nosuid wait\n",
+        );
+        let mut all = phone;
+        merge(&mut all, added, true);
+        let points: Vec<&str> = all.iter().map(|e| e.mount_point.as_str()).collect();
+        assert!(!points.contains(&"/cust"), "{points:?}");
+        assert_eq!(points.iter().filter(|p| **p == "/vendor").count(), 1);
+        assert_eq!(points.iter().filter(|p| **p == "/data").count(), 2);
+        // Nothing is dropped where the lines were not the recovery's own.
+        let mut plain = entries("/dev/block/bootdevice/by-name/cust /cust ext4 ro wait\n");
+        merge(
+            &mut plain,
+            entries("/dev/block/bootdevice/by-name/cust /vendor ext4 ro wait\n"),
+            false,
+        );
+        assert_eq!(plain.len(), 2);
+    }
 
     #[test]
     fn a_mount_point_can_be_named_once_per_filesystem_it_might_hold() {
@@ -165,5 +439,66 @@ mod tests {
     fn comments_and_short_lines_are_passed_over() {
         assert!(entries("# nothing\n\n/dev/x /y f2fs rw\n").is_empty());
         assert_eq!(entries(TABLE).len(), 3);
+    }
+
+    const OLDER: &str = "\
+/dev/block/bootdevice/by-name/boot      /boot        emmc  defaults  defaults
+/dev/block/bootdevice/by-name/system    /            ext4  ro,barrier=1  wait
+/dev/block/bootdevice/by-name/cust      /vendor      ext4  ro,barrier=1  wait
+/dev/block/bootdevice/by-name/cache     /cache       ext4  nosuid,nodev,noatime  defaults
+/dev/block/bootdevice/by-name/cache     /cache       f2fs  nosuid,nodev,noatime  defaults
+/dev/block/bootdevice/by-name/userdata  /data        ext4  nosuid  wait,check,fileencryption=ice
+/dev/block/bootdevice/by-name/persist   /persist     ext4  nosuid  defaults
+/dev/block/bootdevice/by-name/modem     /vendor/firmware_mnt vfat ro,uid=1000 defaults
+";
+
+    #[test]
+    fn a_recovery_table_names_what_can_be_mounted_and_what_cannot() {
+        let list = mountable_of(OLDER);
+        let names: Vec<&str> = list.iter().map(|one| one.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["system", "cust", "cache", "userdata", "persist", "modem"],
+            "the raw boot partition is not a filesystem to mount"
+        );
+        assert_eq!(
+            list[0].point, "/system_root",
+            "a system whose root holds everything is mounted in a folder of its own"
+        );
+        assert_eq!(list[2].ways.len(), 2, "one cache, the two filesystems it might hold");
+        assert_eq!(list[2].ways[0].filesystem, "ext4", "in the order the table gives them");
+    }
+
+    #[test]
+    fn a_partition_mounted_in_more_than_one_place_is_one_row_per_place() {
+        let list = mountable_of("/dev/x /a ext4 rw defaults\n/dev/x /b ext4 rw defaults\n");
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].name.as_str(), list[0].point.as_str()), ("x", "/a"));
+        assert_eq!((list[1].name.as_str(), list[1].point.as_str()), ("x", "/b"));
+    }
+
+    /// The listing over a table given as text, which is what the page reads.
+    fn mountable_of(text: &str) -> Vec<Mountable> {
+        let mut out: Vec<Mountable> = Vec::new();
+        for entry in entries(text) {
+            if RAW.contains(&entry.filesystem.as_str()) {
+                continue;
+            }
+            let name = std::path::Path::new(&entry.device)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let point = point(&entry.mount_point).to_string();
+            match out.iter_mut().find(|one| one.name == name && one.point == point) {
+                Some(one) => one.ways.push(entry),
+                None => out.push(Mountable {
+                    name,
+                    point,
+                    ways: vec![entry],
+                }),
+            }
+        }
+        out
     }
 }

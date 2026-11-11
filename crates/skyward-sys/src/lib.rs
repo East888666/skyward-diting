@@ -184,6 +184,22 @@ pub fn keep_log(path: &Path) -> Result<()> {
     KEPT.set(Mutex::new(file)).map_err(|_| anyhow!("the log is kept in a file already"))
 }
 
+/// Capture recovery and inherited child output even when stock init
+/// supplies /dev/null. Each write appends beside the structured log lines.
+#[cfg(target_os = "android")]
+pub fn keep_stdio(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = OpenOptions::new().create(true).append(true).mode(0o600).open(path)
+        .with_context(|| format!("open {} for service output", path.display()))?;
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
+            return Err(std::io::Error::last_os_error()).context("keep service output in the recovery log");
+        }
+    }
+    Ok(())
+}
+
 /// Append a line to the kernel log, where it survives until the next boot
 /// and shows in `dmesg`, and to the file [`keep_log`] opened, stamped with
 /// the seconds since the phone started as the kernel log stamps it.

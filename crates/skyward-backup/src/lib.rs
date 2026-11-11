@@ -94,6 +94,13 @@ impl Manifest {
         Part::ALL.map(|p| self.items.iter().any(|i| i.part == p))
     }
 
+    /// What it holds, by partition name, in the order its manifest lists
+    /// them: what a restore is chosen from, since a backup of one phone's
+    /// partitions is not a backup of another phone's parts.
+    pub fn names(&self) -> Vec<String> {
+        self.items.iter().map(|i| i.name.clone()).collect()
+    }
+
     /// The bytes its files take.
     pub fn size(&self) -> u64 {
         self.items.iter().map(|i| i.stored.stored).sum()

@@ -1,11 +1,15 @@
 pub mod fscrypt;
 pub mod gatekeeper;
 pub mod keystore;
+pub mod keymaster3;
 pub mod locksettings;
 pub mod sharedsecret;
 pub mod token;
 pub mod user;
 pub mod weaver;
+
+#[cfg(any(target_os = "android", test))]
+mod plain;
 
 #[cfg(target_os = "android")]
 pub mod data;

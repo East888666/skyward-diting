@@ -71,8 +71,13 @@ fn with_metadata<T>(work: impl FnOnce() -> Result<T>) -> Result<T> {
     if mount::is_mount_point(at)? {
         return work();
     }
-    mount::mount_ro(&Path::new(skyward_block::BY_NAME).join("metadata"), at)?;
+    // The phone's own table says where its metadata is: a partition of the
+    // name on most, and on a phone that keeps none, whatever its
+    // configuration says answers for it. The table's options mount it read
+    // only, as the module's own rule has it, and it is writable only while
+    // a file is moved into it.
+    let at = skyward_block::fstab::mount("metadata")?;
     let done = work();
-    mount::umount(at)?;
+    mount::umount(&at)?;
     done
 }

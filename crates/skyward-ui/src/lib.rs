@@ -2,6 +2,8 @@ pub mod app;
 pub mod canvas;
 pub mod charge;
 pub mod color;
+#[cfg(any(target_os = "android", test))]
+mod commit;
 pub mod editor;
 pub mod files;
 pub mod fling;

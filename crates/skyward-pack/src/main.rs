@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod avb;
 
-use skyward_bootimg::{BootImage, Ramdisk};
+use skyward_bootimg::{BootImage, Format, Ramdisk};
 
 /// Builds Skyward recovery images from a device's own stock images.
 #[derive(Parser)]
@@ -40,13 +40,19 @@ enum Cmd {
     },
     /// Build a Skyward recovery image on top of the device's stock recovery:
     /// its init, adbd, SELinux policy and libraries stay, the recovery
-    /// service becomes Skyward. The image fills the whole partition and ends
-    /// in an unsigned AVB footer of its own.
+    /// service becomes Skyward. Modern stock keeps its partition size and
+    /// gets an unsigned AVB footer; legacy stock is rebuilt without a footer.
     Recovery {
         /// The device's stock recovery image: the whole partition, as the
-        /// phone or a full update package holds it, ending in its AVB footer.
+        /// phone or a full update package holds it. Modern images need their
+        /// AVB footer; legacy v0-v2 images may have no footer.
         #[arg(long)]
         stock: PathBuf,
+        /// Actual recovery partition capacity in bytes, when known from
+        /// the device. Checks that legacy output fits; never inferred from
+        /// the size of a signed input file.
+        #[arg(long)]
+        partition_size: Option<usize>,
         /// Skyward built for the device (aarch64-linux-android).
         #[arg(long)]
         binary: PathBuf,
@@ -97,7 +103,8 @@ fn main() -> Result<()> {
         }
         Cmd::Repack { image, out } => {
             let mut img = BootImage::read(&image)?;
-            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode()?;
+            let format = Format::of(&img.ramdisk)?;
+            img.ramdisk = Ramdisk::decode(&img.ramdisk)?.encode_as(format)?;
             write(&out, &img, &img.to_bytes()?)
         }
         Cmd::Boot { kernel, ramdisk, out } => {
@@ -105,9 +112,17 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
-            let size = partition_size(&stock)?;
+        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, config, font, mono, mono_license, out } => {
             let mut img = BootImage::read(&stock)?;
+            let size = match partition_size(&stock) {
+                Ok(size) => Some(size),
+                Err(_) if matches!(&img.header, abootimg_oxide::Header::V0(_)) => None,
+                Err(e) => return Err(e),
+            };
+            if let (Some(footer_size), Some(capacity)) = (size, capacity) {
+                ensure!(footer_size == capacity, "stock footer size {footer_size} differs from the supplied capacity {capacity}");
+            }
+            let format = Format::of(&img.ramdisk)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
             // A stock recovery ramdisk has no third-party tree; refuse to build
             // on top of another custom recovery.
@@ -115,17 +130,44 @@ fn main() -> Result<()> {
                 anyhow::bail!("{} holds {}, which is not a stock recovery", stock.display(), e.name);
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
-            skyward_config::DeviceConfig::load(&config)?;
+            let cfg = skyward_config::DeviceConfig::load(&config)?;
+            if let Some(version) = &cfg.recovery.legacy_version {
+                let abootimg_oxide::Header::V0(header) = &mut img.header else {
+                    anyhow::bail!("legacy_version requires a v0-v2 recovery image");
+                };
+                header.osversionpatch = abootimg_oxide::OsVersionPatch(version.encoded()?);
+            }
+            if cfg.recovery.ramdisk_libraries_first || cfg.recovery.ramdisk_libraries_only {
+                let path = "system/etc/ld.config.txt";
+                let entry = rd.find(path).context("ramdisk_libraries_first requires system/etc/ld.config.txt")?;
+                let text = std::str::from_utf8(&entry.data).context("ld.config.txt is not text")?;
+                let fixed = if cfg.recovery.ramdisk_libraries_only {
+                    ramdisk_libraries_only(text)?
+                } else {
+                    ramdisk_libraries_first(text)?
+                };
+                rd.replace(path, fixed.into_bytes())?;
+            }
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
             // until it points here; the recovery binary is each of them.
             let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
             for command in paths::COMMANDS {
+                // Android 10 stock may carry unzip as a real executable,
+                // rather than the newer ziptool symlink. Both are replaced
+                // deliberately by Skyward's streaming command.
+                if rd.find(command).is_some_and(|e| e.mode & 0o170000 == 0o100000) {
+                    rd.drop_at(command);
+                }
                 rd.link(command, recovery)?;
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
+            if !cfg.fstab.is_empty() {
+                let text: String = cfg.fstab.iter().map(|line| format!("{}\n", line.text())).collect();
+                rd.add(paths::FSTAB, 0o644, text.into_bytes())?;
+            }
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;
             rd.add(paths::MONO_LICENSE, 0o644, read(&mono_license)?)?;
@@ -135,6 +177,25 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            if !cfg.device.ab {
+                let entry = rd.find("init.rc").context("legacy stock has no init.rc")?;
+                let mut init = String::from_utf8(entry.data.clone()).context("init.rc is not text")?;
+                if !init.contains(paths::MTP_RC) {
+                    init = format!("import /{}\n{init}", paths::MTP_RC);
+                    rd.replace("init.rc", init.into_bytes())?;
+                }
+                // Older vendor rules bind their kernel MTP function before
+                // Skyward has supplied FunctionFS descriptors. Keep their
+                // plain ADB setup, but let Skyward own the combined port.
+                for entry in &mut rd.entries {
+                    if entry.name.ends_with(".rc") && !entry.is_dir() {
+                        if let Ok(text) = std::str::from_utf8(&entry.data) {
+                            let changed = legacy_rc(&entry.name, text);
+                            if changed != text { entry.data = changed.into_bytes(); }
+                        }
+                    }
+                }
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
@@ -147,10 +208,23 @@ fn main() -> Result<()> {
                 .data;
             let mut props = without(stock_props, &BUILD_VERSION);
             props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            if let Some(version) = &cfg.recovery.legacy_version {
+                props.extend_from_slice(format!("ro.build.version.release={}\nro.build.version.security_patch={}\n", version.release, version.security_patch).as_bytes());
+            }
             rd.replace(paths::PROP_DEFAULT, props)?;
-            img.ramdisk = rd.encode()?;
+            img.ramdisk = rd.encode_as(format)?;
             let bytes = img.to_bytes()?;
-            write(&out, &img, &avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?)
+            let bytes = match size {
+                Some(size) => avb::footed(&bytes, "recovery", size, &Sha256::digest(&bytes))?,
+                None => {
+                    println!("legacy image: output is unsigned, without an AVB footer or guessed partition padding");
+                    bytes
+                }
+            };
+            if let Some(capacity) = capacity {
+                ensure!(bytes.len() <= capacity, "rebuilt recovery is {} bytes, exceeding the {capacity}-byte partition; use a smaller font or reduce the recovery payload", bytes.len());
+            }
+            write(&out, &img, &bytes)
         }
         Cmd::Stock { config, out } => {
             let stock = skyward_config::DeviceConfig::load(&config)?.stock.with_context(|| format!("{} names no stock build", config.display()))?;
@@ -242,6 +316,82 @@ fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     out
 }
 
+/// Reorder only the default search path of the named recovery namespace.
+/// Keep namespace links, vendor rules and every other section untouched.
+fn ramdisk_libraries_only(text: &str) -> Result<String> {
+    let reordered = ramdisk_libraries_first(text)?;
+    let mut recovery = false;
+    Ok(reordered.split_inclusive('\n').filter(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            recovery = trimmed == "[recovery]";
+        }
+        !(recovery && trimmed.strip_prefix("namespace.default.search.paths")
+            .is_some_and(|rest| rest.trim_start().starts_with("+=")))
+    }).collect())
+}
+
+fn ramdisk_libraries_first(text: &str) -> Result<String> {
+    const KEY: &str = "namespace.default.search.paths";
+    const RAMDISK: &str = "/system/${LIB}";
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut recovery = false;
+    let mut indices = Vec::new();
+    let mut paths = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            recovery = trimmed == "[recovery]";
+        }
+        if !recovery { continue; }
+        let Some((key, value)) = trimmed.split_once('=') else { continue };
+        if key.trim_end().trim_end_matches('+').trim_end() == KEY {
+            indices.push(i);
+            paths.extend(value.trim().split(':').map(str::to_owned));
+        }
+    }
+    ensure!(paths.iter().any(|p| p == RAMDISK), "recovery default namespace has no {RAMDISK} search path");
+    paths.retain(|p| p != RAMDISK);
+    paths.insert(0, RAMDISK.into());
+    let first = indices[0];
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i == first {
+            for (j, path) in paths.iter().enumerate() {
+                let op = if j == 0 { "=" } else { "+=" };
+                out.push_str(&format!("{KEY} {op} {path}\n"));
+            }
+        }
+        if !indices.contains(&i) { out.push_str(line); }
+    }
+    Ok(out)
+}
+
+/// Remove only old combined-port binding actions. A standalone ADB-ready
+/// trigger must not rebind ADB while Skyward is setting up MTP plus ADB.
+fn legacy_rc(name: &str, text: &str) -> String {
+    if name == skyward_config::ramdisk::MTP_RC { text.to_string() } else { legacy_usb_rules(text) }
+}
+
+fn legacy_usb_rules(text: &str) -> String {
+    let mut out = String::new();
+    let mut dropping = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("on ") {
+            dropping = line.contains("config=mtp,adb") &&
+                (line.contains("sys.usb.ffs.ready") || line.contains("sys.usb.configfs=0"));
+        } else if !(line.starts_with(char::is_whitespace) || line.trim().is_empty() || line.starts_with('#')) {
+            dropping = false;
+        }
+        if !dropping {
+            if line.trim_end() == "on property:sys.usb.ffs.ready=1" {
+                out.push_str("on property:sys.usb.ffs.ready=1 && property:sys.usb.config=adb\n");
+            } else { out.push_str(line); }
+        }
+    }
+    out
+}
+
 /// Write `bytes`, the image `img` makes, to `out`.
 fn write(out: &Path, img: &BootImage, bytes: &[u8]) -> Result<()> {
     std::fs::write(out, bytes).with_context(|| format!("write {}", out.display()))?;
@@ -263,7 +413,7 @@ fn list(image: &Path) -> Result<()> {
         h.header_version(),
         img.kernel.len(),
         img.ramdisk.len(),
-        h.osversionpatch
+        match h { abootimg_oxide::Header::V0(h) => &h.osversionpatch, abootimg_oxide::Header::V3(h) => &h.osversionpatch }
     );
     if img.ramdisk.is_empty() {
         return Ok(());
@@ -279,6 +429,55 @@ fn list(image: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_library_order_is_opt_in_and_section_local() {
+        let stock = concat!(
+            "dir.recovery = /system/bin\n[recovery]\n",
+            "namespace.default.search.paths = /system_root/system/${LIB}\n",
+            "namespace.default.search.paths += /system/${LIB}:/vendor/${LIB}\n",
+            "namespace.default.links = system\n",
+            "[vendor]\nnamespace.default.search.paths = /vendor/${LIB}\n"
+        );
+        let fixed = ramdisk_libraries_first(stock).unwrap();
+        assert!(fixed.contains("[recovery]\nnamespace.default.search.paths = /system/${LIB}\nnamespace.default.search.paths += /system_root/system/${LIB}\n"));
+        assert!(fixed.contains("namespace.default.search.paths += /vendor/${LIB}\nnamespace.default.links = system\n"));
+        assert!(fixed.ends_with("[vendor]\nnamespace.default.search.paths = /vendor/${LIB}\n"));
+        assert_eq!(ramdisk_libraries_first(&fixed).unwrap(), fixed);
+        assert!(ramdisk_libraries_first("[vendor]\nnamespace.default.search.paths = /system/${LIB}\n").is_err());
+    }
+
+    #[test]
+    fn old_recovery_can_exclude_newer_fallback_libraries() {
+        let text = "dir.recovery = /system/bin\n[recovery]\nnamespace.default.search.paths = /system_root/system/${LIB}:/system/${LIB}\nnamespace.default.search.paths += /vendor/${LIB}\nnamespace.other.search.paths += /keep\n[vendor]\nnamespace.default.search.paths += /vendor/${LIB}\n";
+        let fixed = ramdisk_libraries_only(text).unwrap();
+        assert_eq!(fixed, "dir.recovery = /system/bin\n[recovery]\nnamespace.default.search.paths = /system/${LIB}\nnamespace.other.search.paths += /keep\n[vendor]\nnamespace.default.search.paths += /vendor/${LIB}\n");
+        assert_eq!(ramdisk_libraries_only(&fixed).unwrap(), fixed);
+    }
+
+    #[test]
+    fn legacy_usb_rules_keep_adb_and_remove_the_competing_mtp_binding() {
+        let stock = "on property:sys.usb.config=mtp,adb\n    start adbd\n\non property:sys.usb.ffs.ready=1 && property:sys.usb.config=mtp,adb\n    symlink /functions/mtp.gs0 /config/f1\n\non property:sys.usb.ffs.ready=1\n    write /UDC controller\n";
+        let changed = legacy_usb_rules(stock);
+        assert!(changed.contains("on property:sys.usb.config=mtp,adb\n    start adbd"));
+        assert!(!changed.contains("mtp.gs0"));
+        assert!(changed.contains("on property:sys.usb.ffs.ready=1 && property:sys.usb.config=adb"));
+        assert_eq!(legacy_usb_rules(&changed), changed);
+        let modern = "on boot\n    start adbd\n";
+        assert_eq!(legacy_usb_rules(modern), modern);
+    }
+
+    #[test]
+    fn legacy_packing_preserves_skywards_own_mtp_binding() {
+        let text = std::str::from_utf8(MTP_RC).unwrap();
+        let kept = legacy_rc(skyward_config::ramdisk::MTP_RC, text);
+        assert_eq!(kept, text);
+        assert!(kept.contains("on property:sys.usb.configfs=1\n"));
+        assert!(!kept.contains("on fs && property:sys.usb.configfs=1"));
+        assert!(kept.contains("property:sys.usb.ffs.mtp.ready=1 && property:sys.usb.configfs=1"));
+        assert!(kept.contains("symlink /config/usb_gadget/g1/functions/ffs.mtp"));
+        assert_ne!(legacy_rc("init.stock.rc", text), text);
+    }
 
     #[test]
     fn the_lines_that_set_a_name_are_the_only_ones_left_out() {

@@ -80,6 +80,36 @@ impl Message {
         self.framed(at, value.len(), value.len() + 1);
     }
 
+    /// A vector of fixed-size structures containing byte-vector frames.
+    /// Each child names the byte offset of its frame in the structures.
+    /// Binder needs a fixup even for an empty embedded byte vector.
+    pub fn structures(&mut self, raw: &[u8], stride: usize, children: &[(usize, &[u8])]) -> Result<()> {
+        anyhow::ensure!(stride != 0 && raw.len().is_multiple_of(stride), "invalid HIDL structure vector size");
+        let count = raw.len() / stride;
+        anyhow::ensure!(u32::try_from(count).is_ok(), "too many HIDL structures");
+        let mut raw = raw.to_vec();
+        let mut nested = Vec::new();
+        let mut previous = None;
+        for &(offset, bytes) in children {
+            anyhow::ensure!(offset.is_multiple_of(8) && offset.checked_add(FRAME_BYTES).is_some_and(|end| end <= raw.len()), "embedded frame outside HIDL structures");
+            anyhow::ensure!(previous.is_none_or(|end| offset >= end), "embedded frames overlap or are out of order");
+            anyhow::ensure!(u32::try_from(bytes.len()).is_ok(), "HIDL byte vector too long");
+            previous = Some(offset + FRAME_BYTES);
+            let at = self.keep(bytes.to_vec());
+            raw[offset..offset + 8].copy_from_slice(&at.to_le_bytes());
+            raw[offset + 8..offset + 12].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+            raw[offset + 12..offset + FRAME_BYTES].fill(0);
+            nested.push((offset, at, bytes.len()));
+        }
+        let at = self.keep(raw);
+        self.framed(at, count, count * stride);
+        let parent = self.addresses.len() - 1;
+        for (offset, at, length) in nested {
+            self.address(at, length, Some((parent, offset)));
+        }
+        Ok(())
+    }
+
     /// Hold on to bytes the driver will read, and say where they are.
     fn keep(&mut self, bytes: Vec<u8>) -> u64 {
         let bytes = bytes.into_boxed_slice();
@@ -98,22 +128,22 @@ impl Message {
         frame.extend_from_slice(&[0; 4]);
         let frame_at = self.keep(frame);
         let parent = self.address(frame_at, FRAME_BYTES, None);
-        self.address(at, length, Some(parent));
+        self.address(at, length, Some((parent, 0)));
     }
 
     /// Write an address among the values and say where it sits, which is
     /// how the driver finds it. The answer is which address this is, for
     /// the one pointing inside it to name.
-    fn address(&mut self, at: u64, length: usize, inside: Option<usize>) -> usize {
+    fn address(&mut self, at: u64, length: usize, inside: Option<(usize, usize)>) -> usize {
         let which = self.addresses.len();
         self.addresses.push(self.data.len() as u64);
         self.data.extend_from_slice(&ADDRESS.to_le_bytes());
         self.data.extend_from_slice(&inside.map_or(0, |_| INSIDE_ANOTHER).to_le_bytes());
         self.data.extend_from_slice(&at.to_le_bytes());
         self.data.extend_from_slice(&(length as u64).to_le_bytes());
-        self.data.extend_from_slice(&(inside.unwrap_or(0) as u64).to_le_bytes());
+        self.data.extend_from_slice(&(inside.map_or(0, |(parent, _)| parent) as u64).to_le_bytes());
         // The address inside the frame is the frame's first field.
-        self.data.extend_from_slice(&0u64.to_le_bytes());
+        self.data.extend_from_slice(&(inside.map_or(0, |(_, offset)| offset) as u64).to_le_bytes());
         self.pointed += (length as u64).next_multiple_of(WORD);
         which
     }
@@ -161,6 +191,20 @@ impl<'a> Answer<'a> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
 
+    pub fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+    }
+
+    /// Read a framed byte vector, including an empty one.
+    pub fn bytes(&mut self) -> Result<&'a [u8]> {
+        let frame = self.pointed()?;
+        anyhow::ensure!(frame.len() == FRAME_BYTES, "invalid HIDL byte vector frame");
+        let count = u32::from_le_bytes(frame[8..12].try_into().expect("four bytes")) as usize;
+        let bytes = self.pointed()?;
+        anyhow::ensure!(bytes.len() == count, "HIDL byte vector count differs from its buffer");
+        Ok(bytes)
+    }
+
     /// A truth value: a byte, padded to four as everything is.
     pub fn bool(&mut self) -> Result<bool> {
         Ok(self.take(4)?[0] != 0)
@@ -177,6 +221,7 @@ impl<'a> Answer<'a> {
         }
         let at = u64::from_le_bytes(raw[8..16].try_into().expect("eight bytes"));
         let length = u64::from_le_bytes(raw[16..24].try_into().expect("eight bytes"));
+        if length == 0 { return Ok(&[]); }
         if at == 0 {
             bail!("the service left out something the call asked for");
         }
@@ -279,6 +324,24 @@ mod tests {
                 (flags, inside, bytes)
             })
             .collect()
+    }
+
+    #[test]
+    fn nested_frames_point_to_the_structure_buffer_and_their_actual_offsets() {
+        let mut m = Message::default();
+        m.structures(&[0; 64], 32, &[(16, b"binding"), (48, b"")]).unwrap();
+        assert_eq!(m.addresses.len(), 4);
+        let object = |i: usize| &m.data[m.addresses[i] as usize..m.addresses[i] as usize + ADDRESS_BYTES];
+        for (i, offset) in [(2, 16), (3, 48)] {
+            assert_eq!(u64::from_le_bytes(object(i)[24..32].try_into().unwrap()), 1);
+            assert_eq!(u64::from_le_bytes(object(i)[32..40].try_into().unwrap()), offset);
+        }
+        let pointer = u64::from_le_bytes(object(1)[8..16].try_into().unwrap());
+        let structures = unsafe { std::slice::from_raw_parts(pointer as *const u8, 64) };
+        assert_eq!(u32::from_le_bytes(structures[24..28].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(structures[56..60].try_into().unwrap()), 0);
+        assert!(m.structures(&[0; 32], 32, &[(24, b"x")]).is_err());
+        assert!(m.structures(&[0; 32], 0, &[]).is_err());
     }
 
     #[test]

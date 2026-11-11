@@ -6,11 +6,12 @@ use anyhow::{ensure, Context, Result};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Where a phone keeps the bundles of shared libraries its own partitions
 /// were built against.
-const BUNDLE_DIRS: [&str; 4] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex"];
+const BUNDLE_DIRS: [&str; 5] = ["/mnt/system_ext/apex", "/mnt/system/system/apex", "/mnt/product/apex", "/vendor/apex", "/system_root/system/apex"];
 
 /// The file inside a bundle that holds its filesystem. It is stored whole,
 /// so the bundle can be opened where it lies.
@@ -20,6 +21,25 @@ const BUNDLE_IMAGE: &str = "apex_payload.img";
 /// inside one.
 const BUNDLE_MOUNT: &str = "/apex";
 const BUNDLE_LIBS: &str = "lib64";
+
+// Only bundles opened by this process are ours to release.
+static OPEN_BUNDLES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Called only after the services using these libraries have exited.
+/// Drop the filesystem and the loop's backing reference before system is
+/// unmounted. An external holder aborts installation through normal umount.
+pub fn release_bundles() -> Result<()> {
+    let mut bundles = OPEN_BUNDLES.lock().expect("bundle list poisoned");
+    while let Some((at, device)) = bundles.last() {
+        if skyward_block::mount::is_mount_point(at)? {
+            skyward_block::mount::umount(at)?;
+        }
+        skyward_block::loopdev::detach(device)?;
+        let _ = skyward_sys::kmsg(&format!("install: released {} and {}", at.display(), device.display()));
+        bundles.pop();
+    }
+    Ok(())
+}
 
 /// Which build of the vendor interface the phone's own partitions were
 /// made for.
@@ -53,7 +73,6 @@ const BUNDLE_LOADER: &str = "bin/linker64";
 
 /// Which programs may register which hardware services, and where the
 /// directory for those services looks for that.
-const SERVICE_LABELS: &str = "/mnt/system/system/etc/selinux/plat_hwservice_contexts";
 const RECOVERY_LABELS: &str = "/system/etc/selinux";
 
 /// The driver the phone's hardware services talk over, as they expect to
@@ -107,8 +126,8 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // Recent libhidlbase checks these standard executable paths before it
     // talks to a hardware directory, even when that directory is running.
     let hardware_program = Path::new("/system/bin/hwservicemanager");
-    let installed_hardware = Path::new("/mnt/system_ext/bin/hwservicemanager");
-    if !hardware_program.exists() && installed_hardware.is_file() {
+    let installed_hardware = ["/mnt/system_ext/bin/hwservicemanager", "/system_root/system/bin/hwservicemanager"].iter().map(Path::new).find(|p| p.is_file());
+    if let Some(installed_hardware) = installed_hardware.filter(|_| !hardware_program.exists()) {
         std::os::unix::fs::symlink(installed_hardware, hardware_program).context("expose installed hardware service directory")?;
     }
     let driver = Path::new(HARDWARE_DRIVER);
@@ -128,9 +147,12 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // are given the modes the system's own copies have.
     fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    let mut labels = vec![Path::new(SERVICE_LABELS)];
+    let system = if Path::new("/system_root/system/build.prop").is_file() { "/system_root/system" } else { "/mnt/system/system" };
+    let hardware_labels = Path::new(system).join("etc/selinux/plat_hwservice_contexts");
+    let service_labels = Path::new(system).join("etc/selinux/plat_service_contexts");
+    let mut labels = vec![hardware_labels.as_path()];
     if !Path::new(DIRECTORY_PROGRAM).is_file() {
-        labels.push(Path::new("/mnt/system/system/etc/selinux/plat_service_contexts"));
+        labels.push(service_labels.as_path());
     }
     for from in labels {
         let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
@@ -175,7 +197,11 @@ fn describe_hardware(wanted: &[String]) -> Result<String> {
 /// need no bundle has none to open.
 pub fn libraries() -> Result<Option<PathBuf>> {
     let Some(version) = skyward_sys::prop(VENDOR_INTERFACE) else { return Ok(None) };
-    Ok(bundle(&format!("com.android.vndk.v{version}"))?.map(|at| at.join(BUNDLE_LIBS)))
+    let named = bundle(&format!("com.android.vndk.v{version}"))?;
+    // Some Android 12 ports ship the vendor ABI bundle under "current".
+    // Use that only when no numbered bundle was found in the installed OS.
+    let at = match named { Some(at) => Some(at), None => bundle("com.android.vndk.current")? };
+    Ok(at.map(|at| at.join(BUNDLE_LIBS)))
 }
 
 /// Open the bundle of this name where it lies, and give where it is. A
@@ -191,6 +217,7 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     };
     let (offset, length) = image(&file)?;
     let device = skyward_block::loopdev::attach(&file, offset, length)?;
+    OPEN_BUNDLES.lock().expect("bundle list poisoned").push((at.clone(), device.clone()));
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
     Ok(Some(at))

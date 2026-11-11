@@ -94,7 +94,7 @@ pub(crate) mod tests {
             cmdline: Box::new([0; 1536]),
             v4_signature_size: Some(0),
         };
-        let mut image = BootImage { header, kernel: Vec::new(), ramdisk: ramdisk.to_vec() }.to_bytes().unwrap();
+        let mut image = BootImage { header: abootimg_oxide::Header::V3(header), kernel: Vec::new(), ramdisk: ramdisk.to_vec() }.to_bytes().unwrap();
         image.resize(1 << 20, 0);
         image
     }

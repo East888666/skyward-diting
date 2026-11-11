@@ -99,6 +99,11 @@ pub enum Step {
     Cache,
     /// /metadata, which holds the key the data partition is opened with.
     Metadata,
+    /// The partition the system runs from, wherever the table mounts it.
+    System,
+    /// The partition the vendor files are on, which is named `cust` on some
+    /// phones and mounted at `/vendor` all the same.
+    Vendor,
     /// Each app's own data, for every user.
     AppData,
     /// The files users share between apps.
@@ -131,6 +136,10 @@ pub enum Refusal {
     NotRebuilt,
     /// The phone has no cache partition.
     NoCache,
+    /// The phone has no /metadata partition.
+    NoMetadata,
+    /// The phone's table has no line for the partition asked for.
+    NoPartition(&'static str),
 }
 
 /// How erasing stopped short.
@@ -155,7 +164,10 @@ fn failed(step: Step) -> impl FnOnce(anyhow::Error) -> Stop {
 pub struct Plan {
     data: Entry,
     cache: Option<Entry>,
-    metadata: Entry,
+    /// /metadata, where the phone has it: it holds the key the data
+    /// partition is opened with, and a phone whose table names no such
+    /// partition has nothing to remake, and nothing that rebuilds itself.
+    metadata: Option<Entry>,
     /// The filesystem each partition is made afresh as, where the system
     /// asked for one.
     reformat: Option<String>,
@@ -172,12 +184,26 @@ pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
         if let Some(hold) = update_hold()? {
             return Ok(Err(Refusal::Update(hold)));
         }
-        let data = first(DATA)?;
-        let rebuilt = data.extra("keydirectory").is_some() && data.extras.iter().any(|e| e == "formattable");
-        if !rebuilt && reformat.is_none() {
-            return Ok(Err(Refusal::NotRebuilt));
-        }
-        Ok(Ok(Plan { data, cache: cache()?, metadata: first(METADATA)?, reformat }))
+        let data = entry_for(DATA)?;
+        let formattable = formattable(DATA)?;
+        // Where the system keeps the key to the data partition in
+        // /metadata it makes the partition afresh itself as it starts, and
+        // the recovery only empties it. Where it keeps no such key -- a
+        // phone that encrypts nothing, or encrypts with a key of the
+        // partition's own -- nobody rebuilds it, so the recovery makes the
+        // filesystem here, as the table says it may, in the filesystem the
+        // partition is really in.
+        let reformat = match reformat {
+            Some(fs) => Some(fs),
+            None if !formattable => return Ok(Err(Refusal::NotRebuilt)),
+            None if data.extra("keydirectory").is_some() => None,
+            None => Some(data.filesystem.clone()),
+        };
+        let _ = skyward_sys::kmsg(&format!(
+            "a factory reset makes {DATA} afresh as {:?}",
+            reformat.as_deref()
+        ));
+        Ok(Ok(Plan { data, cache: cache()?, metadata: at(METADATA)?, reformat }))
     })();
     match plan {
         Ok(Ok(plan)) => Ok(plan),
@@ -186,12 +212,105 @@ pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
     }
 }
 
+/// The partitions the wipe page has chosen, made afresh one after another.
+pub struct Formatting {
+    parts: Vec<(Step, Entry, String)>,
+}
+
+/// Find the partition `step` names and what to make it as: the filesystem
+/// it really holds now, or the table's own where it holds nothing known.
+/// A phone whose table has no line for the cache or the metadata partition
+/// is refused by name, and the data partition is refused where the system
+/// would not start from a filesystem made here either.
+fn one(step: Step) -> Result<(Entry, String), Stop> {
+    let entry = match step {
+        Step::Data => entry_for(DATA).map_err(failed(step))?,
+        Step::Cache => at(CACHE)
+            .map_err(failed(step))?
+            .ok_or(Stop::Refused(Refusal::NoCache))?,
+        Step::Metadata => at(METADATA)
+            .map_err(failed(step))?
+            .ok_or(Stop::Refused(Refusal::NoMetadata))?,
+        // Newer systems run from the partition the table mounts at the root
+        // of everything, and put their vendor files under a name of their
+        // own; the table says which of the older places it still answers.
+        Step::System => at_one_of(&["/", "/system"])
+            .map_err(failed(step))?
+            .ok_or(Stop::Refused(Refusal::NoPartition("system")))?,
+        Step::Vendor => at_one_of(&["/vendor", "/system/vendor", "/cust"])
+            .map_err(failed(step))?
+            .ok_or(Stop::Refused(Refusal::NoPartition("vendor")))?,
+        other => unreachable!("{other:?} is not a partition made afresh on its own"),
+    };
+    if step == Step::Data && !formattable(DATA).map_err(failed(step))? {
+        return Err(Stop::Refused(Refusal::NotRebuilt));
+    }
+    let filesystem = entry.filesystem.clone();
+    Ok((entry, filesystem))
+}
+
+/// Several partitions, made afresh one after another, as the wipe page is
+/// asked to when more than one of its rows is chosen.
+///
+/// **Every one is looked up first**, and the whole choice is refused if any
+/// of them cannot be made afresh: a phone with no cache partition, or a data
+/// partition its system would not start from a filesystem made here, is
+/// turned down before anything has been written, so a choice that cannot be
+/// carried out leaves every partition as it was rather than half of them
+/// empty.
+pub fn format_all(steps: &[Step]) -> Result<Formatting, Stop> {
+    let mut parts = Vec::new();
+    for &step in steps {
+        let (entry, filesystem) = one(step)?;
+        parts.push((step, entry, filesystem));
+    }
+    Ok(Formatting { parts })
+}
+
+impl Formatting {
+    /// Let go of what is mounted from each, empty it, and make the
+    /// filesystem afresh on the partition itself.
+    pub fn carry_out(self, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
+        for (step, entry, filesystem) in self.parts {
+            tell(Event::At(step));
+            match step {
+                Step::Data => {
+                    release_data().map_err(failed(step))?;
+                    let device = fstab::device(&entry).map_err(failed(step))?;
+                    erase::make(Path::new(&device), &filesystem, &entry.extras, casefolds(&entry))
+                        .map_err(failed(step))?;
+                }
+                // The cache partition keeps what the recovery's own logs
+                // are, as a factory reset keeps them.
+                Step::Cache => remake_cache(&entry, &filesystem).map_err(failed(step))?,
+                // A partition the table mounts at more than one place -- the
+                // system's files under the recovery's own root, the vendor
+                // files under a name of their own -- comes off every one of
+                // them before it is made afresh, since what is read from a
+                // partition while it holds a filesystem is not what is
+                // written over it.
+                Step::System | Step::Vendor => {
+                    let name = Path::new(&entry.device)
+                        .file_name()
+                        .with_context(|| format!("{} names no partition", entry.device))
+                        .map_err(failed(step))?;
+                    fstab::unmount(name.to_string_lossy().as_ref()).map_err(failed(step))?;
+                    remake(&entry, &filesystem).map_err(failed(step))?;
+                }
+                _ => remake(&entry, &filesystem).map_err(failed(step))?,
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The update that keeps the data partition from being erased, if one does,
 /// as /metadata tells it: mounted already, or mounted read-only to tell. A
 /// /metadata that does not mount keeps track of no update to lose, and
 /// erasing makes it afresh.
 fn update_hold() -> Result<Option<Hold>> {
-    let Some(current) = skyward_vab::current_slot()? else { return Ok(None) };
+    let Some(current) = skyward_vab::current_slot()? else { return Ok(None);
+    };
     let at = Path::new(METADATA);
     if !mount::is_mount_point(at)? {
         let device = fstab::device(&first(METADATA)?)?;
@@ -207,7 +326,8 @@ impl Plan {
     /// The parts, in the order they are erased.
     pub fn steps(&self) -> Vec<Step> {
         let cache = self.cache.as_ref().map(|_| Step::Cache);
-        std::iter::once(Step::Data).chain(cache).chain(std::iter::once(Step::Metadata)).collect()
+        let metadata = self.metadata.as_ref().map(|_| Step::Metadata);
+        std::iter::once(Step::Data).chain(cache).chain(metadata).collect()
     }
 
     /// Erase each part, telling `tell` of each as it begins. The programs
@@ -240,10 +360,15 @@ impl Plan {
             tell(Event::At(Step::Cache));
             remake_cache(cache, &made_as(cache)).map_err(failed(Step::Cache))?;
         }
-        tell(Event::At(Step::Metadata));
-        remake(&self.metadata, &made_as(&self.metadata)).map_err(failed(Step::Metadata))?;
+        if let Some(metadata) = &self.metadata {
+            tell(Event::At(Step::Metadata));
+        remake(metadata, &made_as(metadata)).map_err(failed(Step::Metadata))?;
+        }
         if !keep_memtag_mode {
-            bcb::forget_memtag_mode(&bcb::misc()).map_err(failed(Step::Metadata))?;
+            // What is forgotten stands in misc, which goes with the last
+            // partition the reset takes in.
+            let part = self.metadata.as_ref().map_or(Step::Data, |_| Step::Metadata);
+            bcb::forget_memtag_mode(&bcb::misc()).map_err(failed(part))?;
         }
         Ok(())
     }
@@ -292,7 +417,7 @@ impl Parts {
     pub fn carry_out(self, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
         let in_data = self.steps.iter().any(|&s| s != Step::Cache);
         if in_data && !mount::is_mount_point(Path::new(DATA)).map_err(|e| Stop::Closed(format!("{e:#}")))? {
-            let opening = crate::decrypt::with_key_service(data::open_without_credential).map_err(Stop::Closed)?;
+            let opening = crate::decrypt::open_data().map_err(Stop::Closed)?;
             tell(Event::Opened(opening));
         }
         let users = Users::of_the_phone();
@@ -319,7 +444,9 @@ impl Parts {
                     let cache = self.cache.as_ref().expect("the cache partition was found as the parts were");
                     remake_cache(cache, self.reformat.as_deref().unwrap_or(&cache.filesystem))
                 }
-                Step::Data | Step::Metadata => unreachable!("only a factory reset erases {step:?}"),
+                Step::Data | Step::Metadata | Step::System | Step::Vendor => {
+                    unreachable!("only a factory reset or a format takes {step:?}")
+            }
             };
             erased.map_err(failed(step))?;
         }
@@ -500,13 +627,84 @@ pub fn cache() -> Result<Option<Entry>> {
 /// The first entry the phone's table has for `mount_point`: the one the
 /// system tries first.
 fn first(mount_point: &str) -> Result<Entry> {
-    fstab::read(mount_point)?.into_iter().next().with_context(|| format!("the phone's table has no {mount_point}"))
+    at(mount_point)?.with_context(|| format!("the phone's table has no {mount_point}"))
+}
+
+/// The table's entry for the first of `points` it has a line for.
+fn at_one_of(points: &[&str]) -> Result<Option<Entry>> {
+    for point in points {
+        if let Some(entry) = at(point)? {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether the phone's table has a line for the partition `step` takes in,
+/// which is what decides whether a row for it is offered at all.
+pub fn has(step: Step) -> Result<bool> {
+    Ok(match step {
+        Step::Data => at(DATA)?.is_some(),
+        Step::Cache => at(CACHE)?.is_some(),
+        Step::Metadata => at(METADATA)?.is_some(),
+        Step::System => at_one_of(&["/", "/system"])?.is_some(),
+        Step::Vendor => at_one_of(&["/vendor", "/system/vendor", "/cust"])?.is_some(),
+        other => unreachable!("{other:?} is not a partition made afresh on its own"),
+    })
+}
+
+/// The entry the phone's table has for `mount_point`, where it has one.
+fn at(mount_point: &str) -> Result<Option<Entry>> {
+    Ok(fstab::read(mount_point)?.into_iter().next())
+}
+
+/// Whether the phone's table lets the partition at `mount_point` be made
+/// afresh. **Any** of its lines may say so: a table marks the filesystem the
+/// system would make the partition as `formattable` and leaves the others
+/// plain, so this phone's ext4 /data -- which is what it holds -- carries
+/// `fileencryption` and no `formattable`, while its f2fs line carries both.
+/// The partition is still made afresh as what is there; the flag only says it
+/// may be, which is why it is asked of every line rather than of the one that
+/// matches.
+fn formattable(mount_point: &str) -> Result<bool> {
+    Ok(fstab::read(mount_point)?
+        .iter().any(|e| e.extras.iter().any(|x| x == "formattable")))
+}
+
+/// The entry of the phone's table that says how the partition at
+/// `mount_point` is really put together now. A table may name one partition
+/// once for every filesystem it might hold, and its first line is only what
+/// the system would try first: what is erased has to be made afresh as the
+/// filesystem that is there, which is the same question opening the data
+/// partition asks. Where the partition holds nothing known -- it was
+/// discarded, or is empty -- the table's first line stands.
+fn entry_for(mount_point: &str) -> Result<Entry> {
+    let entries = fstab::read(mount_point)?;
+    let first = entries
+        .first()
+        .cloned()
+        .with_context(|| format!("the phone's table has no {mount_point}"))?;
+    if entries.len() < 2 {
+        return Ok(first);
+    }
+    let device = fstab::device(&first)?;
+    let now = skyward_block::probe::filesystem(Path::new(&device))?;
+    Ok(now
+        .as_deref()
+        .and_then(|fs| entries.iter().find(|e| e.filesystem == fs))
+        .cloned()
+        .unwrap_or(first))
+}
+
+/// The /metadata partition, where the phone has one.
+pub fn metadata() -> Result<Option<Entry>> {
+    at(METADATA)
 }
 
 /// Make the partition an entry names afresh as `filesystem`, with nothing
 /// mounted from it.
 pub fn remake(entry: &Entry, filesystem: &str) -> Result<()> {
-    let at = Path::new(&entry.mount_point);
+    let at = Path::new(fstab::point(&entry.mount_point));
     if mount::is_mount_point(at)? {
         mount::umount(at)?;
     }
@@ -536,7 +734,15 @@ pub fn release_data() -> Result<()> {
 /// and wait for them to be gone.
 fn end_holders(device: (u32, u32)) -> Result<()> {
     let me = std::process::id() as i32;
-    let others = || -> Result<Vec<(i32, String)>> { Ok(mount::holding(device)?.into_iter().filter(|(pid, _)| *pid != me).collect()) };
+    // The recovery is not its own ending: init, and the shell that started
+    // this one and keeps its output, hold the data partition as the programs
+    // they serve do, and ending either takes the recovery down with them --
+    // which is what a reboot at the tap on a format asks of nobody. What is
+    // left holding the partition makes the unmount fail with what the kernel
+    // says, which is a thing the page can tell.
+    let group = unsafe { libc::getpgrp() };
+    let kin = |pid: i32| pid == 1 || pid == me || unsafe { libc::getpgid(pid) } == group;
+    let others = || -> Result<Vec<(i32, String)>> { Ok(mount::holding(device)?.into_iter().filter(|(pid, _)| !kin(*pid)).collect()) };
     for (pid, name) in others()? {
         skyward_sys::kmsg(&format!("ending {name} ({pid}), which holds the data partition"))?;
         if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
@@ -596,7 +802,9 @@ fn clear(paths: &[PathBuf], tell: &mut dyn FnMut(Event)) -> Result<()> {
 /// Delete every file under `folders`, leaving each folder in them as the
 /// system made it, telling `tell` how many files are gone of how many.
 fn clear_files(folders: &[PathBuf], tell: &mut dyn FnMut(Event)) -> Result<()> {
-    told(tell, |cancel, progress| skyward_files::delete_files(folders, cancel, progress))
+    told(tell, |cancel, progress| {
+        skyward_files::delete_files(folders, cancel, progress)
+})
 }
 
 /// Do `work`, telling `tell` how far it has come at most every
@@ -694,8 +902,9 @@ pub fn remake_cache(entry: &Entry, filesystem: &str) -> Result<()> {
     let device = PathBuf::from(fstab::device(entry)?);
     let kept = read_logs(&device, at)?;
     remake(entry, filesystem)?;
-    let Some((folder, logs)) = kept else { return Ok(()) };
-    fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+    let Some((folder, logs)) = kept else { return Ok(());
+    };
+    mount::prepare(at)?;
     // The table's options are for the filesystem it names.
     let options: &[String] = if filesystem == entry.filesystem { &entry.options } else { &[] };
     mount::mount(&device, at, filesystem, options)?;
@@ -722,7 +931,7 @@ fn read_logs(device: &Path, at: &Path) -> Result<Option<(Look, Vec<Log>)>> {
     if mount::is_mount_point(at)? {
         mount::umount(at)?;
     }
-    fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+    mount::prepare(at)?;
     if let Err(e) = mount::mount_ro(device, at) {
         skyward_sys::kmsg(&format!("{} does not mount, so it keeps no logs: {e:#}", device.display()))?;
         return Ok(None);

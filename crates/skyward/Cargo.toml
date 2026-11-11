@@ -8,6 +8,12 @@ license.workspace = true
 name = "skyward"
 path = "src/main.rs"
 
+[features]
+default = ["wifi"]
+# Leave this off for small recovery partitions. Local flashing, ADB and
+# MTP remain available; WLAN and online updates are omitted.
+wifi = ["dep:ureq", "skyward-net/https"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
@@ -37,5 +43,5 @@ procfs = { version = "0.18.0", default-features = false }
 skyward-ui = { path = "../skyward-ui" }
 skyward-mtp = { path = "../skyward-mtp" }
 skyward-systems = { path = "../skyward-systems" }
-skyward-net = { path = "../skyward-net" }
-ureq = { version = "=3.5.0", default-features = false }
+skyward-net = { path = "../skyward-net", default-features = false }
+ureq = { version = "=3.5.0", default-features = false, optional = true }

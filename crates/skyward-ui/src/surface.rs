@@ -14,6 +14,82 @@ pub trait Surface {
     fn settle(&mut self) -> Result<()>;
 }
 
+/// Read only the completion flag needed by our single outstanding commit.
+/// Older Qualcomm kernels leave both crtc_id and user_data zero in a flip
+/// event. drm's typed iterator unwraps that zero as a nonzero CRTC handle;
+/// no handle is needed here, because this fd drives only the built-in panel.
+#[cfg(any(target_os = "android", test))]
+fn page_flip_complete(mut bytes: &[u8]) -> Result<bool> {
+    let mut complete = false;
+    while !bytes.is_empty() {
+        anyhow::ensure!(bytes.len() >= 8, "truncated DRM event header");
+        let kind = u32::from_ne_bytes(bytes[..4].try_into()?);
+        let len = u32::from_ne_bytes(bytes[4..8].try_into()?) as usize;
+        anyhow::ensure!(len >= 8 && len <= bytes.len(), "invalid DRM event length {len}");
+        // DRM_EVENT_FLIP_COMPLETE, with the drm_event_vblank payload.
+        if kind == 2 {
+            anyhow::ensure!(len >= 32, "truncated DRM page flip event");
+            complete = true;
+        }
+        bytes = &bytes[len..];
+    }
+    Ok(complete)
+}
+
+#[cfg(test)]
+mod flip_event_tests {
+    use super::page_flip_complete;
+
+    fn event(kind: u32, crtc: u32, cookie: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 32];
+        bytes[..4].copy_from_slice(&kind.to_ne_bytes());
+        bytes[4..8].copy_from_slice(&32u32.to_ne_bytes());
+        bytes[8..16].copy_from_slice(&cookie.to_ne_bytes());
+        bytes[28..32].copy_from_slice(&crtc.to_ne_bytes());
+        bytes
+    }
+
+    #[test]
+    fn legacy_and_modern_flips_complete_without_a_handle() {
+        assert!(page_flip_complete(&event(2, 0, 0)).unwrap());
+        assert!(page_flip_complete(&event(2, 42, 0)).unwrap());
+        assert!(page_flip_complete(&event(2, 0, 42)).unwrap());
+    }
+
+    #[test]
+    fn unrelated_events_do_not_complete_a_commit() {
+        let mut bytes = event(1, 0, 0);
+        assert!(!page_flip_complete(&bytes).unwrap());
+        bytes.extend(event(2, 0, 0));
+        assert!(page_flip_complete(&bytes).unwrap());
+        assert!(!page_flip_complete(&[]).unwrap());
+    }
+
+    #[test]
+    fn malformed_events_return_errors_instead_of_panicking_or_looping() {
+        for length in [0, 7, 8, 31, 33] {
+            let mut bytes = event(2, 0, 0);
+            bytes[4..8].copy_from_slice(&(length as u32).to_ne_bytes());
+            assert!(page_flip_complete(&bytes).is_err(), "length {length}");
+        }
+        assert!(page_flip_complete(&[0; 7]).is_err());
+        let mut bytes = event(2, 0, 0);
+        bytes.push(0);
+        assert!(page_flip_complete(&bytes).is_err());
+    }
+}
+
+/// How the display stands: lit, resting with nothing shown on it, or off.
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Power {
+    On,
+    /// The panel rests, ready to light again at once, with the display
+    /// processor stopped or the backlight down.
+    Resting,
+    Off,
+}
+
 /// How Qualcomm's display driver drives a mode, from the text of the
 /// connector's mode_properties blob: key=value lines, a block per mode_name.
 #[cfg(any(target_os = "android", test))]
@@ -202,11 +278,12 @@ mod tests {
 #[cfg(target_os = "android")]
 pub mod kms {
     use super::*;
+    use crate::commit::CommitWorker;
     use anyhow::{anyhow, Context};
     use drm::buffer::{self, DrmFourcc, DrmModifier, PlanarBuffer};
     use drm::control::dumbbuffer::DumbBuffer;
     use drm::control::{
-        atomic, connector, framebuffer, plane, property, AtomicCommitFlags, Device as ControlDevice, Event, FbCmd2Flags, ModeTypeFlags, PlaneType,
+        atomic, connector, framebuffer, plane, property, AtomicCommitFlags, Device as ControlDevice, FbCmd2Flags, ModeTypeFlags, PlaneType,
         ResourceHandle,
     };
     use drm::Device;
@@ -327,10 +404,13 @@ pub mod kms {
         matches!(interface, connector::Interface::DSI | connector::Interface::EmbeddedDisplayPort | connector::Interface::LVDS)
     }
 
-    /// Commit without blocking and wait for the flip event, so a commit the
-    /// display never completes surfaces as an error instead of an endless
-    /// wait.
-    fn commit(card: &Card, req: atomic::AtomicModeReq, flags: AtomicCommitFlags) -> Result<()> {
+    /// Legacy drivers may need the ioctl to finish the commit without
+    /// allocating a userspace flip event. Otherwise retain the bounded
+    /// event wait used by modern devices.
+    fn commit(card: &Card, req: atomic::AtomicModeReq, flags: AtomicCommitFlags, blocking: bool) -> Result<()> {
+        if blocking {
+            return card.atomic_commit(flags, req).context("blocking atomic commit");
+        }
         card.atomic_commit(flags | AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT, req).context("atomic commit")?;
         flipped(card)
     }
@@ -353,10 +433,16 @@ pub mod kms {
             if n == 0 {
                 return Err(anyhow!("the display did not complete the commit within {} ms", COMMIT_TIMEOUT.as_millis()));
             }
-            for event in card.receive_events().context("read display events")? {
-                if let Event::PageFlip(_) = event {
-                    return Ok(());
-                }
+            use std::io::Read;
+            let mut events = [0u8; 4096];
+            let amount = match (&card.0).read(&mut events) {
+                Ok(0) => return Err(anyhow!("the display event stream closed")),
+                Ok(amount) => amount,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e).context("read display events"),
+            };
+            if page_flip_complete(&events[..amount])? {
+                return Ok(());
             }
         }
     }
@@ -467,16 +553,6 @@ pub mod kms {
     /// Direct scanout on the built-in panel: its fastest mode on the CRTC
     /// driving it, three dumb buffers taken in turn on its primary planes,
     /// and every other connector and plane taken off that CRTC.
-    /// How the display stands.
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Power {
-        On,
-        /// The panel rests in its low-power mode, the display processor
-        /// stopped.
-        Resting,
-        Off,
-    }
-
     pub struct KmsSurface {
         card: Card,
         bufs: [Buf; 3],
@@ -484,6 +560,14 @@ pub mod kms {
         back: usize,
         /// A frame was committed whose flip has not come yet.
         flipping: bool,
+        /// Do not request flip events from a driver with broken event lifetime.
+        blocking: bool,
+        worker: Option<CommitWorker<(atomic::AtomicModeReq, AtomicCommitFlags)>>,
+        frames: u32,
+        copy_time: Duration,
+        wait_time: Duration,
+        commit_time: Duration,
+        commits: u32,
         /// The planes showing the buffer, one per layer mixer, with their
         /// FB_ID properties.
         planes: Vec<(plane::Handle, property::Handle)>,
@@ -515,7 +599,8 @@ pub mod kms {
     }
 
     impl KmsSurface {
-        pub fn open(path: &str) -> Result<Self> {
+        pub fn open(path: &str, blocking: bool, pipelined: bool) -> Result<Self> {
+            anyhow::ensure!(!pipelined || blocking, "pipelined commits require blocking commits");
             let card = open_card(path)?;
             let res = card.resource_handles().context("read KMS resources")?;
 
@@ -708,12 +793,12 @@ pub mod kms {
             }
             // The panel comes up in its preferred mode, then switches to the
             // fastest, as `to_fastest` says why.
-            commit(&card, req, AtomicCommitFlags::ALLOW_MODESET).context("set the panel mode")?;
+            commit(&card, req, AtomicCommitFlags::ALLOW_MODESET, blocking).context("set the panel mode")?;
             let fastest = (mode.vrefresh() != preferred.vrefresh()).then_some(blob);
 
             let ids: Vec<u32> = planes.iter().map(|p| u32::from(p.0)).collect();
             let summary = format!(
-                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}",
+                "{:?} connector {} mode {:?} {w}x{h} {} Hz, crtc {}, planes {ids:?} {:?}{}, blocking commits {blocking}, pipelined commits {pipelined}",
                 conn.interface(),
                 u32::from(conn.handle()),
                 mode.name(),
@@ -728,11 +813,28 @@ pub mod kms {
                 Err(_) => None,
             };
             let conn = conn.handle();
+            let worker = if pipelined {
+                let commit_card = Card(card.0.try_clone().context("share display fd with commit worker")?);
+                Some(CommitWorker::start(move |(req, flags)| {
+                    // Both the config and this branch require blocking
+                    // commits. Never allocate a userspace flip event here.
+                    commit_card.atomic_commit(flags, req).context("blocking atomic commit")
+                })?)
+            } else {
+                None
+            };
             let s = KmsSurface {
                 card,
                 bufs,
                 back: 1,
                 flipping: false,
+                blocking,
+                worker,
+                frames: 0,
+                copy_time: Duration::ZERO,
+                wait_time: Duration::ZERO,
+                commit_time: Duration::ZERO,
+                commits: 0,
                 planes,
                 crtc,
                 active,
@@ -777,7 +879,8 @@ pub mod kms {
             if self.power != Power::On {
                 return Ok(());
             }
-            let Some((id, _, rest)) = self.lp else { return self.turn_off() };
+            let Some((id, _, rest)) = self.lp else { return self.turn_off();
+            };
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
             req.add_property(self.conn, id, property::Value::UnsignedRange(rest));
@@ -823,18 +926,26 @@ pub mod kms {
         /// running panel sends it the commands for the new rate, as Android's
         /// switches do.
         fn to_fastest(&self) -> Result<()> {
-            let Some(fastest) = self.fastest else { return Ok(()) };
+            let Some(fastest) = self.fastest else { return Ok(());
+            };
             let mut req = atomic::AtomicModeReq::new();
             req.add_property(self.crtc, self.mode_id, fastest);
             if let Some((id, setup)) = self.spr {
                 req.add_property(self.crtc, id, setup);
             }
-            commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET).context("switch the panel to its fastest refresh")
+            commit(&self.card, req, AtomicCommitFlags::ALLOW_MODESET, self.blocking).context("switch the panel to its fastest refresh")
         }
     }
 
     impl Drop for KmsSurface {
         fn drop(&mut self) {
+            if let Some(mut worker) = self.worker.take() {
+                if let Err(error) = worker.settle() {
+                    eprintln!("settle display before shutdown: {error:#}");
+                }
+                // Join before unmapping buffers, including error paths.
+                drop(worker);
+            }
             for buf in &self.bufs {
                 unsafe { libc::munmap(buf.map.cast(), buf.len) };
             }
@@ -859,6 +970,7 @@ pub mod kms {
             if (canvas.w, canvas.h) != (self.w, self.h) {
                 return Err(anyhow!("canvas {}x{} does not match the display {}x{}", canvas.w, canvas.h, self.w, self.h));
             }
+            let copy_started = Instant::now();
             let order = self.order;
             let buf = &self.bufs[self.back];
             let pitch = buffer::Buffer::pitch(&buf.db) as usize;
@@ -876,11 +988,16 @@ pub mod kms {
                     }
                 }
             }
+            self.copy_time += copy_started.elapsed();
             let mut req = atomic::AtomicModeReq::new();
             for &(plane, fb_prop) in &self.planes {
                 req.add_property(plane, fb_prop, property::Value::Framebuffer(Some(buf.fb)));
             }
-            let mut flags = AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT;
+            let mut flags = if self.blocking {
+                AtomicCommitFlags::empty()
+            } else {
+                AtomicCommitFlags::NONBLOCK | AtomicCommitFlags::PAGE_FLIP_EVENT
+            };
             if self.power != Power::On {
                 // The panel runs again, and coming on from off it would
                 // otherwise rest again as it last did.
@@ -897,22 +1014,794 @@ pub mod kms {
                 flags |= AtomicCommitFlags::ALLOW_MODESET;
             }
             self.settle()?;
-            self.card.atomic_commit(flags, req).context(if self.power == Power::On { "flip" } else { "turn the display on" })?;
+            if let Some(worker) = &mut self.worker {
+                worker.submit((req, flags))?;
+            } else {
+                let commit_started = Instant::now();
+                self.card.atomic_commit(flags, req).context(if self.power == Power::On { "flip" } else { "turn the display on" })?;
+                self.commit_time += commit_started.elapsed();
+                self.commits += 1;
+            }
             if self.power == Power::Off {
                 self.slow = self.fastest.is_some();
             }
             self.power = Power::On;
-            self.flipping = true;
+            self.flipping = self.worker.is_some() || !self.blocking;
             self.back = (self.back + 1) % self.bufs.len();
+            self.frames += 1;
+            if self.frames == 120 {
+                eprintln!("display timing: frames={}, commits={}, copy_avg_us={}, settle_avg_us={}, ioctl_avg_us={}, pipelined={}",
+                    self.frames, self.commits, self.copy_time.as_micros() / u128::from(self.frames),
+                    self.wait_time.as_micros() / u128::from(self.frames),
+                    self.commit_time.as_micros() / u128::from(self.commits.max(1)), self.worker.is_some());
+                self.frames = 0;
+                self.copy_time = Duration::ZERO;
+                self.wait_time = Duration::ZERO;
+                self.commit_time = Duration::ZERO;
+                self.commits = 0;
+            }
             Ok(())
         }
 
         fn settle(&mut self) -> Result<()> {
             if self.flipping {
-                flipped(&self.card).context("flip")?;
+                let started = Instant::now();
+                if let Some(worker) = &mut self.worker {
+                    if let Some(elapsed) = worker.settle()? {
+                        self.commit_time += elapsed;
+                        self.commits += 1;
+                    }
+                } else {
+                    flipped(&self.card).context("flip")?;
+                }
+                self.wait_time += started.elapsed();
                 self.flipping = false;
             }
             Ok(())
+        }
+    }
+}
+
+/// The panel as the older Qualcomm kernels leave it lit: an fbdev, whose
+/// buffer is mapped once and whose two pages are pointed at in turn.
+///
+/// `libc` carries none of the framebuffer's own types, so `Var` and `Fix`
+/// below are this file's claim about the kernel's `fb.h`. It is checked as
+/// the device opens: a field put in the wrong place reads back sizes that
+/// cannot be true of a panel, and the checks there refuse the device.
+#[cfg(target_os = "android")]
+pub mod fb {
+    use super::Canvas;
+    use super::Power;
+    use super::Surface;
+    use anyhow::{anyhow, bail, ensure, Context, Result};
+    use std::fs::OpenOptions;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::path::{Path, PathBuf};
+
+    /// The ioctls of the kernel's `fb.h`, numbered as it numbers them.
+    const GET_VSCREENINFO: libc::c_int = 0x4600;
+    const GET_FSCREENINFO: libc::c_int = 0x4602;
+    const PUT_VSCREENINFO: libc::c_int = 0x4601;
+    /// Ask about the panel's power. Its argument is the blank mode itself and
+    /// not a pointer, so it is not asked for through [`ioctl`].
+    const BLANK: libc::c_int = 0x4611;
+    const BLANK_UNBLANK: usize = 0;
+    const BLANK_POWERDOWN: usize = 4;
+
+    /// How the buffer's bytes stand against the canvas's RGBA.
+    #[derive(Clone, Copy, Debug)]
+    enum Order {
+        Rgba,
+        Bgra,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Bitfield {
+        offset: u32,
+        length: u32,
+        msb_first: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Var {
+        xres: u32,
+        yres: u32,
+        xres_virtual: u32,
+        yres_virtual: u32,
+        xoffset: u32,
+        yoffset: u32,
+        bits_per_pixel: u32,
+        grayscale: u32,
+        red: Bitfield,
+        green: Bitfield,
+        blue: Bitfield,
+        transp: Bitfield,
+        nonstd: u32,
+        activate: u32,
+        height: u32,
+        width: u32,
+        accel_flags: u32,
+        pixclock: u32,
+        left_margin: u32,
+        right_margin: u32,
+        upper_margin: u32,
+        lower_margin: u32,
+        hsync_len: u32,
+        vsync_len: u32,
+        sync: u32,
+        vmode: u32,
+        rotate: u32,
+        colorspace: u32,
+        reserved: [u32; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Fix {
+        id: [u8; 16],
+        smem_start: usize,
+        smem_len: u32,
+        type_: u32,
+        type_aux: u32,
+        visual: u32,
+        xpanstep: u16,
+        ypanstep: u16,
+        ywrapstep: u16,
+        /// Where a row begins, which the kernel pads out past the pixels.
+        line_length: u32,
+        mmio_start: usize,
+        mmio_len: u32,
+        accel: u32,
+        capabilities: u16,
+        reserved: [u16; 2],
+    }
+
+    fn ioctl<T>(fd: libc::c_int, request: libc::c_int, arg: &mut T) -> Result<()> {
+        let r = unsafe { libc::ioctl(fd, request, arg as *mut T) };
+        ensure!(r == 0, "{}", std::io::Error::last_os_error());
+        Ok(())
+    }
+
+    fn ioctl_int(fd: libc::c_int, request: libc::c_int, value: usize) -> std::io::Result<()> {
+        let r = unsafe { libc::ioctl(fd, request, value) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// How many blanks in a row a screen may fail to give before its frames
+    /// stop being waited for.
+    const BLANKS_MISSED: u8 = 3;
+
+    pub struct FbSurface {
+        file: std::fs::File,
+        map: *mut u8,
+        len: usize,
+        var: Var,
+        w: u32,
+        h: u32,
+        /// Bytes from one row of the buffer to the next, which the virtual
+        /// width sets, and pages of `h` rows the buffer holds.
+        pitch: usize,
+        pages: u32,
+        /// The page the next frame goes into, and whether a pan is owed.
+        back: u32,
+        flipping: bool,
+        order: Order,
+        /// Where the kernel tells this fbdev's vertical blank, when it does.
+        vsync: Option<PathBuf>,
+        /// Which flip the kernel took has been told about once already.
+        told: bool,
+        /// Whether the visible page can be moved at all. A driver with no pan
+        /// step has no flip to answer, only a buffer to be drawn into.
+        flip: bool,
+        /// Frames shown, so that the driver's count of what it transmitted
+        /// is read once there are enough of them to mean something.
+        frames: u32,
+        /// Where the driver tells the panel's own power, if it tells it.
+        lit_at: Option<PathBuf>,
+        /// Whether the blank that shows a frame has failed to come since the
+        /// screen was last set up, and that has been said.
+        blank_told: bool,
+        /// How many blanks in a row have failed to come. A screen whose
+        /// blanks have stopped is one where every frame costs the whole wait,
+        /// which is a screen that reads as broken rather than slow.
+        blank_missed: u8,
+        /// Whether the panel is lit, resting with the backlight down, or
+        /// blanked.
+        power: Power,
+        summary: String,
+    }
+
+    impl FbSurface {
+        pub fn open(path: &str) -> Result<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .with_context(|| format!("open {path}"))?;
+            let fd = file.as_raw_fd();
+            let mut var: Var = unsafe { std::mem::zeroed() };
+            ioctl(fd, GET_VSCREENINFO, &mut var).with_context(|| format!("{path}: read its mode"))?;
+            let mut fix: Fix = unsafe { std::mem::zeroed() };
+            ioctl(fd, GET_FSCREENINFO, &mut fix).with_context(|| format!("{path}: read its layout"))?;
+
+            // The two structs above describe the kernel's by claim, not by
+            // construction, so the mode is refused unless what they read back
+            // can only be a panel this surface could draw on: the red, green
+            // and blue fields of an eight-bit-per-component 32-bit mode lie
+            // within it, and one row of the buffer is as wide as the virtual
+            // mode asked for.
+            ensure!(
+                var.bits_per_pixel == 32,
+                "{} gives {} bits per pixel, and this surface draws 32",
+                path,
+                var.bits_per_pixel
+            );
+            for (name, field) in [("red", &var.red), ("green", &var.green), ("blue", &var.blue)] {
+                ensure!(
+                    field.length == 8 && field.offset + field.length <= 32,
+                    "{}: {} occupies {} bits at {}, which is not an eight-bit component of a 32-bit pixel",
+                    path,
+                    name,
+                    field.length,
+                    field.offset
+                );
+            }
+            let row = fix.line_length as usize;
+            ensure!(
+                row >= var.xres_virtual as usize * 4,
+                "{}: {} pixels wide need {} bytes in a row, where the buffer gives {}",
+                path,
+                var.xres_virtual,
+                var.xres_virtual as usize * 4,
+                row
+            );
+            let (w, h) = (var.xres, var.yres);
+            ensure!(w != 0 && h != 0, "{path} reports no mode");
+            ensure!(
+                var.yres_virtual >= h && var.yres_virtual.is_multiple_of(h),
+                "{} holds {} rows, which is not whole pages of {}",
+                path,
+                var.yres_virtual,
+                h
+            );
+            let pages = var.yres_virtual / h;
+            ensure!(
+                pages >= 2,
+                "{} holds one page of {}; a frame would be drawn over the one showing",
+                path,
+                h
+            );
+
+            let needed = var.yres_virtual as usize * row;
+            ensure!(
+                fix.smem_len as usize >= needed,
+                "{} maps {} bytes, which is not the {} it needs for {} pages of {}",
+                path,
+                fix.smem_len,
+                needed,
+                pages,
+                h
+            );
+            let len = fix.smem_len as usize;
+            let map = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
+            };
+            ensure!(
+                map != libc::MAP_FAILED,
+                "mmap {}: {}",
+                path,
+                std::io::Error::last_os_error()
+            );
+
+            // An RGB32 mode lays its pixels out as blue first in memory, so
+            // the canvas's red and blue are put across; one whose red sits at
+            // byte zero needs nothing done to it.
+            let order = match (var.red.offset, var.blue.offset) {
+                (0, 16) => Order::Rgba,
+                (16, 0) => Order::Bgra,
+                (r, b) => bail!(
+                    "{} puts red at {} and blue at {}, which this surface does not know",
+                    path,
+                    r,
+                    b
+                ),
+            };
+            let name = Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let vsync = [
+                format!("/sys/class/graphics/{name}/vsync_event"),
+                "/sys/class/graphics/fb0/vsync_event".to_string(),
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+            let lit_at = [
+                format!("/sys/class/graphics/{name}/show_blank_event"),
+                "/sys/class/graphics/fb0/show_blank_event".to_string(),
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists());
+            let summary = format!(
+                "{path} {}x{} of {}x{}, {}, {}, panstep {} {} {}, mode {} layout {} bytes, flipping {}",
+                w,
+                h,
+                var.xres_virtual,
+                var.yres_virtual,
+                String::from_utf8_lossy(&fix.id).trim_end_matches('\0'),
+                if matches!(order, Order::Rgba) { "RGBA" } else { "BGRA" },
+                fix.xpanstep,
+                fix.ypanstep,
+                fix.ywrapstep,
+                std::mem::size_of::<Var>(),
+                std::mem::size_of::<Fix>(),
+                if vsync.is_some() { "at the blank" } else { "at once" }
+            );
+            Ok(FbSurface {
+                file,
+                map: map.cast(),
+                len,
+                var,
+                w,
+                h,
+                pitch: row,
+                pages,
+                back: 1 % pages,
+                flipping: false,
+                order,
+                vsync,
+                told: false,
+                flip: pages >= 2,
+                frames: 0,
+                lit_at,
+                blank_told: false,
+                blank_missed: 0,
+                power: Power::On,
+                summary,
+            })
+        }
+
+        pub fn describe(&self) -> &str {
+            &self.summary
+        }
+
+        pub fn is_on(&self) -> bool {
+            self.power == Power::On
+        }
+
+        pub fn is_off(&self) -> bool {
+            self.power == Power::Off
+        }
+
+        /// Let the panel rest: the backlight is already down and the page
+        /// showing is black, so a driver with no low-power mode of its own
+        /// leaves the panel as it is until the display turns off.
+        pub fn rest(&mut self) -> Result<()> {
+            if self.power != Power::On {
+                return Ok(());
+            }
+            self.power = Power::Resting;
+            Ok(())
+        }
+
+        /// Turn the display off: the panel stops scanning, and the display
+        /// engine with it. The next frame presented powers it again.
+        pub fn turn_off(&mut self) -> Result<()> {
+            if self.power == Power::Off {
+                return Ok(());
+            }
+            self.settle()?;
+            let r = ioctl_int(self.file.as_raw_fd(), BLANK, BLANK_POWERDOWN);
+            eprintln!("turn the display off: {r:?}");
+            r.context("turn the display off")?;
+            self.power = Power::Off;
+            Ok(())
+        }
+
+        /// A panel with one mode needs no switch once it is lit again.
+        pub fn speed_up(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        /// Power the panel back up after the display turned off — **the whole
+        /// of what taking it over does**, not the power cycle alone.
+        ///
+        /// A blanked driver may forget the virtual height it was given and
+        /// hand back a buffer of its own choosing, and this surface would go
+        /// on writing the page count it remembered into a mapping it no
+        /// longer owns. Every flip after that is then a mode change rather
+        /// than a page being named, and a frame that changes the mode costs
+        /// many times one that does not: the screen goes from smooth to
+        /// unusable after a single sleep and wake, which is what the Mi MIX 2
+        /// does. The Mi 6's driver keeps both across a blank, which is why
+        /// the power cycle alone was enough there and this never showed.
+        fn wake(&mut self) {
+            // What the driver has now is what the takeover has to ask from.
+            let fd = self.file.as_raw_fd();
+            let mut var: Var = unsafe { std::mem::zeroed() };
+            if ioctl(fd, GET_VSCREENINFO, &mut var).is_ok() {
+                self.var = var;
+            }
+            self.take_over("after it was turned off");
+        }
+
+        /// Make the panel look at the memory the driver owns, the way the
+        /// recovery that works on this phone does it: a mode write that really
+        /// changes something, the panel powered down and back up, and then the
+        /// mapping remade on whatever the driver ended up owning. Before this,
+        /// the display engine holds no buffer for the framebuffer at all, so
+        /// nothing it could fetch however the page is asked for, and one
+        /// unblank can be swallowed by the phone's own panel code while still
+        /// answering success, so the cycle is repeated until the driver reports
+        /// the panel lit. A failure here is told and not returned: a recovery
+        /// that goes on drawing is worth more than no recovery.
+        fn take_over(&mut self, why: &str) {
+            let fd = self.file.as_raw_fd();
+            // The number is what the working recovery asks for, not what it
+            // gets back: the driver is free to widen a virtual height it
+            // cannot show two pages in, and what matters is that the answer
+            // differs from the mode as read, which is what takes the code past
+            // the comparison that drops a mode write changing nothing.
+            let mut ask = self.var;
+            ask.yres_virtual = ask.yres * 2;
+            ask.yoffset = 0;
+            ask.bits_per_pixel = 32;
+            let asked = ioctl(fd, PUT_VSCREENINFO, &mut ask);
+            eprintln!(
+                "ask the driver for {} rows of {} bits, activate as read {}: {asked:?}",
+                ask.yres_virtual, ask.bits_per_pixel, ask.activate
+            );
+            for try_no in 1..=3 {
+                let down = ioctl_int(fd, BLANK, BLANK_POWERDOWN);
+                let up = ioctl_int(fd, BLANK, BLANK_UNBLANK);
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let now = self
+                    .lit_at
+                    .as_ref()
+                    .and_then(|at| std::fs::read_to_string(at).ok())
+                    .unwrap_or_default();
+                eprintln!(
+                    "take over the panel {why} ({try_no}): down {down:?} up {up:?}, lit reads {:?}",
+                    now.trim()
+                );
+                if now.trim().ends_with('1') {
+                    break;
+                }
+            }
+            // The buffer the engine reads now is the one allocated during the
+            // takeover, so the mapping made before it has to follow. Both
+            // answers are read again and the screen they names is mapped; the
+            // old mapping is only let go once the new one exists, so a step
+            // that fails leaves the surface drawing where it was rather than
+            // into memory the driver has handed back.
+            let mut var: Var = unsafe { std::mem::zeroed() };
+            let mut fix: Fix = unsafe { std::mem::zeroed() };
+            let mode = ioctl(fd, GET_VSCREENINFO, &mut var);
+            let layout = ioctl(fd, GET_FSCREENINFO, &mut fix);
+            let row = fix.line_length as usize;
+            let pages = var.yres_virtual.checked_div(var.yres).unwrap_or(0);
+            let len = fix.smem_len as usize;
+            let fresh = if mode.is_err() || layout.is_err() || pages == 0 || len == 0 {
+                None
+            } else {
+                let map = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                };
+                if map == libc::MAP_FAILED {
+                    None
+                } else {
+                    Some(map)
+                }
+            };
+            let Some(map) = fresh else {
+                eprintln!("the screen could not be mapped after the takeover ({mode:?} {layout:?}, {len} bytes for {pages} pages); drawing goes on where it was");
+                return;
+            };
+            unsafe { libc::munmap(self.map.cast(), self.len) };
+            self.map = map.cast();
+            unsafe { std::slice::from_raw_parts_mut(self.map, self.len).fill(0) };
+            self.len = len;
+            self.pitch = row;
+            self.pages = pages;
+            self.var = var;
+            self.back = 0;
+            self.flip = pages >= 2;
+            // A blank that failed to come before the screen was set up may
+            // come again now that it has been, so the next one is worth
+            // saying too.
+            self.blank_told = false;
+            self.blank_missed = 0;
+            eprintln!(
+                "mapped the screen the driver owns: {}x{} of {}x{}, row {row}, {pages} pages, {len} bytes, {}",
+                var.xres,
+                var.yres,
+                var.xres_virtual,
+                var.yres_virtual,
+                if self.flip {
+                    "flipping between pages"
+                } else {
+                    "drawing in the one page"
+                }
+            );
+        }
+    }
+
+    impl Drop for FbSurface {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.map.cast(), self.len) };
+        }
+    }
+
+    impl Surface for FbSurface {
+        fn size(&self) -> (u32, u32) {
+            (self.w, self.h)
+        }
+
+        /// A frame is written into the page not showing and pointed at next,
+        /// which the driver shows at the blank after the frame before it; the
+        /// buffer is written through its mapping, so no copy is made of the
+        /// frame as a whole.
+        fn present(&mut self, canvas: &Canvas) -> Result<()> {
+            if (canvas.w, canvas.h) != (self.w, self.h) {
+                return Err(anyhow!(
+                    "canvas {}x{} does not match the display {}x{}",
+                    canvas.w,
+                    canvas.h,
+                    self.w,
+                    self.h
+                ));
+            }
+            if self.power == Power::Off {
+                self.wake();
+            }
+            // **Lit again, whichever it was.** A panel that only rested is
+            // lit by the frame shown to it, and one that was turned off is
+            // woken first; either way the surface is on from here, which is
+            // what the KMS surface says on every frame it shows.
+            //
+            // Left resting, the surface goes on answering "not on" for the
+            // rest of its life, and the loop above reads that as a wake on
+            // every frame — so it writes what the device configuration says
+            // to the touch controller every frame, and a write to that
+            // controller costs a hundred times a frame. Measured on the Mi
+            // MIX 2: sixteen milliseconds a frame before the screen was put
+            // out and back, two hundred and fifty after, for as long as the
+            // page stayed up. A screen put out and woken again *before* it
+            // had rested long enough to be turned off is what leaves it
+            // resting, which is exactly what pressing the power key twice
+            // does.
+            self.power = Power::On;
+            self.settle()?;
+            let row = self.w as usize * 4;
+            let base = if self.flip {
+                self.back as usize * self.h as usize * self.pitch
+            } else {
+                0
+            };
+            for y in 0..self.h as usize {
+                let src = &canvas.data[y * row..(y + 1) * row];
+                let out = unsafe { std::slice::from_raw_parts_mut(self.map.add(base + y * self.pitch), row) };
+                match self.order {
+                    Order::Rgba => out.copy_from_slice(src),
+                    Order::Bgra => {
+                        for (o, s) in out.as_chunks_mut::<4>().0.iter_mut().zip(src.as_chunks::<4>().0) {
+                            *o = [s[2], s[1], s[0], s[3]];
+                        }
+                    }
+                }
+            }
+            if !self.flip {
+                return Ok(());
+            }
+            // The same three fields the recovery that works on this phone
+            // writes on every flip, and nothing else: virtual rows for two
+            // pages, the offset naming the page to show, and the depth the
+            // surface draws in. `activate` is left exactly as the driver
+            // reported it, because that flag decides how deep the kernel goes
+            // with a mode, and the value read here is not one this surface
+            // should be choosing; it was the reason my own writes counted
+            // finished frames while the display engine still held no buffer.
+            let mut v = self.var;
+            v.yres_virtual = self.h * 2;
+            v.yoffset = self.back * self.h;
+            v.bits_per_pixel = 32;
+            ioctl(self.file.as_raw_fd(), PUT_VSCREENINFO, &mut v).context("show the page")?;
+            if !self.told {
+                eprintln!(
+                    "flipping with FBIOPUT_VSCREENINFO at the blank, page {} shown",
+                    self.back
+                );
+                self.told = true;
+                // A frame is in memory and pointed at now, so this is where the
+                // boot loader's picture is replaced.
+                self.take_over("after the first frame");
+            }
+            self.frames += 1;
+            // The driver only recomputes its rate once a target number of
+            // frames has passed, so an early reading of zero means nothing:
+            // sample on both sides of that count.
+            if self.frames == 30 || self.frames == 150 {
+                // The driver's own count of frames it finished is the proof of
+                // a flip that needs no eyes: zero here means the panel never
+                // looked at the frame, whatever these calls answered.
+                let fps = std::fs::read_to_string("/sys/class/graphics/fb0/measured_fps")
+                    .unwrap_or_default()
+                    .replace('\n', "");
+                eprintln!("{fps} frames a second after {} of them", self.frames);
+            }
+            self.flipping = true;
+            self.back = (self.back + 1) % self.pages;
+            Ok(())
+        }
+
+        /// Wait for the blank that shows the frame pointed at last. The
+        /// kernel's own `FBIOWAITRETRANSMIT` is not part of `fb.h` and so is
+        /// not asked for here: where the driver gives a `vsync_event` file
+        /// that can be waited on, that is waited on, and where it gives none
+        /// the frame is taken to be shown, which costs a torn frame and
+        /// nothing else.
+        fn settle(&mut self) -> Result<()> {
+            if !self.flipping {
+                return Ok(());
+            }
+            self.flipping = false;
+            let Some(at) = self.vsync.as_ref() else {
+                return Ok(());
+            };
+            // **A screen whose blanks have stopped is not waited for any
+            // more.** The wait exists to keep a frame from being shown half
+            // written; it is worth a frame's time, not a tenth of a second
+            // every time. Three in a row is a screen that is not blanking,
+            // and from there the frame is taken to be shown when it is
+            // written — the same as on a driver that offers no blanks at
+            // all, and the tearing that costs is the whole of what is lost.
+            if self.blank_missed >= BLANKS_MISSED {
+                return Ok(());
+            }
+            let mut file = std::fs::File::open(at).with_context(|| format!("open {}", at.display()))?;
+            let mut poll = [libc::pollfd {
+                fd: file.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let r = unsafe { libc::poll(poll.as_mut_ptr(), 1, 100) };
+            if r > 0 {
+                let mut blank = [0u8; 32];
+                let _ = file.read(&mut blank);
+                self.blank_missed = 0;
+            } else {
+                self.blank_missed = self.blank_missed.saturating_add(1);
+                if !self.blank_told && self.blank_missed >= BLANKS_MISSED {
+                    self.blank_told = true;
+                    eprintln!(
+                        "no blank came from {} in 100 ms, {BLANKS_MISSED} times over; frames are shown as they are written from here",
+                        at.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The screen to draw on: KMS where the kernel exposes it, as the phones
+/// running Android 16 and 17 do, and the fbdev beside it where they do not,
+/// as the older Qualcomm ones leave the panel lit.
+#[cfg(target_os = "android")]
+pub enum Display {
+    Kms(kms::KmsSurface),
+    Fb(fb::FbSurface),
+}
+
+#[cfg(target_os = "android")]
+impl Display {
+    pub fn open(blocking_commits: bool, pipelined_commits: bool) -> Result<Display> {
+        if std::path::Path::new("/dev/dri/card0").exists() {
+            return Ok(Display::Kms(kms::KmsSurface::open("/dev/dri/card0", blocking_commits, pipelined_commits)?));
+        }
+        for path in ["/dev/graphics/fb0", "/dev/fb0"] {
+            if std::path::Path::new(path).exists() {
+                return Ok(Display::Fb(fb::FbSurface::open(path)?));
+            }
+        }
+        Err(anyhow::anyhow!(
+            "there is no /dev/dri/card0 and no framebuffer device to draw on"
+        ))
+    }
+
+    pub fn describe(&self) -> &str {
+        match self {
+            Display::Kms(s) => s.describe(),
+            Display::Fb(s) => s.describe(),
+        }
+    }
+
+    pub fn is_on(&self) -> bool {
+        match self {
+            Display::Kms(s) => s.is_on(),
+            Display::Fb(s) => s.is_on(),
+        }
+    }
+
+    pub fn is_off(&self) -> bool {
+        match self {
+            Display::Kms(s) => s.is_off(),
+            Display::Fb(s) => s.is_off(),
+        }
+    }
+
+    /// Let the panel rest, ready to light again at once, with the display
+    /// processor stopped or the backlight down.
+    pub fn rest(&mut self) -> Result<()> {
+        match self {
+            Display::Kms(s) => s.rest(),
+            Display::Fb(s) => s.rest(),
+        }
+    }
+
+    /// Turn the display off: the panel stops drawing power. The next frame
+    /// presented turns it on again.
+    pub fn turn_off(&mut self) -> Result<()> {
+        match self {
+            Display::Kms(s) => s.turn_off(),
+            Display::Fb(s) => s.turn_off(),
+        }
+    }
+
+    /// Switch a panel that came on again in its preferred mode to its
+    /// fastest.
+    pub fn speed_up(&mut self) -> Result<()> {
+        match self {
+            Display::Kms(s) => s.speed_up(),
+            Display::Fb(s) => s.speed_up(),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Surface for Display {
+    fn size(&self) -> (u32, u32) {
+        match self {
+            Display::Kms(s) => s.size(),
+            Display::Fb(s) => s.size(),
+        }
+    }
+
+    fn present(&mut self, canvas: &Canvas) -> Result<()> {
+        match self {
+            Display::Kms(s) => s.present(canvas),
+            Display::Fb(s) => s.present(canvas),
+        }
+    }
+
+    fn settle(&mut self) -> Result<()> {
+        match self {
+            Display::Kms(s) => s.settle(),
+            Display::Fb(s) => s.settle(),
         }
     }
 }

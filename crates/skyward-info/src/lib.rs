@@ -181,7 +181,7 @@ impl SystemProps {
         }
         let props = match skyward_vab::current_slot()? {
             Some(slot) => installed_props(slot)?,
-            None => HashMap::new(),
+            None => legacy_installed_props()?,
         };
         Ok(SystemProps::Installed(props))
     }
@@ -229,6 +229,20 @@ pub fn installed_props(slot: Slot) -> Result<HashMap<String, String>> {
             }
             rsproperties::load_properties_from_file(&path, None, "u:r:init:s0", &mut props)
                 .with_context(|| format!("read {}", path.display()))?;
+        }
+    }
+    Ok(props)
+}
+
+/// Installed properties on a phone with real, unslotted partitions.
+/// The system can use either the old root or system-as-root layout.
+pub fn legacy_installed_props() -> Result<HashMap<String, String>> {
+    let mut props: HashMap<String, String> = skyward_sys::props(BOOT_PROPS).into_iter().collect();
+    for file in ["/system_root/build.prop", "/system_root/system/build.prop", "/vendor/default.prop", "/vendor/build.prop"] {
+        let path = Path::new(file);
+        if path.is_file() {
+            rsproperties::load_properties_from_file(path, None, "u:r:init:s0", &mut props)
+                .with_context(|| format!("read {file}"))?;
         }
     }
     Ok(props)

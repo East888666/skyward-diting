@@ -1,6 +1,5 @@
 use crate::app::{
-    BackupRefusal, Data, EraseStop, FileKind, FileRow, ItemEnd, MountFailure, Part, PartKind, PartStop, Place, Source, TermEnd, BACKUP_PARTS,
-    TIME_ZONES,
+    BackupRefusal, Data, EraseStop, FileKind, FileRow, ItemEnd, MountFailure, Part, PartKind, PartStop, Place, Source, TermEnd, TIME_ZONES,
 };
 use crate::lang::{Lang, Text};
 use crate::tr;
@@ -9,7 +8,7 @@ use jiff::tz::TimeZone;
 use jiff::Timestamp;
 use skyward_info::{Battery, Charge, Cpu, PatchLevel, Storage};
 use skyward_install::ota::Trouble;
-use skyward_install::{Failure, ImageKind, Ramdisk, Refusal};
+use skyward_install::{Failure, Filesystem, ImageKind, Ramdisk, Refusal};
 use skyward_net::download::Failure as DownloadFailure;
 use skyward_net::reach::Reach;
 use skyward_net::release::Unanswered;
@@ -207,13 +206,50 @@ pub fn snapshot(l: Lang, s: &SnapshotState) -> &'static str {
     })
 }
 
+/// What a partition offered for backup is called on the page. The names
+/// come from the phone's own table and boot list, so they are the same the
+/// world over where the phone is Android's own shape; where one of them is
+/// not known the name is said as it is, because the phone's own word beats a
+/// wrong one of ours.
+pub fn partition(l: Lang, name: &str) -> String {
+    let words = match name {
+        "boot" => ["启动镜像", "啟動映像檔", "Boot image"],
+        "init_boot" => ["首次启动镜像", "首次啟動映像檔", "Initial boot image"],
+        "vendor_boot" => ["厂商启动镜像", "廠商啟動映像檔", "Vendor boot image"],
+        "dtbo" => ["设备树覆盖", "裝置樹覆蓋", "Device tree overlays"],
+        "vbmeta" => ["校验设置", "驗證設定", "Verification settings"],
+        "recovery" => ["恢复分区", "復原分割區", "Recovery"],
+        "system" => ["系统", "系統", "System"],
+        "system_ext" => ["系统扩展", "系統擴充", "System extensions"],
+        "vendor" | "cust" => ["厂商分区", "廠商分割區", "Vendor"],
+        "product" => ["预装应用", "預裝應用程式", "Product"],
+        "odm" => ["厂商定制", "廠商客製", "ODM"],
+        "cache" => ["缓存", "快取", "Cache"],
+        "persist" => ["出厂留存", "出廠留存", "Persist"],
+        "modem" => ["基带固件", "基頻韌體", "Modem firmware"],
+        "data" => [
+            "数据（应用与设置）",
+            "資料（應用程式與設定）",
+            "Data (apps and settings)",
+        ],
+        "metadata" => ["密钥留存", "金鑰留存", "Metadata"],
+        // The four that hold the radio's own identity and calibration, said
+        // as the recoveries that back them up name them, with the partition
+        // each word stands for kept after it.
+        name @ ("modemst1" | "modemst2" | "fsg" | "fsc") => {
+            let which = l.pick(["基带信息", "基頻資訊", "Baseband settings"]);
+            return format!("{which} ({name})");
+        }
+        other => return other.to_string(),
+    };
+    l.pick(words).to_string()
+}
+
 /// Why super is off limits while an update is in flight; `None` when it is not.
 pub fn snapshot_note(l: Lang, s: &SnapshotState) -> Option<&'static str> {
     let text = match s {
         SnapshotState::None => return None,
-        SnapshotState::Snapshotted | SnapshotState::Merging => {
-            ["更新合并完成前，暂不刷写 super 中的分区", "更新合併完成前，暫不刷寫 super 中的分割區", "Partitions in super aren't flashed until the update merges"]
-        }
+        SnapshotState::Snapshotted | SnapshotState::Merging => ["更新合并完成前，暂不刷写 super 中的分区", "更新合併完成前，暫不刷寫 super 中的分割區", "Partitions in super aren't flashed until the update merges"],
         SnapshotState::MergeFailed => [
             "在系统中处理完成前，暂不刷写 super 中的分区",
             "在系統中處理完成前，暫不刷寫 super 中的分割區",
@@ -253,16 +289,10 @@ pub fn next_boot(l: Lang, next: Slot, now: Slot) -> (String, String) {
 pub fn snapshot_slot_note(l: Lang, s: &SnapshotState) -> Option<&'static str> {
     let text = match s {
         SnapshotState::None => return None,
-        SnapshotState::Snapshotted | SnapshotState::Merging => {
-            ["更新合并完成前，暂不切换启动槽位。", "更新合併完成前，暫不切換啟動槽位。", "The boot slot isn't switched until the update merges."]
-        }
-        SnapshotState::MergeFailed => {
-            ["在系统中处理完成前，暂不切换启动槽位。", "在系統中處理完成前，暫不切換啟動槽位。", "The boot slot isn't switched until the system deals with the update."]
-        }
-        SnapshotState::Unknown => {
-            ["读取到更新状态前，暂不切换启动槽位。", "讀取到更新狀態前，暫不切換啟動槽位。", "The boot slot isn't switched until the update's status can be read."]
-        }
-    };
+        SnapshotState::Snapshotted | SnapshotState::Merging => ["更新合并完成前，暂不切换启动槽位。", "更新合併完成前，暫不切換啟動槽位。", "The boot slot isn't switched until the update merges."],
+        SnapshotState::MergeFailed => ["在系统中处理完成前，暂不切换启动槽位。", "在系統中處理完成前，暫不切換啟動槽位。", "The boot slot isn't switched until the system deals with the update."],
+        SnapshotState::Unknown => ["读取到更新状态前，暂不切换启动槽位。", "讀取到更新狀態前，暫不切換啟動槽位。", "The boot slot isn't switched until the update's status can be read."]
+        };
     Some(l.pick(text))
 }
 
@@ -325,16 +355,10 @@ pub fn snapshot_script_note(l: Lang, s: &SnapshotState) -> Option<&'static str> 
 pub fn snapshot_backup_note(l: Lang, s: &SnapshotState) -> Option<&'static str> {
     let text = match s {
         SnapshotState::None => return None,
-        SnapshotState::Snapshotted | SnapshotState::Merging => {
-            ["更新合并完成前，暂不备份系统分区", "更新合併完成前，暫不備份系統分割區", "System partitions aren't backed up until the update merges"]
-        }
-        SnapshotState::MergeFailed => {
-            ["在系统中处理完成前，暂不备份系统分区", "在系統中處理完成前，暫不備份系統分割區", "System partitions aren't backed up until the system deals with the update"]
-        }
-        SnapshotState::Unknown => {
-            ["读取到更新状态前，暂不备份系统分区", "讀取到更新狀態前，暫不備份系統分割區", "System partitions aren't backed up until the update's status can be read"]
-        }
-    };
+        SnapshotState::Snapshotted | SnapshotState::Merging => ["更新合并完成前，暂不备份系统分区", "更新合併完成前，暫不備份系統分割區", "System partitions aren't backed up until the update merges"],
+        SnapshotState::MergeFailed => ["在系统中处理完成前，暂不备份系统分区", "在系統中處理完成前，暫不備份系統分割區", "System partitions aren't backed up until the system deals with the update"],
+        SnapshotState::Unknown => ["读取到更新状态前，暂不备份系统分区", "讀取到更新狀態前，暫不備份系統分割區", "System partitions aren't backed up until the update's status can be read"]
+        };
     Some(l.pick(text))
 }
 
@@ -488,6 +512,8 @@ pub fn part(l: Lang, p: Part) -> &'static str {
         Part::Data => ["data 分区", "data 分割區", "data partition"],
         Part::Cache => ["cache 分区", "cache 分割區", "cache partition"],
         Part::Metadata => ["metadata 分区", "metadata 分割區", "metadata partition"],
+        Part::System => ["system 分区", "system 分割區", "system partition"],
+        Part::Vendor => ["vendor 分区", "vendor 分割區", "vendor partition"],
         Part::AppData => ["应用数据", "應用程式資料", "App data"],
         Part::Media => ["内部存储", "內部儲存空間", "Internal storage"],
         Part::AppCaches => ["应用缓存", "應用程式快取", "App caches"],
@@ -505,6 +531,8 @@ fn part_in_sentence(p: Part) -> &'static str {
         Part::Data => "the data partition",
         Part::Cache => "the cache partition",
         Part::Metadata => "the metadata partition",
+        Part::System => "the system partition",
+        Part::Vendor => "the vendor partition",
         Part::AppData => "app data",
         Part::Media => "internal storage",
         Part::AppCaches => "app caches",
@@ -539,7 +567,9 @@ fn in_sentence(name: &str) -> String {
 /// Things named in a row: in Chinese with 、 between them, in English with
 /// commas, each after the first as a sentence names it.
 pub fn list<'a>(l: Lang, names: impl IntoIterator<Item = &'a str>) -> String {
-    let names: Vec<String> = names.into_iter().enumerate().map(|(k, n)| if l == Lang::En && k > 0 { in_sentence(n) } else { n.to_string() }).collect();
+    let names: Vec<String> = names.into_iter().enumerate().map(|(k, n)| {
+            if l == Lang::En && k > 0 { in_sentence(n) } else { n.to_string() }
+        }).collect();
     names.join(l.pick(["、", "、", ", "]))
 }
 
@@ -555,7 +585,9 @@ pub fn users(l: Lang, users: &[u32]) -> String {
         })
         .collect();
     match (l, names.as_slice()) {
-        (Lang::En, [.., last]) if names.len() > 1 => format!("{} and {last}", names[..names.len() - 1].join(", ")),
+        (Lang::En, [.., last]) if names.len() > 1 => {
+            format!("{} and {last}", names[..names.len() - 1].join(", "))
+        }
         (Lang::En, _) => names.join(""),
         _ => names.join("、"),
     }
@@ -599,6 +631,22 @@ pub fn erase_stop(l: Lang, s: &EraseStop) -> (String, Option<String>) {
             None,
         ),
         EraseStop::NoCache => (said(["本机没有 cache 分区。", "本機沒有 cache 分割區。", "This phone has no cache partition."]), None),
+        EraseStop::NoPartition(name) => {
+            let what = match l {
+                Lang::Hans => format!("本机没有 {name} 分区。"),
+                Lang::Hant => format!("本機沒有 {name} 分割區。"),
+                Lang::En => format!("This phone has no {name} partition."),
+            };
+            (what, None)
+        }
+        EraseStop::NoMetadata => (
+            said([
+                "本机没有 metadata 分区。",
+                "本機沒有 metadata 分割區。",
+                "This phone has no metadata partition.",
+            ]),
+            None,
+        ),
         EraseStop::Erased => (
             said([
                 "data 分区已清空，下次开机时将重新创建，暂无可清除的内容。",
@@ -887,7 +935,9 @@ pub fn file_line(l: Lang, f: &FileRow, now: i64, zone: usize) -> String {
         }
         FileKind::Folder { items: None } => l.pick(["无法读取", "無法讀取", "Unreadable"]).to_string(),
         FileKind::File => format!("{}{DIVIDER}{}", file_time(f.modified, false, now, zone), file_size(f.size)),
-        FileKind::Link { target, .. } => tr!(l, "链接到 {target}", "連結到 {target}", "Link to {target}"),
+        FileKind::Link { target, .. } => {
+            tr!(l, "链接到 {target}", "連結到 {target}", "Link to {target}")
+        }
         FileKind::Special => {
             let what = l.pick(match f.mode & 0o170_000 {
                 0o020_000 => ["字符设备", "字元裝置", "Character device"],
@@ -900,9 +950,12 @@ pub fn file_line(l: Lang, f: &FileRow, now: i64, zone: usize) -> String {
     }
 }
 
-/// The parts a backup holds: `启动分区、系统分区`.
-pub fn parts(l: Lang, held: &[bool; 4]) -> String {
-    list(l, BACKUP_PARTS.iter().zip(held).filter(|(_, &on)| on).map(|(name, _)| l.pick(*name)))
+/// What a backup holds, said by partition: `启动镜像、系统、缓存`. The
+/// names come from the phone's own table, so each is put the way [`partition`]
+/// puts it, and a name nobody has a word for yet is said as the phone says it.
+pub fn partitions(l: Lang, names: &[String]) -> String {
+    let words: Vec<String> = names.iter().map(|name| partition(l, name)).collect();
+    list(l, words.iter().map(|word| word.as_str()))
 }
 
 /// What an image is, and what it holds.
@@ -910,22 +963,38 @@ pub fn image_kind(l: Lang, kind: ImageKind) -> (&'static str, &'static str) {
     const RECOVERY: Text = ["恢复模式镜像", "復原模式映像檔", "Recovery image"];
     const BOOT: Text = ["启动镜像", "啟動映像檔", "Boot image"];
     let (name, holds) = match kind {
-        ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery } => {
-            (RECOVERY, ["包含内核和恢复模式 ramdisk", "包含核心和復原模式 ramdisk", "Holds a kernel and a recovery ramdisk"])
-        }
-        ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery } => {
-            (RECOVERY, ["仅包含恢复模式 ramdisk", "僅包含復原模式 ramdisk", "Holds a recovery ramdisk alone"])
-        }
-        ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Generic } => {
-            (BOOT, ["包含内核和通用 ramdisk", "包含核心和通用 ramdisk", "Holds a kernel and a generic ramdisk"])
-        }
+        ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Recovery } => (RECOVERY, ["包含内核和恢复模式 ramdisk", "包含核心和復原模式 ramdisk", "Holds a kernel and a recovery ramdisk"]),
+        ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery } => (RECOVERY, ["仅包含恢复模式 ramdisk", "僅包含復原模式 ramdisk", "Holds a recovery ramdisk alone"]),
+        ImageKind::Boot { kernel: true, ramdisk: Ramdisk::Generic } => (BOOT, ["包含内核和通用 ramdisk", "包含核心和通用 ramdisk", "Holds a kernel and a generic ramdisk"]),
         ImageKind::Boot { kernel: true, ramdisk: Ramdisk::None } => (BOOT, ["仅包含内核", "僅包含核心", "Holds a kernel alone"]),
         ImageKind::Boot { kernel: false, .. } => (BOOT, ["仅包含通用 ramdisk", "僅包含通用 ramdisk", "Holds a generic ramdisk alone"]),
-        ImageKind::VendorBoot => {
-            (["vendor_boot 镜像", "vendor_boot 映像檔", "vendor_boot image"], ["包含厂商 ramdisk 和设备树", "包含廠商 ramdisk 和裝置樹", "Holds the vendor ramdisk and device tree"])
-        }
+        ImageKind::VendorBoot => (["vendor_boot 镜像", "vendor_boot 映像檔", "vendor_boot image"], ["包含厂商 ramdisk 和设备树", "包含廠商 ramdisk 和裝置樹", "Holds the vendor ramdisk and device tree"]),
         ImageKind::Dtbo => (["dtbo 镜像", "dtbo 映像檔", "dtbo image"], ["包含设备树叠加层", "包含裝置樹疊加層", "Holds device tree overlays"]),
         ImageKind::Vbmeta => (["vbmeta 镜像", "vbmeta 映像檔", "vbmeta image"], ["包含启动验证数据", "包含啟動驗證資料", "Holds verified boot data"]),
+        ImageKind::Filesystem(Filesystem::Erofs) => (
+            ["erofs 文件系统镜像", "erofs 檔案系統映像檔", "erofs filesystem image"],
+            [
+                "整个分区按原样写入",
+                "整個分割區依原樣寫入",
+                "Written to the partition as it is",
+            ],
+        ),
+        ImageKind::Filesystem(Filesystem::Ext4) => (
+            ["ext4 文件系统镜像", "ext4 檔案系統映像檔", "ext4 filesystem image"],
+            [
+                "整个分区按原样写入",
+                "整個分割區依原樣寫入",
+                "Written to the partition as it is",
+            ],
+        ),
+        ImageKind::Filesystem(Filesystem::F2fs) => (
+            ["f2fs 文件系统镜像", "f2fs 檔案系統映像檔", "f2fs filesystem image"],
+            [
+                "整个分区按原样写入",
+                "整個分割區依原樣寫入",
+                "Written to the partition as it is",
+            ],
+        ),
     };
     (l.pick(name), l.pick(holds))
 }
@@ -941,6 +1010,11 @@ pub fn partition_role(l: Lang, name: &str) -> &'static str {
         "vbmeta" => ["启动验证数据", "啟動驗證資料", "Verified boot data"],
         "vbmeta_system" => ["系统分区的验证数据", "系統分割區的驗證資料", "Verification data of the system partitions"],
         "vbmeta_vendor" => ["厂商分区的验证数据", "廠商分割區的驗證資料", "Verification data of the vendor partitions"],
+        "system" => ["系统本体", "系統本體", "The system itself"],
+        "vendor" | "cust" => ["厂商文件", "廠商檔案", "Vendor files"],
+        "product" => ["预装应用", "預裝應用程式", "Preinstalled apps"],
+        "odm" => ["厂商定制", "廠商客製", "Vendor customisation"],
+        "cache" => ["缓存", "快取", "Cache"],
         _ => ["分区", "分割區", "Partition"],
     })
 }
@@ -1126,8 +1200,10 @@ pub fn refusal(l: Lang, r: &Refusal, codename: &str, source: Source, zone: usize
                 "This system needs at least {least}, and the data partition has {room} to spare."
             )
         }
-        Refusal::NotBrick(_) | Refusal::NoSerial => unreachable!("only a request to erase partitions is refused as {r:?}"),
+        Refusal::NotBrick(_) | Refusal::NoSerial => {
+            unreachable!("only a request to erase partitions is refused as {r:?}")
     }
+}
 }
 
 /// Why the system's request to erase the partitions it lists was not
@@ -1177,9 +1253,8 @@ pub fn failure(l: Lang, f: &Failure, source: Source) -> (String, Option<String>)
                     "讀取更新檔失敗，請檢查傳輸線連接後重新傳送。",
                     "Couldn't read the package. Check the cable, then send it again.",
                 ]),
-                (Trouble::Transfer, Source::File(Place::Storage) | Source::Opened { drive: false } | Source::Asked { .. }) => {
-                    said(["读取更新包失败。", "讀取更新檔失敗。", "Couldn't read the package."])
-                }
+                (Trouble::Transfer, Source::File(Place::Storage) | Source::Opened { drive: false } | Source::Asked { .. },
+                ) => said(["读取更新包失败。", "讀取更新檔失敗。", "Couldn't read the package."]),
                 (Trouble::Transfer, Source::File(Place::UsbDrive) | Source::Opened { drive: true }) => said([
                     "读取更新包失败，请检查 U 盘连接后重试。",
                     "讀取更新檔失敗，請檢查 USB 隨身碟連接後重試。",
@@ -1191,11 +1266,10 @@ pub fn failure(l: Lang, f: &Failure, source: Source) -> (String, Option<String>)
                 (Trouble::Unsupported, _) => said(["暂不支持该更新包的格式。", "尚不支援這個更新檔的格式。", "This package's format isn't supported."]),
                 (Trouble::Other, _) => said(["更新程序出错。", "更新程式發生錯誤。", "The updater ran into an error."]),
             };
-            (what, Some(tr!(l, "错误代码：{code}", "錯誤代碼：{code}", "Error code: {code}")))
+            (what, Some(tr!(l, "错误代码：{code}", "錯誤代碼：{code}", "Error code: {code}")),
+            )
         }
-        Failure::Script(code) => {
-            (tr!(l, "安装脚本运行失败，退出码为 {code}。", "安裝指令碼執行失敗，結束代碼為 {code}。", "The install script failed with exit code {code}."), None)
-        }
+        Failure::Script(code) => (tr!(l, "安装脚本运行失败，退出码为 {code}。", "安裝指令碼執行失敗，結束代碼為 {code}。", "The install script failed with exit code {code}."), None),
         Failure::Disconnected => (
             said(["电脑已停止发送，请检查数据线连接后重新发送。", "電腦已停止傳送，請檢查傳輸線連接後重新傳送。", "The computer stopped sending. Check the cable, then send it again."]),
             None,
@@ -1208,13 +1282,9 @@ pub fn failure(l: Lang, f: &Failure, source: Source) -> (String, Option<String>)
             _ => (said(["读取文件失败。", "讀取檔案失敗。", "Couldn't read the file."]), Some(why.clone())),
         },
         Failure::Changed => match source {
-            Source::Computer | Source::Rescue => {
-                (said(["文件在发送过程中被修改，请重新发送。", "檔案在傳送過程中被修改，請重新傳送。", "The file changed while it was sent. Send it again."]), None)
-            }
-            Source::File(_) | Source::Opened { .. } | Source::Asked { .. } => {
-                (said(["文件在读取过程中被修改，请重新选择。", "檔案在讀取過程中被修改，請重新選擇。", "The file changed while it was read. Choose it again."]), None)
-            }
-        },
+            Source::Computer | Source::Rescue => (said(["文件在发送过程中被修改，请重新发送。", "檔案在傳送過程中被修改，請重新傳送。", "The file changed while it was sent. Send it again."]), None),
+            Source::File(_) | Source::Opened { .. } | Source::Asked { .. } => (said(["文件在读取过程中被修改，请重新选择。", "檔案在讀取過程中被修改，請重新選擇。", "The file changed while it was read. Choose it again."]), None)
+            },
         Failure::Error(detail) => (said(UNEXPECTED), Some(detail.clone())),
     }
 }
@@ -1291,7 +1361,8 @@ pub fn wlan_value(l: Lang, w: &Wlan) -> &str {
     match (&w.power, &w.joined) {
         (Power::Off | Power::Failed(_), _) => l.pick(["已关闭", "已關閉", "Off"]),
         (Power::Starting, _) => l.pick(["正在开启", "正在開啟", "Turning on"]),
-        (Power::On, Some(Joined { stage: WlanStage::Connected(_), name, .. })) => name,
+        (Power::On, Some(Joined { stage: WlanStage::Connected(_), name, .. }),
+        ) => name,
         (Power::On, Some(_)) => l.pick(["正在连接", "正在連線", "Connecting"]),
         (Power::On, None) => l.pick(["未连接", "未連線", "Not connected"]),
     }
@@ -1358,7 +1429,9 @@ pub fn unanswered(l: Lang, why: &Unanswered) -> String {
 /// out; one in another form shows as it came.
 pub fn package_size(size: &str) -> String {
     match size.char_indices().last() {
-        Some((at, unit @ ('K' | 'M' | 'G' | 'T'))) if size[..at].parse::<f64>().is_ok() => format!("{} {unit}B", &size[..at]),
+        Some((at, unit @ ('K' | 'M' | 'G' | 'T'))) if size[..at].parse::<f64>().is_ok() => {
+            format!("{} {unit}B", &size[..at])
+        }
         _ => size.to_string(),
     }
 }
@@ -1378,9 +1451,7 @@ pub fn download_failure(l: Lang, f: &DownloadFailure) -> String {
         DownloadFailure::Damaged => l
             .pick(["完整更新包校验失败，已删除，请重新下载。", "完整更新檔驗證失敗，已刪除，請重新下載。", "The full OTA package didn't verify and was deleted. Download it again."])
             .into(),
-        DownloadFailure::Changed => {
-            l.pick(["服务器上的版本已更新，请重新检查更新。", "伺服器上的版本已更新，請重新檢查更新。", "The server has a newer version now. Check for updates again."]).into()
-        }
+        DownloadFailure::Changed => l.pick(["服务器上的版本已更新，请重新检查更新。", "伺服器上的版本已更新，請重新檢查更新。", "The server has a newer version now. Check for updates again."]).into(),
         DownloadFailure::Other(why) => tr!(l, "下载失败：{why}", "下載失敗：{why}", "Download failed: {why}"),
     }
 }
@@ -1398,9 +1469,7 @@ pub fn skyward_download_failure(l: Lang, f: &DownloadFailure) -> String {
                 "Not enough memory: {needed} has to be free, and {free} is."
             )
         }
-        DownloadFailure::Damaged => {
-            l.pick(["安装包校验失败，已删除，请重新更新。", "安裝包驗證失敗，已刪除，請重新更新。", "The package didn't verify and was deleted. Update again."]).into()
-        }
+        DownloadFailure::Damaged => l.pick(["安装包校验失败，已删除，请重新更新。", "安裝包驗證失敗，已刪除，請重新更新。", "The package didn't verify and was deleted. Update again."]).into(),
         DownloadFailure::Changed => unreachable!("GitHub is not asked again where a build is"),
         DownloadFailure::Other(why) => tr!(l, "下载失败：{why}", "下載失敗：{why}", "Download failed: {why}"),
     }
@@ -1608,7 +1677,9 @@ mod tests {
 
     #[test]
     fn screen_off_times() {
-        let labels = |l| crate::app::SCREEN_OFF.iter().map(|&ms| screen_off(l, ms)).collect::<Vec<String>>();
+        let labels = |l| {
+            crate::app::SCREEN_OFF.iter().map(|&ms| screen_off(l, ms)).collect::<Vec<String>>()
+        };
         assert_eq!(labels(HANS), ["15 秒", "30 秒", "1 分钟", "2 分钟", "5 分钟", "10 分钟", "永不"]);
         assert_eq!(labels(Lang::Hant), ["15 秒", "30 秒", "1 分鐘", "2 分鐘", "5 分鐘", "10 分鐘", "永不"]);
         assert_eq!(labels(Lang::En), ["15 seconds", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes", "Never"]);
@@ -1718,11 +1789,30 @@ mod tests {
         assert_eq!(file_size(1_500_000), "1.5 MB");
     }
 
+    /// The names a backup is listed by, as its own record holds them.
+    fn held(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
     #[test]
     fn a_backup_lists_its_parts() {
-        assert_eq!(parts(HANS, &[true, true, false, true]), "启动分区、系统分区、基带与 EFS");
-        assert_eq!(parts(Lang::Hant, &[true, true, false, true]), "啟動分割區、系統分割區、基頻與 EFS");
-        assert_eq!(parts(Lang::En, &[true, true, true, true]), "Boot partitions, system partitions, data partition, modem and EFS");
+        assert_eq!(
+            partitions(HANS, &held(&["boot", "system", "modem"])),
+            "启动镜像、系统、基带固件"
+        );
+        assert_eq!(
+            partitions(Lang::Hant, &held(&["boot", "system", "modem"])),
+            "啟動映像檔、系統、基頻韌體"
+        );
+        assert_eq!(
+            partitions(Lang::En, &held(&["boot", "system", "data", "modem"])),
+            "Boot image, system, data (apps and settings), modem firmware"
+        );
+        // A name no page knows is said as the partition is named.
+        assert_eq!(
+            partitions(HANS, &held(&["modemst1", "fsg"])),
+            "基带信息 (modemst1)、基带信息 (fsg)"
+        );
     }
 
     #[test]

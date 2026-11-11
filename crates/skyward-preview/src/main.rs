@@ -10,10 +10,9 @@ use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Joined, Link, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Named, Other, Overview, Who};
 use skyward_ui::app::{
-    Action, Adding, App, Asked, BackupAt, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
+    Action, Adding, App, Asked, BackupAt, BackupChoice, BackupEnd, BackupEntry, BackupJob, BackupRefusal, Choice, Clip, Damage, Data, DownloadEnd,
     DownloadJob, EraseStop, Field, FileKind, FileOp, FileRow, FileTask, FsAction, FsRow, Have, Held, Install, ItemEnd, JobEnd, Key, Keys,
-    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice,
-    SystemsWork, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
+    MountFailure, MountRow, Part, PartKind, PartStop, Pick, Place, Screen, SkywardEnd, SkywardJob, SkywardStage, Source, SystemChoice, TermEnd, Touch, UsbDrive, UsbLink, SCREEN_OFF,
 };
 use skyward_ui::widgets::{self, Bar, Bolt, Cap, Layer};
 use skyward_ui::{editor, fmt, pages, Canvas, Ctx, Fonts, Lang, Theme};
@@ -124,6 +123,10 @@ type MountShot<'a> = (&'a str, bool, &'a DeviceInfo, Option<MountFailure>, &'a [
 /// File name, page, dark theme, and what to set before the page is drawn.
 type PageShot<'a> = (&'a str, Screen, bool, &'a dyn Fn(&mut App));
 
+/// The partitions a phone whose table has every one of them offers to make
+/// afresh, in the order the wipe page lists them.
+const ALL_FORMATS: [Part; 5] = [Part::Data, Part::Cache, Part::Metadata, Part::System, Part::Vendor];
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let out = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("preview-out"));
@@ -167,9 +170,11 @@ fn main() -> Result<()> {
     // Whole pages, the way a long screenshot shows them. The About page's
     // field is drawn only on screen, so it appears among the moments below.
     let shots: [Shot; 12] = [
-        ("01-decrypt-dark", Screen::Decrypt, true, &info, pattern, &[0, 3, 4, 5, 8]),
+        ("01-decrypt-dark", Screen::Decrypt, true, &info, pattern, &[0, 3, 4, 5, 8],
+        ),
         ("02-home-light", Screen::Home, false, &info, Data::Open, &[]),
-        ("03-home-dark-update-pending", Screen::Home, true, &pending, Data::Open, &[]),
+        ("03-home-dark-update-pending", Screen::Home, true, &pending, Data::Open, &[],
+        ),
         ("04-settings-light", Screen::Settings, false, &info, Data::Open, &[]),
         ("05-settings-dark", Screen::Settings, true, &info, Data::Open, &[]),
         ("06-reboot-dark", Screen::Reboot, true, &info, Data::Open, &[]),
@@ -177,7 +182,8 @@ fn main() -> Result<()> {
         ("09-specs-light", Screen::Specs, false, &info, Data::Open, &[]),
         ("10-specs-dark", Screen::Specs, true, &info, Data::Open, &[]),
         ("11-install-light", Screen::Install, false, &info, Data::Open, &[]),
-        ("12-install-dark-update-pending", Screen::Install, true, &pending, Data::Open, &[]),
+        ("12-install-dark-update-pending", Screen::Install, true, &pending, Data::Open, &[],
+        ),
         ("13-screen-off-light", Screen::ScreenOff, false, &info, Data::Open, &[]),
     ];
     for (name, screen, dark, info, data, pattern) in shots {
@@ -203,7 +209,8 @@ fn main() -> Result<()> {
     let recovery = ImageKind::Boot { kernel: false, ramdisk: Ramdisk::Recovery };
     let installing: [(&str, bool, Install); 17] = [
         ("30-sideload-waiting", false, Install::Waiting),
-        ("31-sideload-checking", false, Install::Checking { size: 7_103_043_868, stage: None }),
+        ("31-sideload-checking", false, Install::Checking { size: 7_103_043_868, stage: None },
+        ),
         (
             "31-sideload-verifying-dark",
             true,
@@ -232,14 +239,23 @@ fn main() -> Result<()> {
                 overwriting: false,
             },
         ),
-        ("35-sideload-flashing", false, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 300, total: 800 }) }),
-        ("36-sideload-installed", false, Install::Finished { outcome: Outcome::Installed { slot: Slot::A, wipe: false }, damage: None }),
-        ("96-sideload-light-wipes", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: true }),
-        ("18-install-ready", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: false }),
+        ("35-sideload-flashing", false, Install::Flashing { partition: "boot", stage: Some(Stage::Flashing { done: 300, total: 800 }) },
+        ),
+        ("36-sideload-installed", false, Install::Finished { outcome: Outcome::Installed { slot: Slot::A, wipe: false }, damage: None },
+        ),
+        ("96-sideload-light-wipes", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: true },
+        ),
+        ("18-install-ready", false, Install::Confirming { version: Some("OS3.0.306.0.WMACNXM".into()), wipe: false },
+        ),
         (
             "37-sideload-flashed-recovery-dark",
             true,
-            Install::Finished { outcome: Outcome::Flashed { partition: "recovery", slots: vec![Slot::A, Slot::B] }, damage: None },
+            Install::Finished { outcome: Outcome::Flashed { partition: "recovery",
+                    devices: ["/dev/block/by-name/recovery_a", "/dev/block/by-name/recovery_b"]
+                        .iter()
+                        .map(PathBuf::from)
+                        .collect(),
+                }, damage: None },
         ),
         (
             "38-sideload-refused",
@@ -274,7 +290,8 @@ fn main() -> Result<()> {
             true,
             Install::Systeming { name: "Ubuntu Touch".into(), stage: Some(Stage::Root { done: 1_610_612_736, total: 9_663_676_416 }) },
         ),
-        ("201-sideload-system-installed", false, Install::Finished { outcome: Outcome::SystemInstalled { name: "Ubuntu Touch".into() }, damage: None }),
+        ("201-sideload-system-installed", false, Install::Finished { outcome: Outcome::SystemInstalled { name: "Ubuntu Touch".into() }, damage: None },
+        ),
     ];
     for (name, dark, install) in installing {
         let mut app = opened(Screen::Installing, w, h, ppd);
@@ -295,7 +312,8 @@ fn main() -> Result<()> {
     let mounting: [MountShot; 3] = [
         ("15-mount-light", false, &info, None, &[]),
         ("16-mount-dark-unmount-failed", true, &info, Some(busy), &[]),
-        ("17-mount-light-update-pending", false, &pending, None, &["product", "system_ext"]),
+        ("17-mount-light-update-pending", false, &pending, None, &["product", "system_ext"],
+        ),
     ];
     for (name, dark, info, failure, unmounted) in mounting {
         let mut app = opened(Screen::Mount, w, h, ppd);
@@ -310,19 +328,58 @@ fn main() -> Result<()> {
     }
 
     // The pages the remaining features open, each with what it would show.
-    let made = |place, made, size, parts, system: &str| {
-        let held = Held { made, size, parts, device: cfg.device.codename.clone(), system: Some(system.into()), slot: Some(Slot::B) };
+    let made = |place, made, size, names: &[&str], system: &str| {
+        let held = Held { made, size,
+            names: names.iter().map(|name| name.to_string()).collect(), device: cfg.device.codename.clone(), system: Some(system.into()), slot: Some(Slot::B) };
         BackupEntry { place, name: fmt::stamp(made, 0), held: Ok(held) }
     };
     let backups = vec![
-        made(Place::Storage, 1_792_348_260, 6_214_000_000, [true, true, false, true], "OS4.0.4.0.XPACNXM"),
-        made(Place::UsbDrive, 1_791_830_000, 141_000_000, [true, false, false, false], "OS4.0.3.0.XPACNXM"),
+        made(Place::Storage, 1_792_348_260, 6_214_000_000,
+            &["boot", "recovery", "system", "cust", "persist", "modem", "data"], "OS4.0.4.0.XPACNXM"),
+        made(Place::UsbDrive, 1_791_830_000, 141_000_000,
+            &["boot", "recovery"], "OS4.0.3.0.XPACNXM"),
         BackupEntry {
             place: Place::Storage,
             name: "20261020-221500".into(),
             held: Err("read /sdcard/Skyward/backups/20261020-221500/backup.toml: No such file or directory (os error 2)".into()),
         },
     ];
+    // The rows a backup page is offered, as the phone's own table would give
+    // them: the partition's name and where it is read from.
+    let backup_rows = || -> Vec<(String, String)> {
+        [
+            ("boot", "/dev/block/by-name/boot"),
+            ("recovery", "/dev/block/by-name/recovery"),
+            ("system", "/system_root"),
+            ("cust", "/vendor"),
+            ("cache", "/cache"),
+            ("persist", "/persist"),
+            ("modem", "/vendor/firmware_mnt"),
+            ("data", "/data"),
+            ("modemst1", "/dev/block/by-name/modemst1"),
+            ("modemst2", "/dev/block/by-name/modemst2"),
+            ("fsg", "/dev/block/by-name/fsg"),
+            ("fsc", "/dev/block/by-name/fsc"),
+        ]
+        .map(|(name, hint)| (name.to_string(), hint.to_string()))
+        .to_vec()
+    };
+    // What the page of one backup ticks: every name it holds, those in `on`
+    // with the box checked.
+    let ticked = |entry: &BackupEntry, on: &[&str]| -> Vec<BackupChoice> {
+        entry
+            .held
+            .as_ref()
+            .expect("a backup whose folder is read")
+            .names
+            .iter()
+            .map(|name| BackupChoice {
+                name: name.clone(),
+                hint: String::new(),
+                on: on.contains(&name.as_str()),
+            })
+            .collect()
+    };
     // What a backup of the slot's partitions and the baseband goes through.
     let plan = || -> Vec<(String, u64)> {
         [
@@ -398,7 +455,9 @@ fn main() -> Result<()> {
         ("11-install-light-locked", Screen::Install, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: false };
         }),
-        ("11-install-light-dual-boot", Screen::Install, false, &|app| app.state.dual_boot = true),
+        ("11-install-light-dual-boot", Screen::Install, false, &|app| {
+            app.state.dual_boot = true
+        }),
         ("11-install-dark-usb", Screen::Install, true, &|app| {
             app.set_usb_drive(Some(UsbDrive::Shown));
         }),
@@ -417,12 +476,12 @@ fn main() -> Result<()> {
             app.state.source = Source::File(Place::UsbDrive);
             app.state.install = Install::Checking { size: 7_103_043_868, stage: None };
         }),
-        ("19-choose-storage-light", Screen::Choose(Place::Storage), false, &|app| {
-            app.set_place(Place::Storage, "Download".into(), Ok(sample_download()), LISTED)
-        }),
+        ("19-choose-storage-light", Screen::Choose(Place::Storage), false, &|app| app.set_place(Place::Storage, "Download".into(), Ok(sample_download()), LISTED),
+        ),
         ("19-choose-storage-dark-empty", Screen::Choose(Place::Storage), true, &|app| {
             app.set_place(Place::Storage, "Download/Skyward".into(), Ok(vec![file("notes.txt", 2_048, LISTED - 600)]), LISTED)
-        }),
+        },
+        ),
         ("20-install-storage-checking", Screen::Installing, false, &|app| {
             from_storage(app, Install::Checking { size: 7_014_220_000, stage: None })
         }),
@@ -458,7 +517,8 @@ fn main() -> Result<()> {
         ("20-install-script-ran-reflashed-dark", Screen::Installing, true, &|app| {
             script(app, Install::Finished { outcome: Outcome::Ran { wipe_cache: false }, damage: None }, false);
             app.state.reflash = Some(Reflash::Written(vec![Slot::A, Slot::B]));
-        }),
+        },
+        ),
         ("20-install-script-reflash-failed", Screen::Installing, false, &|app| {
             script(app, Install::Finished { outcome: Outcome::Failed(Failure::Script(1)), damage: Some(Damage::Script) }, true);
             let why = "write /dev/block/by-name/recovery_a: Input/output error (os error 5)";
@@ -484,32 +544,48 @@ fn main() -> Result<()> {
         ("20-install-storage-installed-reflashed", Screen::Installing, false, &|app| {
             from_storage(app, Install::Finished { outcome: Outcome::Installed { slot: Slot::A, wipe: false }, damage: None });
             app.state.reflash = Some(Reflash::Written(vec![Slot::A]));
+        },
+        ),
+        ("11-install-light-recovery-partitions", Screen::Install, false, &|app| {
+            app.state.recovery_partitions = true
         }),
-        ("11-install-light-recovery-partitions", Screen::Install, false, &|app| app.state.recovery_partitions = true),
         ("41-search-light", Screen::Search, false, &|_| {}),
-        ("42-search-light-found", Screen::Search, false, &|app| app.state.search = "b".into()),
-        ("43-search-dark-pinyin", Screen::Search, true, &|app| app.state.search = "zd".into()),
-        ("44-backup-light", Screen::Backup, false, &|_| {}),
+        ("42-search-light-found", Screen::Search, false, &|app| {
+            app.state.search = "b".into()
+        }),
+        ("43-search-dark-pinyin", Screen::Search, true, &|app| {
+            app.state.search = "zd".into()
+        }),
+        ("44-backup-light", Screen::Backup, false, &|app| {
+            app.set_backup_of(backup_rows())
+        }),
         ("45-backup-dark", Screen::Backup, true, &|app| {
             app.set_usb_drive(Some(UsbDrive::Shown));
             app.state.backup_to = Place::UsbDrive;
+            app.set_backup_of(backup_rows());
         }),
         ("46-restore-light-none", Screen::Restore, false, &|_| {}),
-        ("47-restore-light", Screen::Restore, false, &|app| app.set_backups(backups.clone())),
+        ("47-restore-light", Screen::Restore, false, &|app| {
+            app.set_backups(backups.clone())
+        }),
         ("48-restore-backup-light", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, false, false, true]));
+            app.state.restore = Some((backups[0].clone(), ticked(&backups[0], &["boot", "modem"])));
         }),
         ("48-restore-backup-dark-deleting", Screen::RestoreBackup, true, &|app| {
-            app.state.restore = Some((backups[0].clone(), [true, true, false, true]));
+            app.state.restore = Some((backups[0].clone(), ticked(&backups[0], &["boot", "system", "modem"])));
             app.state.asking_delete = true;
         }),
         ("48-restore-backup-light-other-version", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[1].clone(), [true, false, false, false]));
-        }),
+            app.state.restore = Some((backups[1].clone(), ticked(&backups[1], &["boot"])));
+        },
+        ),
         ("48-restore-backup-light-unreadable", Screen::RestoreBackup, false, &|app| {
-            app.state.restore = Some((backups[2].clone(), [false; 4]));
+            app.state.restore = Some((backups[2].clone(), Vec::new()));
+        },
+        ),
+        ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| {
+            app.state.backup_job = job(false, Vec::new(), None, None)
         }),
-        ("100-backup-job-light-measuring", Screen::BackupJob, false, &|app| app.state.backup_job = job(false, Vec::new(), None, None)),
         ("101-backup-job-light", Screen::BackupJob, false, &|app| {
             app.state.backup_job = job(false, plan(), Some(BackupAt { item: 9, done: 1_820_000_000, of: 4_312_031_232, checking: false }), None)
         }),
@@ -541,16 +617,30 @@ fn main() -> Result<()> {
             app.state.backup_job = job(true, Vec::new(), None, Some(BackupEnd::Refused(BackupRefusal::DataReset)))
         }),
         ("49-advanced-light", Screen::Advanced, false, &|_| {}),
-        ("50-files-light", Screen::Files, false, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
-        ("51-files-dark", Screen::Files, true, &|app| app.set_files("/".into(), Ok(sample_root()), LISTED)),
-        ("52-file-info-light", Screen::FileInfo, false, &|app| app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")),
+        ("50-files-light", Screen::Files, false, &|app| {
+            app.set_files("/".into(), Ok(sample_root()), LISTED)
+        }),
+        ("51-files-dark", Screen::Files, true, &|app| {
+            app.set_files("/".into(), Ok(sample_root()), LISTED)
+        }),
+        ("52-file-info-light", Screen::FileInfo, false, &|app| {
+            app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")
+        }),
         ("52-file-permissions-dark", Screen::Permissions, true, &|app| {
             app.state.file = sample_root().into_iter().find(|e| e.name == "init.environ.rc")
         }),
-        ("61-files-names-light", Screen::Files, false, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_download()), LISTED)),
-        ("110-files-types-light", Screen::Files, false, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)),
-        ("110-files-types-dark", Screen::Files, true, &|app| app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)),
-        ("62-files-empty-light", Screen::Files, false, &|app| app.set_files("/cust".into(), Ok(Vec::new()), LISTED)),
+        ("61-files-names-light", Screen::Files, false, &|app| {
+            app.set_files("/sdcard/Download".into(), Ok(sample_download()), LISTED)
+        }),
+        ("110-files-types-light", Screen::Files, false, &|app| {
+            app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)
+        }),
+        ("110-files-types-dark", Screen::Files, true, &|app| {
+            app.set_files("/sdcard/Download".into(), Ok(sample_types()), LISTED)
+        }),
+        ("62-files-empty-light", Screen::Files, false, &|app| {
+            app.set_files("/cust".into(), Ok(Vec::new()), LISTED)
+        }),
         ("63-files-unreadable-dark", Screen::Files, true, &|app| {
             app.set_files("/sys/kernel/debug".into(), Err("read /sys/kernel/debug: Permission denied (os error 13)".into()), LISTED)
         }),
@@ -574,7 +664,9 @@ fn main() -> Result<()> {
             app.state.layer = Layer::Symbols;
         }),
         ("127-relabel-light", Screen::Relabel, false, &|_| {}),
-        ("128-relabel-dark-closed", Screen::Relabel, true, &|app| app.state.data = Data::Closed),
+        ("128-relabel-dark-closed", Screen::Relabel, true, &|app| {
+            app.state.data = Data::Closed
+        }),
         ("129-relabel-light-running", Screen::Relabel, false, &|app| {
             app.relabel_started();
             app.relabel_progress(48_213, 131_908, 6);
@@ -584,13 +676,27 @@ fn main() -> Result<()> {
             app.relabel_progress(131_908, 131_908, 37);
             app.relabel_ended(JobEnd::Done, 0);
         }),
-        ("131-home-light-wlan", Screen::Home, false, &|app| app.state.wlan = Some(joined(Joining::Connected(router_link())))),
-        ("132-wlan-light-off", Screen::Wlan, false, &|app| app.state.wlan = Some(Wlan::default())),
-        ("133-wlan-dark-starting", Screen::Wlan, true, &|app| app.state.wlan = Some(Wlan { power: Power::Starting, ..Wlan::default() })),
-        ("134-wlan-light-nearby", Screen::Wlan, false, &|app| app.state.wlan = Some(Wlan { power: Power::On, networks: nearby(), joined: None })),
-        ("135-wlan-light-joined", Screen::Wlan, false, &|app| app.state.wlan = Some(joined(Joining::Connected(router_link())))),
-        ("136-wlan-dark-wrong-password", Screen::Wlan, true, &|app| app.state.wlan = Some(joined(Joining::WrongPassword))),
-        ("137-wlan-light-addressing", Screen::Wlan, false, &|app| app.state.wlan = Some(joined(Joining::Addressing))),
+        ("131-home-light-wlan", Screen::Home, false, &|app| {
+            app.state.wlan = Some(joined(Joining::Connected(router_link())))
+        }),
+        ("132-wlan-light-off", Screen::Wlan, false, &|app| {
+            app.state.wlan = Some(Wlan::default())
+        }),
+        ("133-wlan-dark-starting", Screen::Wlan, true, &|app| {
+            app.state.wlan = Some(Wlan { power: Power::Starting, ..Wlan::default() })
+        }),
+        ("134-wlan-light-nearby", Screen::Wlan, false, &|app| {
+            app.state.wlan = Some(Wlan { power: Power::On, networks: nearby(), joined: None })
+        }),
+        ("135-wlan-light-joined", Screen::Wlan, false, &|app| {
+            app.state.wlan = Some(joined(Joining::Connected(router_link())))
+        }),
+        ("136-wlan-dark-wrong-password", Screen::Wlan, true, &|app| {
+            app.state.wlan = Some(joined(Joining::WrongPassword))
+        }),
+        ("137-wlan-light-addressing", Screen::Wlan, false, &|app| {
+            app.state.wlan = Some(joined(Joining::Addressing))
+        }),
         ("138-wlan-light-failed", Screen::Wlan, false, &|app| {
             let why = "wpa_supplicant ended as it started: exit status: 255".into();
             app.state.wlan = Some(Wlan { power: Power::Failed(why), ..Wlan::default() });
@@ -616,13 +722,19 @@ fn main() -> Result<()> {
             app.state.wlan = Some(joined(Joining::Connected(router_link())));
             app.state.details = Some(nearby()[7].clone());
         }),
-        ("153-wlan-light-searching", Screen::Wlan, false, &|app| app.state.wlan = Some(Wlan { power: Power::On, ..Wlan::default() })),
-        ("154-wlan-add-light", Screen::WlanAdd, false, &|app| adding(app, "", Security::Open, Field::Name, false)),
+        ("153-wlan-light-searching", Screen::Wlan, false, &|app| {
+            app.state.wlan = Some(Wlan { power: Power::On, ..Wlan::default() })
+        }),
+        ("154-wlan-add-light", Screen::WlanAdd, false, &|app| {
+            adding(app, "", Security::Open, Field::Name, false)
+        }),
         ("155-wlan-add-light-password", Screen::WlanAdd, false, &|app| {
             adding(app, "Skyward-Attic", Security::Psk, Field::Password, false);
             app.state.password = "skyward2024".into();
         }),
-        ("156-wlan-add-light-choosing", Screen::WlanAdd, false, &|app| adding(app, "Skyward-Attic", Security::Psk, Field::Name, true)),
+        ("156-wlan-add-light-choosing", Screen::WlanAdd, false, &|app| {
+            adding(app, "Skyward-Attic", Security::Psk, Field::Name, true)
+        }),
         ("157-wlan-add-dark-choosing", Screen::WlanAdd, true, &|app| {
             adding(app, "Skyward-Attic", Security::Open, Field::Name, true);
             app.state.held = Some(Action::PickSecurity(Security::Sae));
@@ -635,12 +747,16 @@ fn main() -> Result<()> {
             let login = Reach::Login(Some("http://192.168.64.254:2060/redirect/?pip=192.168.72.76".into()));
             app.state.wlan = Some(joined(Joining::Connected(Link { reach: Some(login), ..router_link() })));
         }),
-        ("159-filesystems-light", Screen::Filesystems, false, &|app| app.set_filesystems(Ok(phone_filesystems(true)))),
+        ("159-filesystems-light", Screen::Filesystems, false, &|app| {
+            app.set_filesystems(Ok(phone_filesystems(true)))
+        }),
         ("160-filesystems-dark-closed", Screen::Filesystems, true, &|app| {
             app.state.data = Data::Closed;
             app.set_filesystems(Ok(phone_filesystems(false)));
         }),
-        ("161-filesystem-light-data", Screen::Filesystem, false, &|app| app.set_filesystems(Ok(phone_filesystems(true)))),
+        ("161-filesystem-light-data", Screen::Filesystem, false, &|app| {
+            app.set_filesystems(Ok(phone_filesystems(true)))
+        }),
         ("162-filesystem-dark-cache", Screen::Filesystem, true, &|app| {
             let mut rows = phone_filesystems(true);
             rows.push(FsRow {
@@ -734,11 +850,14 @@ fn main() -> Result<()> {
             let why = "android.hardware.security.keymint.IKeyMintDevice/default is not running; the phone's key service has to be started first";
             app.part_ended(0, ItemEnd::Failed(Some(why.into())), "");
             app.part_work_ended(Ok(()), 0);
-        }),
+        },
+        ),
         ("178-file-info-light-package", Screen::FileInfo, false, &|app| {
             in_download(app, "OTA_ishtar_OS3.0.305.0.WMACNXM_20260412_full_package_signed_for_recovery_install.zip")
         }),
-        ("179-file-info-dark-image", Screen::FileInfo, true, &|app| in_download(app, "skyward-recovery-ishtar.img")),
+        ("179-file-info-dark-image", Screen::FileInfo, true, &|app| {
+            in_download(app, "skyward-recovery-ishtar.img")
+        }),
         ("180-install-opened-light-checking", Screen::Installing, false, &|app| {
             app.state.source = Source::Opened { drive: false };
             app.state.install = Install::Checking { size: 7_014_220_000, stage: None };
@@ -802,7 +921,8 @@ fn main() -> Result<()> {
         ("190-skyward-update-light-offline", Screen::SkywardUpdate, false, &|app| {
             app.state.recovery_partitions = true;
             app.state.wlan = Some(Wlan::default());
-        }),
+        },
+        ),
         ("191-skyward-update-light-newer", Screen::SkywardUpdate, false, &|app| {
             skyward_online(app);
             app.skyward_checked(Ok(skyward_newest()));
@@ -812,19 +932,22 @@ fn main() -> Result<()> {
             app.skyward_checked(Ok(skyward_newest()));
             let stage = Some(SkywardStage::Download(Progress::Downloading { done: 17_104_000, total: 43_145_196 }));
             app.state.skyward_job = Some(SkywardJob { stage, rate: 3_260_000, outcome: None, stopping: false });
-        }),
+        },
+        ),
         ("193-skyward-update-light-writing", Screen::SkywardUpdate, false, &|app| {
             skyward_online(app);
             app.skyward_checked(Ok(skyward_newest()));
             let stage = Some(SkywardStage::Write { done: 140_000_000, total: 419_430_400 });
             app.state.skyward_job = Some(SkywardJob { stage, rate: 0, outcome: None, stopping: false });
-        }),
+        },
+        ),
         ("194-skyward-update-light-updated", Screen::SkywardUpdate, false, &|app| {
             skyward_online(app);
             app.skyward_checked(Ok(skyward_newest()));
             let outcome = Some(SkywardEnd::Updated(vec![Slot::A, Slot::B]));
             app.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome, stopping: false });
-        }),
+        },
+        ),
         ("195-skyward-update-dark-latest", Screen::SkywardUpdate, true, &|app| {
             skyward_online(app);
             app.skyward_checked(Ok(Newest { version: "0.1.3".into(), newer: false, ..skyward_newest() }));
@@ -835,12 +958,14 @@ fn main() -> Result<()> {
             let why = "/dev/block/by-name/recovery_a reads back different from what was written";
             let outcome = Some(SkywardEnd::WriteFailed(vec![Slot::A], why.into()));
             app.state.skyward_job = Some(SkywardJob { stage: None, rate: 0, outcome, stopping: false });
-        }),
+        },
+        ),
         ("197-skyward-update-light-unanswered", Screen::SkywardUpdate, false, &|app| {
             skyward_online(app);
             let why = "GitHub answered 403 Forbidden: API rate limit exceeded for 203.0.113.7. (But here's the good news: Authenticated requests get a higher rate limit.)";
             app.skyward_checked(Err(Unanswered::Failed(why.into())));
-        }),
+        },
+        ),
         ("198-settings-light-skyward-newer", Screen::Settings, false, &|app| {
             skyward_online(app);
             app.skyward_checked(Ok(skyward_newest()));
@@ -853,19 +978,31 @@ fn main() -> Result<()> {
         }),
         ("55-language-light", Screen::Language, false, &|_| {}),
         ("56-time-zone-light", Screen::TimeZone, false, &|_| {}),
-        ("56-time-zone-dark-london", Screen::TimeZone, true, &|app| app.state.time_zone = 5),
+        ("56-time-zone-dark-london", Screen::TimeZone, true, &|app| {
+            app.state.time_zone = 5
+        }),
         ("57-logs-light", Screen::Logs, false, &|_| {}),
-        ("113-update-light-waiting", Screen::Update, false, &|app| app.set_update(Standing::Waiting)),
-        ("114-update-dark-merging", Screen::Update, true, &|app| app.set_update(Standing::Merging(0.37))),
-        ("115-update-light-installed", Screen::Update, false, &|app| app.set_update(Standing::Installed(Slot::A))),
+        ("113-update-light-waiting", Screen::Update, false, &|app| {
+            app.set_update(Standing::Waiting)
+        }),
+        ("114-update-dark-merging", Screen::Update, true, &|app| {
+            app.set_update(Standing::Merging(0.37))
+        }),
+        ("115-update-light-installed", Screen::Update, false, &|app| {
+            app.set_update(Standing::Installed(Slot::A))
+        }),
         // Installed by an updater that has slot A start next only as it
         // restarts the phone itself.
         ("118-update-light-installed-unswitched", Screen::Update, false, &|app| {
             app.set_update(Standing::Installed(Slot::A));
             app.set_boot_slots(Ok(BootSlots { active: Slot::B, bootable: [false, true], successful: [false, true] }));
         }),
-        ("116-update-dark-failed", Screen::Update, true, &|app| app.set_update(Standing::Failed(FailureCode::ExpectedMergeTarget))),
-        ("117-advanced-light-merged", Screen::Advanced, false, &|app| app.set_update(Standing::Merged)),
+        ("116-update-dark-failed", Screen::Update, true, &|app| {
+            app.set_update(Standing::Failed(FailureCode::ExpectedMergeTarget))
+        }),
+        ("117-advanced-light-merged", Screen::Advanced, false, &|app| {
+            app.set_update(Standing::Merged)
+        }),
         ("58-license-light", Screen::License, false, &|_| {}),
         ("59-font-license-light", Screen::FontLicense, false, &|_| {}),
         ("60-slot-dark", Screen::Slot, true, &|app| {
@@ -875,20 +1012,22 @@ fn main() -> Result<()> {
         ("60-slot-light-unread", Screen::Slot, false, &|app| {
             app.set_boot_slots(Err("android.hardware.boot.IBootControl/default is not running; the phone's boot control has to be started first".into()))
         }),
-        ("202-systems-light", Screen::Systems, false, &|app| app.set_systems(Ok(two_systems()))),
+        ("202-systems-light", Screen::Systems, false, &|app| {
+            app.set_systems(Ok(two_systems()))
+        }),
         ("202-systems-light-picked", Screen::Systems, false, &|app| {
             app.set_systems(Ok(two_systems()));
             app.state.system_pick = Some(Who::Other);
         }),
-        ("202-systems-dark", Screen::Systems, true, &|app| app.set_systems(Ok(two_systems()))),
+        ("202-systems-dark", Screen::Systems, true, &|app| {
+            app.set_systems(Ok(two_systems()))
+        }),
         ("202-systems-dark-second-starts", Screen::Systems, true, &|app| {
             app.set_systems(Ok(Overview { other_starts: true, changed: true, ..two_systems() }));
             app.state.asking_delete = true;
         }),
-        ("202-systems-light-empty", Screen::Systems, false, &|app| app.set_systems(Ok(Overview { other: None, ..two_systems() }))),
-        ("202-systems-dark-switching", Screen::Systems, true, &|app| {
-            app.set_systems(Ok(two_systems()));
-            app.state.systems_work = Some(SystemsWork::Switching(Who::Other));
+        ("202-systems-light-empty", Screen::Systems, false, &|app| {
+            app.set_systems(Ok(Overview { other: None, ..two_systems() }))
         }),
         ("202-systems-light-stopped", Screen::Systems, false, &|app| {
             app.set_systems(Ok(Overview { other_starts: true, ..two_systems() }));
@@ -931,7 +1070,9 @@ fn main() -> Result<()> {
             app.set_files("/sdcard/Download".into(), Ok(sample_download()), LISTED);
             app.state.clip = Some(Clip { op: FileOp::Move, path: "/sdcard/README.txt".into() });
         }),
-        ("77-folder-info-dark", Screen::FileInfo, true, &|app| in_download(app, "安装包")),
+        ("77-folder-info-dark", Screen::FileInfo, true, &|app| {
+            in_download(app, "安装包")
+        }),
         ("78-file-info-light-deleting", Screen::FileInfo, false, &|app| {
             in_download(app, "README.txt");
             app.state.asking_delete = true;
@@ -947,7 +1088,9 @@ fn main() -> Result<()> {
             app.file_job_started(copying());
             app.file_progress((2_934_000_000, 7_014_220_000), (0, 1));
         }),
-        ("82-file-job-dark-measuring", Screen::Files, true, &|app| app.file_job_started(FileTask::Delete { path: "/sdcard/DCIM".into() })),
+        ("82-file-job-dark-measuring", Screen::Files, true, &|app| {
+            app.file_job_started(FileTask::Delete { path: "/sdcard/DCIM".into() })
+        }),
         ("83-file-job-light-stopped", Screen::Files, false, &|app| {
             app.file_job_started(copying());
             app.file_progress((2_934_000_000, 7_014_220_000), (0, 1));
@@ -958,24 +1101,39 @@ fn main() -> Result<()> {
             app.file_progress((0, 18_000), (0, 1));
             app.file_job_ended(JobEnd::Failed("make /sdcard/Download/skyward.log: Read-only file system (os error 30)".into()), 0);
         }),
-        ("85-decrypt-light-opening", Screen::Decrypt, false, &|app| app.state.data = Data::Opening),
+        ("85-decrypt-light-opening", Screen::Decrypt, false, &|app| {
+            app.state.data = Data::Opening
+        }),
         ("86-decrypt-light-digits", Screen::Decrypt, false, &|app| {
             app.data_waiting(Some((0, Keys::Digits)));
             app.state.code = "123".into();
         }),
-        ("87-decrypt-dark-letters", Screen::Decrypt, true, &|app| app.data_waiting(Some((10, Keys::Letters)))),
+        ("87-decrypt-dark-letters", Screen::Decrypt, true, &|app| {
+            app.data_waiting(Some((10, Keys::Letters)))
+        }),
         ("88-decrypt-light-checking", Screen::Decrypt, false, &|app| {
             app.state.data = Data::Locked { user: 0, keys: Keys::Digits, checking: true };
         }),
-        ("89-decrypt-light-open", Screen::Decrypt, false, &|app| app.data_waiting(None)),
+        ("89-decrypt-light-open", Screen::Decrypt, false, &|app| {
+            app.data_waiting(None)
+        }),
         ("90-decrypt-dark-failed", Screen::Decrypt, true, &|app| {
             app.data_failed("android.hardware.security.keymint.IKeyMintDevice/default is not running".into())
         }),
-        ("91-wipe-light-all", Screen::Wipe, false, &|app| app.state.wipe[0] = true),
+        ("91-wipe-light-all", Screen::Wipe, false, &|app| {
+            app.state.formats = ALL_FORMATS.to_vec();
+            app.state.wipe[0] = true
+        }),
         ("92-wipe-dark-parts-cache", Screen::Wipe, true, &|app| {
             app.state.cache_partition = true;
+            app.state.metadata_partition = true;
+            app.state.formats = ALL_FORMATS.to_vec();
             app.state.phone_logs = 7;
             app.state.wipe = [false, false, true, true, true, false, true, false, true];
+        }),
+        ("92b-wipe-light-format-parts", Screen::Wipe, false, &|app| {
+            app.state.formats = ALL_FORMATS.to_vec();
+            app.state.format = vec![Part::Cache, Part::System, Part::Vendor];
         }),
         ("93-erase-light-media", Screen::Erase, false, &|app| {
             app.erase_started(false, false, vec![Part::Media, Part::AppCaches, Part::SystemCaches, Part::Logs]);
@@ -990,7 +1148,9 @@ fn main() -> Result<()> {
             app.erase_started(true, false, Vec::new());
             app.erase_ended(Err(EraseStop::Update(Hold::Merging)), 0);
         }),
-        ("97-decrypt-light-erased", Screen::Decrypt, false, &|app| app.state.data = Data::Erased),
+        ("97-decrypt-light-erased", Screen::Decrypt, false, &|app| {
+            app.state.data = Data::Erased
+        }),
         ("98-erase-light-closed", Screen::Erase, false, &|app| {
             app.erase_started(false, false, vec![Part::Art]);
             app.erase_ended(Err(EraseStop::Closed("android.hardware.security.keymint.IKeyMintDevice/default is not running".into())), 0);
@@ -1014,15 +1174,33 @@ fn main() -> Result<()> {
         ("08-about-light", Screen::About, false, &|_, _| 2000),
         ("08-about-dark", Screen::About, true, &|_, _| 2000),
         ("08-about-light-later", Screen::About, false, &|_, _| 9000),
-        ("21-settings-scrolled", Screen::Settings, false, &|app, f| drag(app, f, 1900.0, 1300.0)),
-        ("22-settings-scrolled-dark", Screen::Settings, true, &|app, f| drag(app, f, 1900.0, 1300.0)),
-        ("23-specs-title-fading", Screen::Specs, false, &|app, f| drag(app, f, 1900.0, 1870.0)),
-        ("24-specs-title-gone", Screen::Specs, false, &|app, f| drag(app, f, 1900.0, 1820.0)),
-        ("25-specs-under-bar", Screen::Specs, false, &|app, f| drag(app, f, 1900.0, 1450.0)),
-        ("26-reboot-pulled-down", Screen::Reboot, false, &|app, f| hold(app, f, 900.0, 1700.0)),
-        ("27-back-cue-short", Screen::Home, false, &|app, f| swipe_in(app, f, &info, 133.0)),
-        ("28-back-cue-armed", Screen::Home, false, &|app, f| swipe_in(app, f, &info, 323.0)),
-        ("29-about-scrolled", Screen::About, false, &|app, f| drag(app, f, 1900.0, 1500.0)),
+        ("21-settings-scrolled", Screen::Settings, false, &|app, f| {
+            drag(app, f, 1900.0, 1300.0)
+        }),
+        ("22-settings-scrolled-dark", Screen::Settings, true, &|app, f| {
+            drag(app, f, 1900.0, 1300.0)
+        }),
+        ("23-specs-title-fading", Screen::Specs, false, &|app, f| {
+            drag(app, f, 1900.0, 1870.0)
+        }),
+        ("24-specs-title-gone", Screen::Specs, false, &|app, f| {
+            drag(app, f, 1900.0, 1820.0)
+        }),
+        ("25-specs-under-bar", Screen::Specs, false, &|app, f| {
+            drag(app, f, 1900.0, 1450.0)
+        }),
+        ("26-reboot-pulled-down", Screen::Reboot, false, &|app, f| {
+            hold(app, f, 900.0, 1700.0)
+        }),
+        ("27-back-cue-short", Screen::Home, false, &|app, f| {
+            swipe_in(app, f, &info, 133.0)
+        }),
+        ("28-back-cue-armed", Screen::Home, false, &|app, f| {
+            swipe_in(app, f, &info, 323.0)
+        }),
+        ("29-about-scrolled", Screen::About, false, &|app, f| {
+            drag(app, f, 1900.0, 1500.0)
+        }),
         ("64-files-scrolled", Screen::Files, false, &|app, f| {
             app.set_files("/system/bin".into(), Ok(sample_bin()), LISTED);
             app.frame(f, &info);
@@ -1045,9 +1223,15 @@ fn main() -> Result<()> {
         // The home page's search bar folding away under a finger: its words
         // fading, then the bar, folded whole once let go past halfway, and
         // past that the large title going.
-        ("184-home-search-folding-light", Screen::Home, false, &|app, f| hold(app, f, 1900.0, 1834.0)),
-        ("185-home-search-folding-dark-late", Screen::Home, true, &|app, f| hold(app, f, 1900.0, 1790.0)),
-        ("186-home-search-folded-light", Screen::Home, false, &|app, f| drag(app, f, 1900.0, 1750.0)),
+        ("184-home-search-folding-light", Screen::Home, false, &|app, f| {
+            hold(app, f, 1900.0, 1834.0)
+        }),
+        ("185-home-search-folding-dark-late", Screen::Home, true, &|app, f| {
+            hold(app, f, 1900.0, 1790.0)
+        }),
+        ("186-home-search-folded-light", Screen::Home, false, &|app, f| {
+            drag(app, f, 1900.0, 1750.0)
+        }),
         ("187-home-title-going-dark", Screen::Home, true, &|app, f| {
             // The WLAN's row and a restart into the other slot make the page
             // long enough to go on past the fold.
@@ -1056,8 +1240,12 @@ fn main() -> Result<()> {
             app.frame(f, &info);
             hold(app, f, 1900.0, 1700.0)
         }),
-        ("111-home-keys-light", Screen::Home, false, &|app, f| keys_down(app, f, &info, 3)),
-        ("112-home-keys-dark", Screen::Home, true, &|app, f| keys_down(app, f, &info, 9)),
+        ("111-home-keys-light", Screen::Home, false, &|app, f| {
+            keys_down(app, f, &info, 3)
+        }),
+        ("112-home-keys-dark", Screen::Home, true, &|app, f| {
+            keys_down(app, f, &info, 9)
+        }),
         // A row held down until dark, then let go: the page it opens slides
         // in over it.
         ("119-home-row-held-light", Screen::Home, false, &|app, f| {
@@ -1188,7 +1376,9 @@ fn finger_on(app: &mut App, f: &Fonts, info: &DeviceInfo, action: Action, at: u6
     let t = app.theme();
     let rect = match action {
         Action::Back => widgets::back_rect(&t),
-        _ => app.frame(f, info).hits.iter().find(|h| h.action == action).expect("the control is on the page").rect,
+        _ => {
+            app.frame(f, info).hits.iter().find(|h| h.action == action).expect("the control is on the page").rect
+    }
     };
     let (x, y) = rect.centre();
     app.touch(Touch::Down(x, y), f, at);

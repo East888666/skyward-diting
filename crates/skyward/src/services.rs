@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,9 @@ const RESTART_DELAY: Duration = Duration::from_secs(1);
 /// How long a program gets to become what it says it will be.
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const READY_POLL: Duration = Duration::from_millis(100);
+
+static CONTROLS: Mutex<Vec<(String, Arc<crate::service_control::Control>)>> = Mutex::new(Vec::new());
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the kernel says the highest capability it knows.
 const CAP_LAST_CAP: &str = "/proc/sys/kernel/cap_last_cap";
@@ -57,7 +61,9 @@ pub fn start(services: &[Service], libraries: Option<&Path>) -> Result<()> {
         }
         let waiting = s.clone();
         let name = Path::new(&s.path).file_name().map_or_else(|| s.path.clone(), |n| n.to_string_lossy().into_owned());
-        thread::Builder::new().name(name).spawn(move || supervise(&s, &who)).context("start a supervising thread")?;
+        let control = Arc::new(crate::service_control::Control::default());
+        CONTROLS.lock().expect("service controls poisoned").push((s.path.clone(), control.clone()));
+        thread::Builder::new().name(name).spawn(move || supervise(&s, &who, &control)).context("start a supervising thread")?;
         ready(&waiting)?;
     }
     Ok(())
@@ -189,13 +195,23 @@ fn ready(s: &Service) -> Result<()> {
     }
 }
 
-fn supervise(s: &Service, who: &Credentials) -> ! {
+fn supervise(s: &Service, who: &Credentials, control: &crate::service_control::Control) {
     loop {
         let started = Instant::now();
-        let ended = match running(&s.path) {
-            Some(pid) => wait_for(pid).map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
-            None => run(s, who),
+        // Finding an earlier child and creating a new one both serialize
+        // with stop: it cannot miss a process born during the stop.
+        let launched = control.launch(|| {
+            if let Some(pid) = running(&s.path) { return Ok((pid, (pid, None))); }
+            let child = command(s, who).spawn()?;
+            Ok((child.id(), (child.id(), Some(child))))
+        });
+        let ended = match launched {
+            Ok(None) => return,
+            Ok(Some((pid, Some(mut child)))) => child.wait().context("wait for it").map(|status| format!("pid {pid} ended: {status}")),
+            Ok(Some((pid, None))) => wait_for(pid).map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
+            Err(e) => Err(e).with_context(|| format!("start {}", s.path)),
         };
+        control.finish();
         let line = match ended {
             Ok(how) => format!("{}: {how}", s.path),
             Err(e) => format!("{}: {e:#}", s.path),
@@ -207,19 +223,37 @@ fn supervise(s: &Service, who: &Credentials) -> ! {
     }
 }
 
-/// Start the program and wait for it to end.
-fn run(s: &Service, who: &Credentials) -> Result<String> {
-    let mut child = command(s, who).spawn().with_context(|| format!("start {}", s.path))?;
-    let status = child.wait().context("wait for it")?;
-    Ok(format!("pid {} ended: {status}", child.id()))
+/// Permanently retire the configured supervisors before a non-A/B write.
+/// Open data stays open; secure services need a fresh recovery boot after
+/// this, because their installed executables may now have been replaced.
+pub fn stop_for_install() -> Result<()> {
+    let controls = CONTROLS.lock().expect("service controls poisoned").clone();
+    for (_, control) in &controls { control.stop(); }
+    for (path, control) in controls.iter().rev() {
+        let signal = |number| control.signal(|pid| {
+            if unsafe { libc::kill(pid as libc::pid_t, number) } == 0 { return Ok(()); }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) }
+        });
+        signal(libc::SIGTERM).with_context(|| format!("stop {path}"))?;
+        if !control.wait(STOP_TIMEOUT) {
+            signal(libc::SIGKILL).with_context(|| format!("end {path}"))?;
+            ensure!(control.wait(STOP_TIMEOUT), "{path} has not exited; refusing to overwrite its partitions");
+        }
+        let _ = skyward_sys::kmsg(&format!("install: stopped {path}; supervisor retired until recovery reboots"));
+    }
+    Ok(())
 }
 
 /// The program as it is started: with what it is given, from the top of the
 /// tree, reading and writing nothing of the recovery's, finding its
 /// libraries where it names them, and as `who`.
 fn command(s: &Service, who: &Credentials) -> Command {
-    let mut cmd = Command::new(&s.path);
-    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut cmd = match &s.loader {
+        Some(loader) => { let mut cmd = Command::new(loader); cmd.arg(&s.path); cmd },
+        None => Command::new(&s.path),
+    };
+    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
     if !s.libraries.is_empty() {
         cmd.env("LD_LIBRARY_PATH", s.libraries.join(":"));
     }
@@ -319,7 +353,15 @@ pub fn reachable() -> bool {
 pub fn running(path: &str) -> Option<u32> {
     fs::read_dir("/proc").ok()?.flatten().find_map(|e| {
         let pid: u32 = e.file_name().to_str()?.parse().ok()?;
-        (fs::read_link(e.path().join("exe")).ok()? == Path::new(path)).then_some(pid)
+        let exe = fs::read_link(e.path().join("exe")).ok()?;
+        if exe == Path::new(path) { return Some(pid); }
+        // Direct invocation of a matching linker keeps /proc/exe naming
+        // that linker. Its first argument identifies the actual service.
+        if exe.file_name().is_some_and(|n| n == "linker64") {
+            let args = fs::read(e.path().join("cmdline")).ok()?;
+            if args.split(|b| *b == 0).nth(1) == Some(path.as_bytes()) { return Some(pid); }
+        }
+        None
     })
 }
 
@@ -332,6 +374,9 @@ fn wait_for(pid: u32) -> Result<()> {
         if e.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
+        if e.raw_os_error() == Some(libc::ENOSYS) {
+            return wait_for_legacy(pid);
+        }
         return Err(e).context("open a pidfd");
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
@@ -343,6 +388,25 @@ fn wait_for(pid: u32) -> Result<()> {
         let e = io::Error::last_os_error();
         if e.kind() != io::ErrorKind::Interrupted {
             return Err(e).context("wait on the pidfd");
+        }
+    }
+}
+
+/// Old Android kernels have no pidfds. Hold the proc directory open so
+/// PID reuse cannot make us wait for a different process. A zombie has
+/// already exited, even while its parent has yet to reap it.
+fn wait_for_legacy(pid: u32) -> Result<()> {
+    let process = match Process::new(pid as i32) {
+        Ok(process) => process,
+        Err(procfs::ProcError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(error).context("open the process directory"),
+    };
+    loop {
+        match process.stat() {
+            Ok(stat) if matches!(stat.state, 'Z' | 'X' | 'x') => return Ok(()),
+            Ok(_) => thread::sleep(READY_POLL),
+            Err(procfs::ProcError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error).context("wait for the process to exit"),
         }
     }
 }

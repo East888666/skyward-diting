@@ -199,6 +199,9 @@ mod sys {
     /// is, as everything that writes or erases the installed system first
     /// does; says whether it had to.
     pub fn ensure_installed() -> Result<bool> {
+        // This store can only occupy an A/B slot. An unslotted device
+        // must not try to mount a nonexistent metadata partition here.
+        if skyward_vab::current_slot()?.is_none() { return Ok(false); }
         resume()?;
         let state = state()?;
         let Some(slot) = state.occupied.as_deref().map(|s| Slot::from_suffix(s).with_context(|| format!("the other system is in slot {s:?}"))).transpose()? else {

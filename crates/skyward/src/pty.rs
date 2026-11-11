@@ -19,8 +19,8 @@ pub struct Shell {
     /// The screen's side of the terminal.
     master: File,
     child: Child,
-    /// Readable once the shell has ended.
-    ended: OwnedFd,
+    /// Readable once the shell has ended; absent on kernels before pidfds.
+    ended: Option<OwnedFd>,
 }
 
 impl Shell {
@@ -67,18 +67,29 @@ impl Shell {
                 Ok(())
             });
         }
-        let child = command.spawn().with_context(|| format!("start {SHELL}"))?;
+        let mut child = command.spawn().with_context(|| format!("start {SHELL}"))?;
         let ended = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
-        if ended < 0 {
-            return Err(io::Error::last_os_error()).context("watch the shell");
-        }
-        let ended = unsafe { OwnedFd::from_raw_fd(ended as RawFd) };
+        let ended = if ended >= 0 {
+            Some(unsafe { OwnedFd::from_raw_fd(ended as RawFd) })
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOSYS) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("watch the shell");
+            }
+            // The PTY wakes poll on output/HUP. The UI also wakes at least
+            // once a second and calls try_wait, even if descendants still
+            // hold the slave open after the shell exits.
+            None
+        };
         Ok(Shell { master: File::from(master), child, ended })
     }
 
-    /// What to wait on: the shell writing, and the shell ending.
+    /// What to wait on: the shell writing, and the shell ending. A missing
+    /// pidfd is -1, which poll ignores on older kernels.
     pub fn fds(&self) -> [RawFd; 2] {
-        [self.master.as_raw_fd(), self.ended.as_raw_fd()]
+        [self.master.as_raw_fd(), self.ended.as_ref().map_or(-1, AsRawFd::as_raw_fd)]
     }
 
     /// What the shell wrote since the last call. Once nothing holds the

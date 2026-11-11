@@ -99,9 +99,91 @@ pub fn recorded_name(path: &Path) -> Result<[u8; NAME_BYTES]> {
     }
 }
 
+/// Old v1 policies identify their 64-byte key by a double SHA-512 hash.
+/// This is the vold KeyUtil algorithm, not the modern kernel identifier.
+pub fn legacy_descriptor(raw: &[u8]) -> Result<[u8; 8]> {
+    use sha2::{Digest, Sha512};
+    anyhow::ensure!(raw.len() == 64, "legacy fscrypt key must be 64 bytes");
+    Ok(Sha512::digest(Sha512::digest(raw))[..8].try_into().expect("eight bytes"))
+}
+
+#[cfg(target_os = "android")]
+pub fn legacy_prepare_keyring() -> Result<i32> {
+    use std::ffi::CString;
+    const SESSION: libc::c_long = -3;
+    let session = unsafe { libc::syscall(libc::SYS_keyctl, 0, SESSION, 1, 0, 0) };
+    if session < 0 { return Err(std::io::Error::last_os_error()).context("open recovery session keyring"); }
+    let kind = CString::new("keyring")?;
+    let name = CString::new("fscrypt")?;
+    let found = unsafe { libc::syscall(libc::SYS_keyctl, 10, session, kind.as_ptr(), name.as_ptr(), 0) };
+    if found >= 0 { return Ok(found as i32); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::ENOKEY) { return Err(error).context("find fscrypt keyring"); }
+    let created = unsafe { libc::syscall(libc::SYS_add_key, kind.as_ptr(), name.as_ptr(), std::ptr::null::<u8>(), 0, session) };
+    if created < 0 { return Err(std::io::Error::last_os_error()).context("create fscrypt session keyring"); }
+    Ok(created as i32)
+}
+
+#[cfg(target_os = "android")]
+pub fn legacy_add_key(raw: &[u8], expected: Option<&[u8; 8]>) -> Result<[u8; 8]> {
+    use std::ffi::CString;
+    let descriptor = legacy_descriptor(raw)?;
+    anyhow::ensure!(expected.is_none_or(|expected| expected == &descriptor), "legacy key differs from its recorded descriptor");
+    let ring = legacy_prepare_keyring()?;
+    let mut payload = [0u8; 72];
+    payload[..4].copy_from_slice(&1u32.to_ne_bytes()); // FS_ENCRYPTION_MODE_AES_256_XTS
+    payload[4..68].copy_from_slice(raw);
+    payload[68..].copy_from_slice(&64u32.to_ne_bytes());
+    let kind = CString::new("logon")?;
+    let suffix: String = descriptor.iter().map(|b| format!("{b:02x}")).collect();
+    let result = (|| -> Result<()> {
+        for prefix in ["ext4", "f2fs", "fscrypt"] {
+            let name = CString::new(format!("{prefix}:{suffix}"))?;
+            let added = unsafe { libc::syscall(libc::SYS_add_key, kind.as_ptr(), name.as_ptr(), payload.as_ptr(), payload.len(), ring) };
+            if added < 0 { return Err(std::io::Error::last_os_error()).context("install legacy fscrypt key"); }
+        }
+        Ok(())
+    })();
+    payload.fill(0);
+    result?;
+    Ok(descriptor)
+}
+
+/// Confirm the exact policy descriptor has a logon key in this session.
+/// Old kernels lack FS_IOC_GET_ENCRYPTION_KEY_STATUS; do not send that
+/// modern ioctl or mistake ENOTTY for a decrypted directory.
+#[cfg(target_os = "android")]
+pub fn legacy_unlocked(dir: &Path) -> Result<bool> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+    let folder = std::fs::File::open(dir).with_context(|| format!("open {}", dir.display()))?;
+    let mut policy = [0u8; 12];
+    if unsafe { libc::ioctl(folder.as_raw_fd(), 0x400c6615u32 as libc::Ioctl, policy.as_mut_ptr()) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ENODATA) { return Ok(true); }
+        return Err(error).context("read legacy encryption policy");
+    }
+    anyhow::ensure!(policy[0] == 0 && matches!(policy[1], 1 | 127) && policy[2] == 4, "unsupported legacy encryption policy");
+    let name: String = policy[4..12].iter().map(|b| format!("{b:02x}")).collect();
+    let kind = CString::new("logon")?;
+    let name = CString::new(format!("fscrypt:{name}"))?;
+    let ring = legacy_prepare_keyring()?;
+    let key = unsafe { libc::syscall(libc::SYS_keyctl, 10, ring, kind.as_ptr(), name.as_ptr(), 0) };
+    if key >= 0 { return Ok(true); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOKEY) { return Ok(false); }
+    Err(error).context("find key for legacy encryption policy")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_descriptor_matches_an_independent_double_sha512_vector() {
+        let descriptor = legacy_descriptor(&[0u8; 64]).unwrap();
+        assert_eq!(descriptor, [245, 116, 167, 116, 100, 1, 115, 17]);
+        assert!(legacy_descriptor(&[0; 32]).is_err());
+    }
 
     #[test]
     fn a_phone_says_whether_the_hardware_holds_the_keys() {

@@ -22,11 +22,12 @@ mod ffs;
 #[cfg(target_os = "android")]
 mod run;
 
-pub use image::{ImageKind, Ramdisk};
+pub use image::{Filesystem, ImageKind, Ramdisk};
 #[cfg(target_os = "android")]
 pub use run::{Detach, Installer};
 use skyward_info::{Battery, Charge};
 use skyward_vab::{Slot, SnapshotState};
+use std::path::PathBuf;
 
 /// The least charge to install on, without and with a charger, as
 /// Android's recovery asks.
@@ -167,8 +168,11 @@ pub enum Outcome {
     /// The update is in `slot`, which starts next; `wipe` when all user data
     /// is to be erased before it does.
     Installed { slot: Slot, wipe: bool },
-    /// The image is in the partition of these slots.
-    Flashed { partition: &'static str, slots: Vec<Slot> },
+    /// The image is written to these partitions, by the links it went
+    /// through: one of each slot where the phone keeps a set per slot, and
+    /// one of its own name where it has a single set.
+    Flashed { partition: &'static str,
+        devices: Vec<PathBuf> },
     /// The install script ran to its end; `wipe_cache` when it asked for
     /// the cache partition to be erased after.
     Ran { wipe_cache: bool },
@@ -267,9 +271,10 @@ pub enum Failure {
 /// What the screen tells the installer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Write the image held in [`Event::Image`] to `partition` in these
-    /// slots.
-    Flash { partition: &'static str, slots: Vec<Slot> },
+    /// Write the image held in [`Event::Image`] to `partition` at these
+    /// devices.
+    Flash { partition: &'static str,
+        devices: Vec<PathBuf> },
     /// Install the update held in [`Event::Ready`], or run the script held
     /// in [`Event::Script`].
     Install,

@@ -43,7 +43,7 @@ impl Decryptor {
             .name("decrypt".into())
             .spawn(move || {
                 let ended_as = match job {
-                    Job::Open => Ended::Opened(with_key_service(data::open_without_credential)),
+                    Job::Open => Ended::Opened(open_data()),
                     Job::Unlock { closed, user, credential } => {
                         Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
                     }
@@ -87,4 +87,29 @@ pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T
         work(&service)
     })();
     done.map_err(|e| format!("{e:#}"))
+}
+
+/// Plain legacy data needs no AIDL service. Preserve both failure reasons
+/// when the configured encryption requires hardware this recovery lacks.
+pub fn open_data() -> Result<Opening, String> {
+    match data::open_without_keys() {
+        Ok(opening) => Ok(opening),
+        Err(plain) => {
+            // A damaged/unreplayed filesystem is not evidence that a key
+            // service should be tried. Its later missing-key error would
+            // obscure the directory I/O failure that actually needs fixing.
+            if plain.chain().any(|cause| cause.downcast_ref::<std::io::Error>()
+                .is_some_and(|io| matches!(io.raw_os_error(), Some(libc::EUCLEAN | libc::EIO)))) {
+                return Err(format!("data filesystem could not be read; check its filesystem before retrying: {plain:#}"));
+            }
+            let legacy = skyward_config::DeviceConfig::load("/skyward/device.toml")
+                .is_ok_and(|cfg| cfg.recovery.legacy_version.is_some());
+            if legacy {
+                return data::open_legacy_without_credential()
+                    .map_err(|error| format!("plain data: {plain:#}; legacy FBE: {error:#}"));
+            }
+            with_key_service(data::open_without_credential)
+                .map_err(|hardware| format!("plain data: {plain:#}; encrypted data: {hardware}"))
+        }
+    }
 }

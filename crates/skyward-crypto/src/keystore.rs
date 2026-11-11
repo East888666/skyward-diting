@@ -70,7 +70,13 @@ impl StoredKey {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
         if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+            let stretching = fs::read_to_string(dir.join(FN_STRETCHING)).context("read legacy key stretching")?;
+            // AOSP KeyStorage: nopassword appends an empty stretched secret.
+            // Other old layouts need their own stretching/authentication path.
+            if stretching != "nopassword" {
+                bail!("{} uses unsupported legacy key stretching {stretching:?}", dir.display());
+            }
+            anyhow::ensure!(dir.join(FN_KEY_BLOB).is_file() && dir.join(FN_SECDISCARDABLE).is_file(), "nopassword key lacks hardware binding");
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
@@ -231,7 +237,7 @@ mod tests {
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
         fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
-        assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
+        assert!(refusal(&dir).contains("unsupported legacy key stretching"), "{}", refusal(&dir));
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));
@@ -246,6 +252,20 @@ mod tests {
         let s = StoredKey::load(&dir).unwrap();
         assert!(s.secdiscardable_hash.is_empty());
         assert_eq!(s.unwrap(Unwrap::<NoService>::Secret(b"only the secret")).unwrap(), key.to_vec());
+    }
+
+    #[test]
+    fn legacy_nopassword_keeps_the_secdiscardable_binding() {
+        let dir = tempdir("nopassword");
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
+        fs::write(dir.join(FN_STRETCHING), "nopassword").unwrap();
+        assert!(StoredKey::load(&dir).is_err(), "hardware binding is required");
+        fs::write(dir.join(FN_KEY_BLOB), b"hardware blob").unwrap();
+        fs::write(dir.join(FN_SECDISCARDABLE), b"discardable").unwrap();
+        let key = StoredKey::load(&dir).unwrap();
+        assert_eq!(key.app_id(&[]), hash_with_prefix(SECDISCARDABLE_PREFIX, b"discardable"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// Why loading the directory was turned down.

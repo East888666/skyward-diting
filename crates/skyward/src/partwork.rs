@@ -294,7 +294,7 @@ fn repair(part: Part, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
     tell(Event::Listed(vec![name(&part)]));
     tell(Event::At(0));
     let done = reach(&part, |device| {
-        let filesystem = probe::filesystem(device)?.context("the partition holds no filesystem blkid knows")?;
+        let filesystem = probe::filesystem(device)?.context("the partition holds no filesystem this recovery knows")?;
         let (fixed, ran) = fsck::repair(device, &filesystem)?;
         Ok((Item::Fixed(fixed), ran.said))
     });
@@ -340,7 +340,7 @@ fn reach<T>(part: &Part, work: impl FnOnce(&Path) -> Result<T>) -> Result<T> {
             done
         }
         Part::Entry(entry) => {
-            let at = Path::new(&entry.mount_point);
+            let at = Path::new(fstab::point(&entry.mount_point));
             let mounted = mount::is_mount_point(at)?;
             if mounted {
                 mount::umount(at)?;

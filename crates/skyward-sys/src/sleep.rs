@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -17,8 +18,18 @@ use std::time::{Duration, Instant};
 /// began.
 const WAKEUP_COUNT: &str = "/sys/power/wakeup_count";
 
-/// Where writing `mem` suspends the phone, and returns once it wakes.
+/// Where writing the sleep's own word suspends the phone, and returns once
+/// it wakes.
 const STATE: &str = "/sys/power/state";
+
+/// The word `mem` stands for once `mem_sleep` says `s2idle`.
+const MEM: &str = "mem";
+
+/// The word that asks for the same sleep on a kernel without `mem_sleep`:
+/// `freeze` is suspend-to-idle by its own name, and every kernel that has
+/// suspend offers it beside `mem`. A kernel older than 4.5 has no
+/// `mem_sleep` to choose with, and this phone's is 4.4.
+const IDLE: &str = "freeze";
 
 /// How `mem` suspends the phone. Set to `s2idle`, as the phone's own system
 /// sets it, every CPU stays online and idles in its deepest state. Suspended
@@ -60,13 +71,25 @@ pub struct Sleeper {
 
 impl Sleeper {
     pub fn start() -> Result<Sleeper> {
-        fs::write(MEM_SLEEP, "s2idle").with_context(|| format!("write s2idle to {MEM_SLEEP}"))?;
+        // A kernel from 4.5 on has `mem_sleep`, and `s2idle` there is what
+        // makes `mem` mean suspend-to-idle. This phone's kernel is 4.4: it
+        // has no such file at all, and asking for one is refused, so the
+        // sleep is asked for by the name that kernel knows instead. Writing
+        // `mem` regardless would take the CPUs offline, which is the sleep
+        // this file exists to avoid.
+        let state = if Path::new(MEM_SLEEP).exists() {
+            fs::write(MEM_SLEEP, "s2idle").with_context(|| format!("write s2idle to {MEM_SLEEP}"))?;
+            MEM
+        } else {
+            IDLE
+        };
         let mut fds = [0; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
             return Err(std::io::Error::last_os_error()).context("make the sleeper's wake pipe");
         }
         let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new()));
+        let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new(),
+        ));
         let (tx, told) = mpsc::channel();
         let shared = leave.clone();
         thread::Builder::new()
@@ -86,7 +109,9 @@ impl Sleeper {
                             };
                         }
                     }
-                    let slept = sleep(|| lock.lock().expect("the sleeper's leave is not held by a thread that panicked").allowed);
+                    let slept = sleep(state, || {
+                        lock.lock().expect("the sleeper's leave is not held by a thread that panicked").allowed
+                    });
                     let Some(slept) = slept else { continue };
                     {
                         let mut l = lock.lock().expect("the sleeper's leave is not held by a thread that panicked");
@@ -168,8 +193,8 @@ impl Wakeful {
 
 /// Suspend the phone, unless `allowed` says the screen's loop took its
 /// leave back while the thread waited for the wakeup events in progress to
-/// end: none then.
-fn sleep(allowed: impl Fn() -> bool) -> Option<Slept> {
+/// end: none then. `state` is the word this kernel takes to suspend to idle.
+fn sleep(state: &str, allowed: impl Fn() -> bool) -> Option<Slept> {
     let count = match fs::read_to_string(WAKEUP_COUNT) {
         Ok(count) => count,
         Err(e) => return Some(Slept::Refused(format!("read {WAKEUP_COUNT}: {e}"))),
@@ -180,7 +205,7 @@ fn sleep(allowed: impl Fn() -> bool) -> Option<Slept> {
     if let Err(e) = fs::write(WAKEUP_COUNT, count.trim()) {
         return Some(Slept::Refused(format!("a wakeup event came as the phone was to sleep: {e}")));
     }
-    Some(match fs::write(STATE, "mem") {
+    Some(match fs::write(STATE, state) {
         Ok(()) => Slept::Woke,
         Err(e) => Slept::Refused(format!("the kernel would not suspend: {e}")),
     })

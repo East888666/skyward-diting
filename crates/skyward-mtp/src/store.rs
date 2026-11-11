@@ -202,7 +202,8 @@ impl Store {
 
     /// Forget an entry, and everything in it.
     pub fn remove(&mut self, h: u32) {
-        let Some(entry) = self.entries.remove(&h) else { return };
+        let Some(entry) = self.entries.remove(&h) else { return;
+        };
         if let Ok(parent) = self.folder_mut(entry.parent) {
             parent.entries.remove(&entry.name);
         }
@@ -275,11 +276,13 @@ impl Store {
                 }
             }
             Raw::Appeared(wd, name) => {
-                let Some(folder) = self.watch.folder(wd) else { return };
+                let Some(folder) = self.watch.folder(wd) else { return;
+                };
                 if self.child(folder, &name).is_some() {
                     return;
                 }
-                let Some(path) = self.path(folder) else { return };
+                let Some(path) = self.path(folder) else { return;
+                };
                 let path = path.join(&name);
                 if fs::symlink_metadata(&path).is_ok() {
                     let h = self.add(folder, name, is_dir(&path));
@@ -287,8 +290,10 @@ impl Store {
                 }
             }
             Raw::Vanished(wd, name) => {
-                let Some(folder) = self.watch.folder(wd) else { return };
-                let Some(h) = self.child(folder, &name) else { return };
+                let Some(folder) = self.watch.folder(wd) else { return;
+                };
+                let Some(h) = self.child(folder, &name) else { return;
+                };
                 let path = self.path(h).expect("a known entry has a path");
                 if fs::symlink_metadata(&path).is_err() {
                     self.remove(h);
@@ -517,7 +522,8 @@ mod tests {
         fs::write(at.join("a/x.txt"), b"x").unwrap();
         let mut store = Store::new(at.clone()).unwrap();
         store.children(TOP).unwrap();
-        let (a, b) = (store.child(TOP, OsStr::new("a")).unwrap(), store.child(TOP, OsStr::new("b")).unwrap());
+        let (a, b) = (store.child(TOP, OsStr::new("a")).unwrap(), store.child(TOP, OsStr::new("b")).unwrap(),
+        );
         let x = store.children(a).unwrap()[0];
         fs::rename(at.join("a/x.txt"), at.join("a/y.txt")).unwrap();
         store.rename(x, "y.txt".into());

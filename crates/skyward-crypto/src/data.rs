@@ -161,7 +161,167 @@ fn show_owner_storage() -> Result<()> {
     if mount::is_mount_point(at)? {
         return Ok(());
     }
-    mount::bind(&Path::new(SHARED_STORAGE).join(OWNER.to_string()), at)
+    mount::prepare(at)?;
+    mount::bind(&shared_storage(), at)
+}
+
+/// The owner directory on multi-user Android, or the older shared layout.
+pub fn shared_storage() -> PathBuf {
+    let owner = Path::new(SHARED_STORAGE).join(OWNER.to_string());
+    if owner.is_dir() { owner } else { PathBuf::from(SHARED_STORAGE) }
+}
+
+/// Open old v1 FBE with Keymaster 3 and the inherited fscrypt keyring.
+/// Only hardware-bound nopassword CE keys are supported here; synthetic
+/// password and credential-protected CE layouts fail rather than being
+/// reported as decrypted. Replay the filesystem journal before inspecting
+/// keys, with ordinary directory writes still disabled.
+pub fn open_legacy_without_credential() -> Result<Opening> {
+    use crate::{fscrypt, keymaster3::Keymaster3};
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    anyhow::ensure!(entries.iter().all(|e| e.extra("metadata_encryption").is_none()), "legacy FBE does not support metadata encryption");
+    let newly_mounted = !mount::is_mount_point(Path::new(MOUNT))?;
+    let mounted = if newly_mounted {
+        let mut opened = None;
+        for entry in &entries {
+            let device = PathBuf::from(skyward_block::fstab::device(entry)?);
+            if skyward_block::probe::filesystem(&device)?.as_deref() != Some(&entry.filesystem) { continue; }
+            mount::prepare(Path::new(MOUNT))?;
+            let options = crate::plain::mount_options(&entry.options, false);
+            mount::mount(&device, Path::new(MOUNT), &entry.filesystem, &options)?;
+            opened = Some(Opened { mapped: device, filesystem: entry.filesystem.clone(), checked: None });
+            break;
+        }
+        Some(opened.context("legacy data has no directly mountable filesystem")?)
+    } else { None };
+    let opened = (|| -> Result<()> {
+        let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read legacy encryption mode {FILE_MODE}"))?;
+        anyhow::ensure!(matches!(mode.trim(), "ice:aes-256-cts:v1" | "aes-256-xts:aes-256-cts:v1"), "unsupported legacy file encryption mode");
+        let reference = std::fs::read(SHARED_NAME)?;
+        let expected: [u8; 8] = reference.try_into().map_err(|_| anyhow::anyhow!("legacy common key needs an 8-byte descriptor"))?;
+        let binder = Binder::hardware()?;
+        let service = Keymaster3::open(&binder)?;
+        let install = |dir: &Path, expected: Option<&[u8; 8]>| -> Result<()> {
+            let mut raw = StoredKey::load(dir)?.unwrap(Unwrap::Hardware(&service)).with_context(|| format!("unwrap legacy key in {}", dir.display()))?;
+            let result = fscrypt::legacy_add_key(&raw, expected);
+            raw.fill(0);
+            result.map(|_| ())
+        };
+        install(Path::new(SHARED_KEY), Some(&expected))?;
+        let users = users()?;
+        anyhow::ensure!(users.contains(&OWNER), "legacy DE key for owner is absent");
+        for user in &users {
+            install(&Path::new(USER_KEYS).join("de").join(user.to_string()), None)?;
+            for prefix in ["user_de", "system_de"] {
+                let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
+                if dir.is_dir() { anyhow::ensure!(fscrypt::legacy_unlocked(&dir)?, "legacy DE key does not open {}", dir.display()); }
+            }
+        }
+        for user in users {
+            let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+            install(&dir, None).context("legacy CE key requires a supported nopassword hardware layout")?;
+            for prefix in ["user", "system_ce", "media"] {
+                let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
+                if dir.is_dir() { anyhow::ensure!(fscrypt::legacy_unlocked(&dir)?, "legacy CE key does not open {}", dir.display()); }
+            }
+        }
+        anyhow::ensure!(shared_storage().is_dir(), "legacy data has no existing shared storage");
+        Ok(())
+    })();
+    if let Err(error) = opened {
+        if newly_mounted { mount::umount(Path::new(MOUNT)).context("unmount legacy data after failed unlock")?; }
+        return Err(error);
+    }
+    if let Some(opened) = &mounted {
+        // Do not remount an inspection view writable: on older kernels a
+        // noload mount can keep norecovery through remount. Use the table's
+        // ordinary writable options, as in the plain-data path below.
+        let entry = entries.iter().find(|e| e.filesystem == opened.filesystem).context("legacy data filesystem entry disappeared")?;
+        mount::umount(Path::new(MOUNT))?;
+        mount::mount(&opened.mapped, Path::new(MOUNT), &opened.filesystem, &crate::plain::mount_options(&entry.options, true))?;
+    }
+    show_owner_storage()?;
+    Ok(Opening { mounted, closed: Vec::new() })
+}
+
+/// Open only demonstrably plain data without contacting KeyMint. Legacy
+/// full-disk encryption and FBE still require their own key services.
+/// Initialize media only on an empty filesystem without encryption policies.
+pub fn open_without_keys() -> Result<Opening> {
+    let entries = skyward_block::fstab::read(MOUNT)?;
+    anyhow::ensure!(!entries.is_empty(), "the phone's table names no data filesystem");
+    anyhow::ensure!(!entries.iter().any(|e| e.extra("metadata_encryption").is_some()),
+        "data is configured for metadata encryption and needs a key service");
+    let newly_mounted = !mount::is_mount_point(Path::new(MOUNT))?;
+    let mounted = if newly_mounted {
+        let mut opened = None;
+        for entry in &entries {
+            let device = PathBuf::from(skyward_block::fstab::device(entry)?);
+            if skyward_block::probe::filesystem(&device)?.as_deref() != Some(&entry.filesystem) { continue; }
+            mount::prepare(Path::new(MOUNT))?;
+            // Let ext4 replay committed metadata before inspecting paths.
+            // noload can expose stale directory entries after a reset,
+            // including media pointing to an inode not yet recovered.
+            let options = crate::plain::mount_options(&entry.options, false);
+            mount::mount(&device, Path::new(MOUNT), &entry.filesystem, &options)?;
+            opened = Some(Opened { mapped: device, filesystem: entry.filesystem.clone(), checked: None });
+            break;
+        }
+        Some(opened.context("data holds no directly mountable filesystem; legacy encrypted data needs decryption support")?)
+    } else { None };
+    let opened = (|| -> Result<()> {
+        let file_encryption = entries.iter().any(|e| e.extra("fileencryption").is_some());
+        let mut initialize = crate::plain::inspect(Path::new(MOUNT), file_encryption, ensure_plain)?;
+        if let Some(opened) = &mounted {
+            // A writable remount retains ext4's noload/norecovery option.
+            // Reopen normally so subsequent writes have a working journal
+            // and use the device table's nosuid/nodev and other options.
+            let entry = entries.iter().find(|e| e.filesystem == opened.filesystem).context("data filesystem entry disappeared")?;
+            mount::umount(Path::new(MOUNT))?;
+            mount::mount(&opened.mapped, Path::new(MOUNT), &opened.filesystem, &crate::plain::mount_options(&entry.options, true))?;
+            // Journal replay must not turn an apparently plain layout into
+            // a reported unlock of encrypted data.
+            initialize = crate::plain::inspect(Path::new(MOUNT), file_encryption, ensure_plain)?;
+        }
+        if initialize {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [SHARED_STORAGE.to_string(), format!("{SHARED_STORAGE}/{OWNER}")] {
+                std::fs::create_dir(&dir).with_context(|| format!("initialize {dir} after formatting data"))?;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))?;
+                std::os::unix::fs::chown(&dir, Some(1023), Some(1023)).with_context(|| format!("set media ownership of {dir}"))?;
+            }
+        }
+        show_owner_storage()
+    })();
+    if let Err(error) = opened {
+        if newly_mounted && mount::is_mount_point(Path::new(MOUNT))? {
+            mount::umount(Path::new(MOUNT)).context("unmount data after failed plain opening")?;
+        }
+        return Err(error);
+    }
+    Ok(Opening { mounted, closed: Vec::new() })
+}
+
+#[cfg(target_os = "android")]
+fn ensure_plain(dir: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    // The v1 policy ioctl is also understood by Android's older kernels.
+    // Linux defines this GET ioctl with _IOW, despite its name.
+    const GET_POLICY: u32 = 0x400c_6615;
+    let file = std::fs::File::open(dir)?;
+    let mut policy = [0u8; 12];
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), GET_POLICY as libc::Ioctl, policy.as_mut_ptr()) };
+    anyhow::ensure!(result != 0, "{} has an encryption policy and needs keys", dir.display());
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ENOTTY) => Ok(()),
+        _ => Err(error).with_context(|| format!("inspect encryption of {}", dir.display())),
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn ensure_plain(_dir: &Path) -> Result<()> {
+    anyhow::bail!("data encryption is inspected only on Android")
 }
 
 /// Close what opening the partition opened, where the recovery opened it:

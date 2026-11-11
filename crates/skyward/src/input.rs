@@ -66,6 +66,35 @@ fn slot0_value(dev: &RawDevice, axis: AbsoluteAxisCode, slots: usize) -> io::Res
     Ok(buf[1])
 }
 
+/// Whether the panel reports `key` at all, from the driver's own EV_KEY bit
+/// mask: the kernel answers what the device can say, not what it has said.
+fn has_key(dev: &RawDevice, key: KeyCode) -> bool {
+    let mut bits = [0u8; 128];
+    // _IOC(_IOC_READ, 'E', 0x20 + EV_KEY, size)
+    let request = (2u32 << 30) | ((bits.len() as u32) << 16) | (u32::from(b'E') << 8) | (0x20 + 1);
+    if unsafe { libc::ioctl(dev.as_raw_fd(), request as _, bits.as_mut_ptr()) } < 0 {
+        return false;
+    }
+    let code = usize::from(key.0);
+    bits[code / 8] >> (code % 8) & 1 == 1
+}
+
+/// Whether `key` is held right now, from the kernel's own key state. A panel
+/// that reports its touches through the global axes without ever writing the
+/// multitouch slot array leaves [`slot0_value`] reading the zero the array
+/// started with, which reads as a finger that arrived before the recovery and
+/// never lifts; the key state is the one place that cannot say that.
+fn key_held(dev: &RawDevice, key: KeyCode) -> Option<bool> {
+    let mut bits = [0u8; 128];
+    // _IOC(_IOC_READ, 'E', 0x18, size)
+    let request = (2u32 << 30) | ((bits.len() as u32) << 16) | (u32::from(b'E') << 8) | 0x18;
+    if unsafe { libc::ioctl(dev.as_raw_fd(), request as _, bits.as_mut_ptr()) } < 0 {
+        return None;
+    }
+    let code = usize::from(key.0);
+    Some(bits[code / 8] >> (code % 8) & 1 == 1)
+}
+
 /// The direct-touch panel. Only the first finger is followed (multitouch
 /// protocol B, slot 0).
 struct Panel {
@@ -75,6 +104,9 @@ struct Panel {
     y_range: (i32, i32),
     slots: usize,
     slot: i32,
+    /// What the panel says about a finger being down at start: the key state
+    /// where it reports one, the slot array where it does not.
+    key_down: bool,
     down: bool,
     was_down: bool,
     raw: (i32, i32),
@@ -108,20 +140,46 @@ impl Panel {
             return Err(io::Error::last_os_error()).context("stamp touch events with the monotonic clock");
         }
         set_nonblocking(dev.as_raw_fd()).context("make touch non-blocking")?;
+        // Whether the panel can be asked, from the kernel, if a finger is down now.
+        let key_down = has_key(&dev, KeyCode::BTN_TOUCH);
         let mut panel =
-            Panel { dev, path, x_range, y_range, slots, slot: 0, down: false, was_down: false, raw: (0, 0), moved: false, dropped: false };
+            Panel { dev, path, x_range, y_range, slots, slot: 0,
+            key_down,
+            down: false, was_down: false, raw: (0, 0), moved: false, dropped: false };
         // The kernel drops a position equal to the one a slot already holds,
         // so a touch landing where the last one lifted carries no position;
         // start from what the panel holds now.
-        panel.resync().context("read the touch state")?;
+        panel.resync(true).context("read the touch state")?;
         eprintln!("touch {:?}: x {:?} y {:?}, {slots} slots, slot 0 at {:?}", panel.dev.name().unwrap_or("?"), x_range, y_range, panel.raw);
         Ok(panel)
     }
 
     /// Read the current slot and slot 0's finger back from the panel.
-    fn resync(&mut self) -> io::Result<()> {
+    ///
+    /// `at_open` is when this process has seen no events yet: what the kernel
+    /// has kept cannot then be a finger this recovery is holding, and on a
+    /// panel that never writes its multitouch slot array the kept value says
+    /// one is down forever - which reads as a drag that began before anything
+    /// was drawn, so every press after it arrives as a move of that one
+    /// impossible finger rather than as a touch of its own.
+    fn resync(&mut self, at_open: bool) -> io::Result<()> {
         self.slot = self.dev.get_abs_state()?[usize::from(AbsoluteAxisCode::ABS_MT_SLOT.0)].value;
-        self.down = slot0_value(&self.dev, AbsoluteAxisCode::ABS_MT_TRACKING_ID, self.slots)? >= 0;
+        self.down = if at_open {
+            false
+        } else {
+            match (self.key_down, key_held(&self.dev, KeyCode::BTN_TOUCH)) {
+                (true, Some(held)) => held,
+                _ => slot0_value(&self.dev, AbsoluteAxisCode::ABS_MT_TRACKING_ID, self.slots)? >= 0,
+            }
+        };
+        self.was_down = self.down;
+        eprintln!(
+            "touch state read at {}: down={}, key_down={}, held={:?}",
+            if at_open { "open" } else { "a drop" },
+            self.down,
+            self.key_down,
+            key_held(&self.dev, KeyCode::BTN_TOUCH)
+        );
         self.raw = (
             slot0_value(&self.dev, AbsoluteAxisCode::ABS_MT_POSITION_X, self.slots)?,
             slot0_value(&self.dev, AbsoluteAxisCode::ABS_MT_POSITION_Y, self.slots)?,
@@ -142,7 +200,7 @@ impl Panel {
                 EventSummary::Synchronization(_, SynchronizationCode::SYN_DROPPED, _) => self.dropped = true,
                 EventSummary::Synchronization(_, SynchronizationCode::SYN_REPORT, _) => {
                     if std::mem::take(&mut self.dropped) {
-                        self.resync()?;
+                        self.resync(false)?;
                     }
                     let time = e.as_ref().time;
                     let at = time.tv_sec as u64 * 1000 + time.tv_usec as u64 / 1000;
@@ -160,7 +218,9 @@ impl Panel {
                 }
                 _ if self.dropped => {}
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, v) => self.slot = v,
-                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_TRACKING_ID, v) if self.slot == 0 => self.down = v >= 0,
+                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_TRACKING_ID, v) if self.slot == 0 => {
+                    self.down = v >= 0
+                }
                 EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, v) if self.slot == 0 => {
                     self.raw.0 = v;
                     self.moved = true;
@@ -189,6 +249,9 @@ pub struct Inputs {
     seen: HashSet<PathBuf>,
     /// What the touchscreen is told each time its panel is taken in.
     touch_writes: Vec<Write>,
+    /// Whether the kernel log has already been told that those were set
+    /// again after the panel's first power cycle.
+    told_panel_again: bool,
     w: f32,
     h: f32,
 }
@@ -215,6 +278,7 @@ impl Inputs {
             buttons: Vec::new(),
             seen: HashSet::new(),
             touch_writes,
+            told_panel_again: false,
             w: w as f32,
             h: h as f32,
         };
@@ -237,7 +301,9 @@ impl Inputs {
             let direct = dev.properties().contains(PropType::DIRECT);
             let mt = dev
                 .supported_absolute_axes()
-                .is_some_and(|a| a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y));
+                .is_some_and(|a| {
+                a.contains(AbsoluteAxisCode::ABS_MT_POSITION_X) && a.contains(AbsoluteAxisCode::ABS_MT_POSITION_Y)
+            });
             let keys = dev.supported_keys().is_some_and(|k| KEYS.iter().any(|c| k.contains(*c)));
             eprintln!("input {}: {:?} direct={direct} multitouch={mt} keys={keys}", path.display(), dev.name().unwrap_or("?"));
             if direct && mt && self.panel.is_none() {
@@ -252,6 +318,30 @@ impl Inputs {
                 self.wakeful.add(dev.as_raw_fd())?;
                 self.buttons.push((path, dev));
             }
+        }
+        Ok(())
+    }
+
+    /// Write the touchscreen's own knobs again, and say so the first time.
+    ///
+    /// A panel power cycle — the takeover's `FBIOBLANK` down and up, or the
+    /// display going off and coming back — hands the driver's wake gesture
+    /// back on, and while it is on a controller such as the Mi MIX 2's
+    /// reports a touch as a wake-up rather than as input, so nothing reaches
+    /// the pages. The values the device configuration sets have therefore to
+    /// be set again after every one; the first time is told to the kernel
+    /// log, the rest are not, since a phone left to itself cycles its panel
+    /// many times.
+    pub fn tell_panel_again(&mut self) -> Result<()> {
+        if self.touch_writes.is_empty() {
+            return Ok(());
+        }
+        for w in &self.touch_writes {
+            fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
+        }
+        if !self.told_panel_again {
+            self.told_panel_again = true;
+            skyward_sys::kmsg("the touchscreen's knobs are set again after the panel's power cycle")?;
         }
         Ok(())
     }

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["https"]
+https = ["ureq/rustls"]
+
 [dependencies]
 aes = "0.8.4"
 anyhow = { workspace = true }
@@ -20,4 +24,4 @@ serde_json = "1.0.154"
 sha2 = "0.10.9"
 # The resolver ureq takes is under its unversioned API, which may change
 # between any two releases.
-ureq = { version = "=3.5.0", default-features = false, features = ["rustls"] }
+ureq = { version = "=3.5.0", default-features = false }

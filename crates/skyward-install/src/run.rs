@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// What runs right before update_engine or an install script starts
 /// writing. Either may write over the installed system's partitions, so
 /// whatever still runs from them has to move off first.
-pub type Detach = Box<dyn FnOnce() -> Result<()> + Send>;
+pub type Detach = Box<dyn Fn() -> Result<()> + Send>;
 
 const METADATA: &str = "/metadata";
 const DATA: &str = "/data";
@@ -138,11 +138,11 @@ impl Installer {
         self.events.try_iter().collect()
     }
 
-    /// Write the image the installer holds to `partition` in `slots`.
-    pub fn flash(&self, partition: &'static str, slots: Vec<Slot>) {
+    /// Write the image the installer holds to `partition` at `devices`.
+    pub fn flash(&self, partition: &'static str, devices: Vec<PathBuf>) {
         // Only a finished installer stops listening, and then there is
         // nothing left to write.
-        let _ = self.commands.send(Command::Flash { partition, slots });
+        let _ = self.commands.send(Command::Flash { partition, devices });
     }
 
     /// Install the update the installer holds.
@@ -264,7 +264,8 @@ enum Done {
 fn receive(ctx: &mut Context, mut conn: Connection<Endpoints>, offer: Offer, rescue: bool) -> (Outcome, Connection<Endpoints>) {
     let _ = kmsg(&format!("install: {} bytes offered in blocks of {}", offer.size, offer.block_size));
     let ending = |outcome: &Outcome| match (rescue, outcome) {
-        (true, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. } | Outcome::SystemInstalled { .. }) | (false, _) => adb::DONE,
+        (true, Outcome::Installed { .. } | Outcome::Flashed { .. } | Outcome::Ran { .. } | Outcome::SystemInstalled { .. },
+        ) | (false, _) => adb::DONE,
         (true, _) => adb::FAILED,
     };
     if let Err(e) = offer.check() {
@@ -456,11 +457,13 @@ fn install<S>(ctx: &mut Context, mount: &Mount<S>, size: u64) -> Result<Done> {
         // The system asks for packages that install themselves, as Android's
         // own recovery takes nothing else; an image needs someone to say
         // where it goes.
-        Package::Image(_) if matches!(ctx.origin, Origin::Asked { .. }) => Ok(Done::Decided(Outcome::Refused(Refusal::Image))),
+        Package::Image(_) if matches!(ctx.origin, Origin::Asked { .. }) => {
+            Ok(Done::Decided(Outcome::Refused(Refusal::Image)))
+        }
         Package::Image(kind) => flash_image(ctx, kind, size),
         Package::Script => run_script(ctx, size),
         Package::System(contents) => install_system(ctx, &contents),
-        Package::Unknown => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
+        Package::Unknown(_) => Ok(Done::Decided(Outcome::Refused(Refusal::Unknown))),
     }
 }
 
@@ -560,10 +563,13 @@ fn installed_boot_set() -> Result<()> {
 /// Move off the installed system before the first write, where nothing has
 /// yet: rescue may install one package after another.
 fn detach_once(ctx: &mut Context) -> Result<()> {
-    match ctx.detach.take() {
-        Some(detach) => detach().context("move off the installed system"),
-        None => Ok(()),
+    if let Some(detach) = &ctx.detach {
+        // Keep the guard after a failed attempt: rescue can accept another
+        // package, which must pass the same check before it writes.
+        detach().context("move off the installed system")?;
+        ctx.detach = None;
     }
+    Ok(())
 }
 
 fn describe(package: &Package) -> String {
@@ -572,7 +578,7 @@ fn describe(package: &Package) -> String {
         Package::Image(kind) => format!("an image of {kind:?}"),
         Package::Script => "a zip with an install script".into(),
         Package::System(c) => format!("the system {} {}, to install beside the installed one", c.manifest.name, c.manifest.version),
-        Package::Unknown => "a file of no known kind".into(),
+        Package::Unknown(why) => format!("a file of no known kind: {why}"),
     }
 }
 
@@ -603,7 +609,7 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
         }
     }
     ctx.send(Event::Installing { version });
-    let kept = hold(ctx, slot)?;
+    let kept = hold(ctx, Some(slot))?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // update_engine mounts /metadata itself, as in the stock recovery, keeps
@@ -631,10 +637,17 @@ fn update_system<S>(ctx: &mut Context, mount: &Mount<S>, update: &Update) -> Res
 /// This recovery, held before an install writes, when the screen asked to
 /// keep it in the recovery partitions; none when it was started without
 /// being flashed.
-fn hold(ctx: &Context, current: Slot) -> Result<Option<Kept>> {
+fn hold(ctx: &Context, current: Option<Slot>) -> Result<Option<Kept>> {
     if !ctx.options.keep {
         return Ok(None);
     }
+    // What is kept is this recovery as the partition of the slot that
+    // starts holds it, and where the phone has one set of partitions there
+    // is no other set to come back to: the page leaves the choice out.
+    let Some(current) = current else {
+        let _ = kmsg("install: a phone with one set of partitions keeps no recovery of its own");
+        return Ok(None);
+    };
     let kept = Kept::hold(Path::new(skyward_block::BY_NAME), current).context("hold this recovery from its partition")?;
     if kept.is_none() {
         let _ = kmsg("install: the recovery partition does not hold Skyward, so there is none to keep");
@@ -666,6 +679,9 @@ fn reflash(ctx: &Context, kept: &Kept, next: Result<Slot>) {
 }
 
 fn remount_metadata() -> Result<()> {
+    if skyward_vab::current_slot()?.is_none() && skyward_block::fstab::read(METADATA)?.is_empty() {
+        return Ok(());
+    }
     let metadata = Path::new(METADATA);
     if !skyward_block::mount::is_mount_point(metadata)? {
         skyward_block::mount::mount_ro(&Path::new(skyward_block::BY_NAME).join("metadata"), metadata)?;
@@ -676,7 +692,8 @@ fn remount_metadata() -> Result<()> {
 /// The phone, and the system on it as its mounted partitions tell.
 fn phone(slot: Slot) -> Result<Phone> {
     let props = skyward_info::installed_props(slot)?;
-    let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch")) {
+    let installed = match (props.get("ro.build.date.utc"), props.get("ro.build.version.security_patch"),
+    ) {
         (Some(time), Some(patch)) => Some(Build {
             timestamp: time.parse().with_context(|| format!("ro.build.date.utc {time:?}"))?,
             security_patch: patch.clone(),
@@ -799,24 +816,27 @@ fn lines(from: impl Read, mut each: impl FnMut(&str) -> io::Result<()>) -> io::R
     }
 }
 
-fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
+fn flash_image(ctx: &mut Context, kind: ImageKind, size: u64) -> Result<Done> {
     let dir = Path::new(skyward_block::BY_NAME);
-    let partitions = image::partitions(kind, dir)?;
+    let partitions = image::partitions(kind, dir, skyward_vab::current_slot()?)?;
     if partitions.is_empty() {
         return Ok(Done::Decided(Outcome::Refused(Refusal::NoPartition)));
     }
     ctx.send(Event::Image { kind, size, partitions: partitions.clone() });
-    let (partition, slots) = match ctx.commands.recv() {
-        Ok(Command::Flash { partition, slots }) => (partition, slots),
+    let (partition, devices) = match ctx.commands.recv() {
+        Ok(Command::Flash { partition, devices }) => (partition, devices),
         Ok(Command::Cancel) | Err(_) => return Ok(Done::Decided(Outcome::Cancelled)),
         Ok(other) => bail!("an image waiting for its partition was told {other:?}"),
     };
     ensure!(partitions.contains(&partition), "{partition} is not among {partitions:?}");
-    ensure!(!slots.is_empty(), "no slot chosen for {partition}");
-    if [skyward_systems::store::BOOT, skyward_systems::store::INIT_BOOT].contains(&partition) {
+    ensure!(!devices.is_empty(), "no partition chosen for {partition}");
+    if matches!(kind, ImageKind::Filesystem(_)) {
+        // Never overwrite a mounted ext4/f2fs/erofs system image.
+        detach_once(ctx)?;
+    }
+    if partition == skyward_systems::store::BOOT || partition == skyward_systems::store::INIT_BOOT {
         installed_boot_set()?;
     }
-    let devices: Vec<_> = slots.iter().map(|&slot| image::device(dir, partition, slot)).collect();
     let mut file = BufReader::with_capacity(1 << 20, File::open(fuse::PACKAGE).context("open the package")?);
     let mut told: Option<Instant> = None;
     image::flash(&mut file, size, &devices, &mut |done, total| {
@@ -825,7 +845,7 @@ fn flash_image(ctx: &Context, kind: ImageKind, size: u64) -> Result<Done> {
             told = Some(Instant::now());
         }
     })?;
-    Ok(Done::Decided(Outcome::Flashed { partition, slots }))
+    Ok(Done::Decided(Outcome::Flashed { partition, devices }))
 }
 
 /// Run the install script of the zip being served, `size` bytes, once the
@@ -860,20 +880,22 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
             Ok(other) => bail!("a script waiting to be agreed to was told {other:?}"),
         }
     }
-    let slot = skyward_vab::current_slot()?.context("not an A/B phone")?;
+    let slot = skyward_vab::current_slot()?;
     extract_script()?;
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
     detach_once(ctx)?;
     // While an update is in flight, the slot's partitions in super are its
-    // and stay unmapped.
-    let mapped = match skyward_vab::snapshot_state()? {
-        SnapshotState::None => skyward_vab::map_slot(slot)?,
-        state => {
+    // and stay unmapped; a phone with one set of partitions has nothing to
+    // map at all, since its links reach every one of them whole.
+    let mapped = match (slot, skyward_vab::snapshot_state()?) {
+        (Some(slot), SnapshotState::None) => skyward_vab::map_slot(slot)?,
+        (Some(_), state) => {
             let _ = kmsg(&format!("install: the slot's partitions stay unmapped while an update is in flight ({state:?})"));
             SlotMaps::default()
         }
+        (None, _) => SlotMaps::default(),
     };
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);
@@ -1017,7 +1039,9 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
 
     let started = Instant::now();
     let mut bar = Bar::default();
-    let thousandths = |bar: &Bar| bar.share(started.elapsed()).map(|share| (share * 1000.0).round() as u16);
+    let thousandths = |bar: &Bar| {
+        bar.share(started.elapsed()).map(|share| (share * 1000.0).round() as u16)
+    };
     let (mut shown, mut told) = (None, Instant::now());
     let mut wipe_cache = false;
     let mut ended = None;
@@ -1073,7 +1097,8 @@ fn run_binary(ctx: &Context) -> Result<(i32, bool)> {
         None => child.wait().context("wait for the install script")?,
     };
     writeln!(log, "[ended: {status}]").context("write the log")?;
-    Ok((status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)), wipe_cache))
+    Ok((status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)), wipe_cache,
+    ))
 }
 
 /// Take away what the script mounted and left mounted, the latest first,

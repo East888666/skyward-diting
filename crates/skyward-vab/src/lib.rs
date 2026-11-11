@@ -264,6 +264,9 @@ impl Update {
 }
 
 pub fn snapshot_state() -> Result<SnapshotState> {
+    // Virtual A/B state has no meaning on an unslotted phone; absence of
+    // its metadata partition is expected, not an unknown pending update.
+    if current_slot()?.is_none() { return Ok(SnapshotState::None); }
     if !skyward_block::mount::is_mount_point(Path::new(METADATA))? {
         return Ok(SnapshotState::Unknown);
     }
