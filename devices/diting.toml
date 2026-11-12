@@ -47,6 +47,33 @@ firmware = [
 [partitions]
 mounted = ["persist"]
 
+# The installed vendor keeps these rules in /vendor/ueventd.rc rather
+# than /vendor/etc/ueventd.rc. Apply them after loading the modules and
+# before qseecomd/KeyMint start; root:root 0600 prevents their system
+# account from opening QSEE or allocating its DMA buffers on Flyme 12.6.
+[[owners]]
+paths = ["/dev/qseecom", "/dev/smcinvoke"]
+user = "system"
+group = "drmrpc"
+mode = 0o660
+
+[[owners]]
+paths = ["/dev/dma_heap/qcom,qseecom", "/dev/dma_heap/qcom,qseecom-ta"]
+user = "system"
+group = "system"
+mode = 0o444
+
+# qseecomd opens the UFS RPMB BSG node after dropping to system. The
+# vendor rule gives it system:system 0600; leaving it root-owned lets
+# listener registration succeed but rejects actual secure-storage I/O.
+# Flyme's keystore database can keep its schema in persistent.sqlite-wal;
+# pair this config with the WAL-aware reader in skyward-crypto/keystore2.rs.
+[[owners]]
+paths = ["/dev/0:0:0:49476"]
+user = "system"
+group = "system"
+mode = 0o600
+
 # This stock recovery carries no Binder service directory. Start the
 # installed system's directory before KeyMint tries to register with it.
 [[service]]
@@ -78,6 +105,12 @@ path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
 # Binder and its matching libc/loader for this NDK service.
 libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
 ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
+# This daemon also publishes the clock and shared-secret interfaces.
+# Let startup perform their agreement before credentials are checked.
+registers = [
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
 user = "system"
 groups = ["system", "drmrpc"]
 

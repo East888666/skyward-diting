@@ -15,7 +15,7 @@ mod plain;
 pub mod data;
 #[cfg(target_os = "android")]
 pub mod keymint;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 pub mod keystore2;
 
 #[cfg(target_os = "android")]
