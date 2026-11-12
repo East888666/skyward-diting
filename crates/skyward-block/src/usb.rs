@@ -5,7 +5,7 @@
 use crate::mount;
 use anyhow::{bail, Context, Result};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Component, Path};
 
 /// Where the kernel lists its disks, each a link to the device it is.
@@ -14,12 +14,47 @@ const SYS_BLOCK: &str = "/sys/block";
 /// Where ueventd makes the nodes of disks and partitions.
 const DEV_BLOCK: &str = "/dev/block";
 
+/// Statically linked, so the installed ROM cannot change its libraries.
+const NTFS_HELPER: &str = "/skyward/ntfs-3g";
+
 /// The filesystems a USB drive may hold, in the order they are tried, with
 /// what each is mounted with to give names as the drive keeps them: FAT
 /// and exFAT keep long names in UTF-16, which the kernel otherwise turns
 /// into a code page without Chinese.
 const FILESYSTEMS: [(&str, &str); 5] =
     [("vfat", "utf8"), ("exfat", "iocharset=utf8"), ("ntfs3", "iocharset=utf8"), ("ext4", ""), ("f2fs", "")];
+
+#[derive(Debug, PartialEq, Eq)]
+enum Volume {
+    Ntfs,
+    VentoyEfi,
+    Other,
+}
+
+fn volume(boot: &[u8]) -> Volume {
+    if boot.len() < 512 || boot[510..512] != [0x55, 0xaa] {
+        return Volume::Other;
+    }
+    if &boot[3..11] == b"NTFS    " {
+        return Volume::Ntfs;
+    }
+    // Ventoy's small second partition holds boot files. A readable boot
+    // partition must not conceal a data partition that failed to mount.
+    if (&boot[54..62] == b"FAT16   " && &boot[43..54] == b"VTOYEFI    ")
+        || (&boot[82..90] == b"FAT32   " && &boot[71..82] == b"VTOYEFI    ")
+    {
+        return Volume::VentoyEfi;
+    }
+    Volume::Other
+}
+
+fn probe(device: &Path) -> Result<Volume> {
+    let mut boot = Vec::with_capacity(512);
+    fs::File::open(device)
+        .and_then(|f| f.take(512).read_to_end(&mut boot))
+        .with_context(|| format!("read the boot sector of {}", device.display()))?;
+    Ok(volume(&boot))
+}
 
 /// A USB drive as the kernel lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,22 +157,63 @@ fn present<T>(r: std::io::Result<T>) -> std::io::Result<Option<T>> {
 }
 
 /// Show `drive` read only at `at`: the first of its partitions, or its
-/// disk, that holds a filesystem the kernel reads. Gives the partition and
-/// the filesystem shown.
+/// disk, that holds a readable filesystem. NTFS can use the bundled FUSE
+/// reader when the kernel has no driver. Gives the partition and filesystem.
 pub fn mount(drive: &Drive, at: &Path) -> Result<(String, &'static str)> {
     fs::create_dir_all(at).with_context(|| format!("create {}", at.display()))?;
+    mount_using(drive, Path::new(DEV_BLOCK), |device, filesystem, own| {
+        let options: Vec<String> = ["ro", "nosuid", "nodev", "noexec", own].map(str::to_string).into();
+        mount::mount(device, at, filesystem, &options)
+    }, |device| {
+        let helper = Path::new(NTFS_HELPER);
+        anyhow::ensure!(helper.is_file(), "this kernel cannot mount NTFS; rebuild the recovery with --ntfs3g (see tools/build-ntfs3g.sh)");
+        let args = ["-o", "ro,nosuid,nodev,noexec,norecover", device.to_str().context("USB device path is not UTF-8")?, at.to_str().context("USB mount path is not UTF-8")?];
+        let out = std::process::Command::new(helper).args(args).output().context("run the NTFS reader")?;
+        anyhow::ensure!(out.status.success(), "NTFS reader ended with {}: {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::ensure!(mount::is_mount_point(at)?, "NTFS reader did not mount {}", device.display());
+        Ok(())
+    })
+}
+
+fn mount_using(
+    drive: &Drive,
+    devices: &Path,
+    mut kernel: impl FnMut(&Path, &'static str, &str) -> Result<()>,
+    mut ntfs: impl FnMut(&Path) -> Result<()>,
+) -> Result<(String, &'static str)> {
     let mut tried = Vec::new();
     for name in drive.candidates() {
-        let device = Path::new(DEV_BLOCK).join(name);
-        for (filesystem, own) in FILESYSTEMS {
-            let options: Vec<String> = ["ro", "nosuid", "nodev", "noexec", own].map(str::to_string).into();
-            match mount::mount(&device, at, filesystem, &options) {
+        let device = devices.join(name);
+        let volume = match probe(&device) {
+            Ok(volume) => volume,
+            Err(e) => {
+                tried.push(format!("{name}: {e:#}"));
+                continue;
+            }
+        };
+        if volume == Volume::VentoyEfi && drive.parts.len() > 1 {
+            tried.push(format!("{name}: skipped Ventoy boot partition VTOYEFI"));
+            continue;
+        }
+        let filesystems: &[(&str, &str)] = if volume == Volume::Ntfs {
+            &[("ntfs3", "iocharset=utf8"), ("ntfs", "utf8")]
+        } else {
+            &FILESYSTEMS
+        };
+        for &(filesystem, own) in filesystems {
+            match kernel(&device, filesystem, own) {
                 Ok(()) => return Ok((name.to_string(), filesystem)),
                 Err(e) => tried.push(format!("{name} as {filesystem}: {}", e.root_cause())),
             }
         }
+        if volume == Volume::Ntfs {
+            match ntfs(&device) {
+                Ok(()) => return Ok((name.to_string(), "ntfs-3g")),
+                Err(e) => tried.push(format!("{name} as ntfs-3g: {e:#}")),
+            }
+        }
     }
-    bail!("{} holds no filesystem the kernel reads: {}", drive.disk, tried.join("; "))
+    bail!("{} has no readable data filesystem: {}", drive.disk, tried.join("; "))
 }
 
 #[cfg(test)]
@@ -182,5 +258,82 @@ mod tests {
         assert_eq!(mac.candidates(), ["sdg2", "sdg1"], "the data before the EFI partition in front of it");
         let floppy = Drive { disk: "sdh".into(), parts: Vec::new() };
         assert_eq!(floppy.candidates(), ["sdh"]);
+    }
+
+    fn boot(oem: &[u8; 8]) -> Vec<u8> {
+        let mut boot = vec![0; 512];
+        boot[3..11].copy_from_slice(oem);
+        boot[510..512].copy_from_slice(&[0x55, 0xaa]);
+        boot
+    }
+
+    #[test]
+    fn ntfs_data_uses_the_reader_and_never_falls_back_to_ventoy_boot_files() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("sdg1"), boot(b"NTFS    ")).unwrap();
+        let mut efi = boot(b"MSDOS5.0");
+        efi[43..54].copy_from_slice(b"VTOYEFI    ");
+        efi[54..62].copy_from_slice(b"FAT16   ");
+        fs::write(root.path().join("sdg2"), &efi).unwrap();
+        let drive = Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 500_000_000), ("sdg2".into(), 32_000_000)] };
+        let mut attempted = Vec::new();
+        let shown = mount_using(&drive, root.path(), |device, fs, _| {
+            attempted.push((device.file_name().unwrap().to_string_lossy().to_string(), fs));
+            bail!("kernel driver unavailable")
+        }, |device| {
+            assert!(device.ends_with("sdg1"));
+            Ok(())
+        }).unwrap();
+        assert_eq!(shown, ("sdg1".into(), "ntfs-3g"));
+        assert_eq!(attempted, [("sdg1".into(), "ntfs3"), ("sdg1".into(), "ntfs")]);
+
+        let refused = mount_using(&drive, root.path(), |device, _, _| {
+            assert!(!device.ends_with("sdg2"), "boot partition must not be mounted when data is unreadable");
+            bail!("kernel driver unavailable")
+        }, |_| bail!("NTFS reader missing")).unwrap_err().to_string();
+        assert!(refused.contains("NTFS reader missing"));
+        assert!(refused.contains("skipped Ventoy boot partition"));
+        assert_eq!(fs::read(root.path().join("sdg2")).unwrap(), efi, "probing does not modify the drive");
+    }
+
+    #[test]
+    fn ordinary_fat_partitions_and_unpartitioned_drives_still_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let mut fat = boot(b"MSDOS5.0");
+        fat[43..54].copy_from_slice(b"MY FILES   ");
+        fat[54..62].copy_from_slice(b"FAT16   ");
+        fs::write(root.path().join("sdg1"), &fat).unwrap();
+        fs::write(root.path().join("sdh"), &fat).unwrap();
+        for (drive, name) in [
+            (Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 1_000_000)] }, "sdg1"),
+            (Drive { disk: "sdh".into(), parts: vec![] }, "sdh"),
+        ] {
+            let shown = mount_using(&drive, root.path(), |_, fs, _| {
+                assert_eq!(fs, "vfat");
+                Ok(())
+            }, |_| panic!("FAT must not use the NTFS reader")).unwrap();
+            assert_eq!(shown, (name.into(), "vfat"));
+        }
+        assert_eq!(volume(&[]), Volume::Other);
+        fat[510] = 0;
+        assert_eq!(volume(&fat), Volume::Other);
+    }
+
+    #[test]
+    fn native_ntfs_support_does_not_start_a_userspace_reader() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("sdg1"), boot(b"NTFS    ")).unwrap();
+        let drive = Drive { disk: "sdg".into(), parts: vec![("sdg1".into(), 1_000_000)] };
+        let shown = mount_using(&drive, root.path(), |_, filesystem, _| {
+            assert_eq!(filesystem, "ntfs3");
+            Ok(())
+        }, |_| panic!("native NTFS does not need a helper")).unwrap();
+        assert_eq!(shown, ("sdg1".into(), "ntfs3"));
+        let mut fat32 = boot(b"MSWIN4.1");
+        fat32[71..82].copy_from_slice(b"VTOYEFI    ");
+        fat32[82..90].copy_from_slice(b"FAT32   ");
+        assert_eq!(volume(&fat32), Volume::VentoyEfi);
+        fat32[71] = b'X';
+        assert_eq!(volume(&fat32), Volume::Other);
     }
 }

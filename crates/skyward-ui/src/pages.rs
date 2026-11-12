@@ -3241,7 +3241,7 @@ pub fn choose(cx: &Ctx, place: Place) -> Frame {
             l.pick(["通过 OTG 连接 U 盘后，将在此显示其中的文件。", "透過 OTG 連接 USB 隨身碟後，將在此顯示其中的檔案。", "Connect a USB drive through OTG to see its files here."]),
         )),
         (Place::UsbDrive, Some(UsbDrive::Unreadable(why))) => {
-            unreadable = tr!(l, "请使用 FAT32 或 exFAT 格式的 U 盘。{why}", "請使用 FAT32 或 exFAT 格式的 USB 隨身碟。{why}", "Use a USB drive formatted as FAT32 or exFAT. {why}");
+            unreadable = tr!(l, "无法读取 U 盘的数据分区。{why}", "無法讀取 USB 隨身碟的資料分割區。{why}", "The USB drive's data partition could not be read. {why}");
             Some((l.pick(USB_DRIVE_UNREADABLE), unreadable.as_str()))
         }
         _ => None,

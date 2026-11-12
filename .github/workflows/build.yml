@@ -55,15 +55,21 @@ jobs:
         run: cargo ndk -t arm64-v8a --platform 30 build --locked --release -p skyward-system-init --target-dir target/system-init
       - name: Build the packer
         run: cargo build --locked --release -p skyward-pack
+      - name: Build the static NTFS reader
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends make autoconf automake libtool pkg-config libgcrypt20-dev patch
+          bash tools/build-ntfs3g.sh
       - name: Gather them
         run: |
-          mkdir tools
-          cp target/aarch64-linux-android/release/skyward target/release/skyward-pack tools/
-          cp target/system-init/aarch64-linux-android/release/system-init tools/
+          mkdir -p target/upload-tools/ntfs3g
+          cp target/aarch64-linux-android/release/skyward target/release/skyward-pack target/upload-tools/
+          cp target/system-init/aarch64-linux-android/release/system-init target/upload-tools/
+          cp target/ntfs3g/ntfs-3g target/ntfs3g/COPYING target/ntfs3g/source.tar.gz target/upload-tools/ntfs3g/
       - uses: actions/upload-artifact@v7
         with:
           name: tools
-          path: tools/
+          path: target/upload-tools/
           if-no-files-found: error
           retention-days: 1
 
@@ -82,7 +88,14 @@ jobs:
             test -f "devices/$DEVICE.toml"
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            # Local-only ports may have no verified downloadable stock yet.
+            # Build those locally with --stock instead of failing every push.
+            python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, pathlib, tomllib
+          devices = [p.stem for p in sorted(pathlib.Path("devices").glob("*.toml"))
+                     if tomllib.loads(p.read_text()).get("stock")]
+          print("devices=" + json.dumps(devices))
+          PY
           fi
 
   recovery:
@@ -128,7 +141,7 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           name="skyward-$version-$DEVICE-$STOCK"
           mkdir out
-          tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
+          tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init --ntfs3g tools/ntfs3g \
             --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
             --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
           echo "name=$name" >> "$GITHUB_OUTPUT"
@@ -178,6 +191,8 @@ jobs:
         run: |
           zips=()
           for config in devices/*.toml; do
+            # A local-only port has no image in the automatic release.
+            python3 -c 'import sys, tomllib; sys.exit(0 if tomllib.load(open(sys.argv[1], "rb")).get("stock") else 1)' "$config" || continue
             device=$(basename "$config" .toml)
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
             zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)

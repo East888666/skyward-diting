@@ -61,6 +61,11 @@ enum Cmd {
         /// statically.
         #[arg(long)]
         system_init: PathBuf,
+        /// NTFS reader bundle from tools/build-ntfs3g.sh (ntfs-3g,
+        /// COPYING and source.tar.gz). Allows NTFS USB drives on kernels
+        /// without an NTFS driver; includes its licence and source.
+        #[arg(long)]
+        ntfs3g: Option<PathBuf>,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -112,7 +117,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, ntfs3g, config, font, mono, mono_license, out } => {
             let mut img = BootImage::read(&stock)?;
             let size = match partition_size(&stock) {
                 Ok(size) => Some(size),
@@ -163,6 +168,11 @@ fn main() -> Result<()> {
                 rd.link(command, recovery)?;
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
+            if let Some(bundle) = ntfs3g {
+                rd.add("skyward/ntfs-3g", 0o755, read(&bundle.join("ntfs-3g"))?)?;
+                rd.add("skyward/ntfs3g-COPYING", 0o644, read(&bundle.join("COPYING"))?)?;
+                rd.add("skyward/ntfs3g-source.tar.gz", 0o644, read(&bundle.join("source.tar.gz"))?)?;
+            }
             rd.add(paths::CONFIG, 0o644, read(&config)?)?;
             if !cfg.fstab.is_empty() {
                 let text: String = cfg.fstab.iter().map(|line| format!("{}\n", line.text())).collect();

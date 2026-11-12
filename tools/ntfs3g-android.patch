@@ -1,0 +1,16 @@
+--- a/configure.ac
++++ b/configure.ac
+@@ -273,12 +273,8 @@
+ # Libraries
+ if test "${with_fuse}" = "internal"; then
+-	AC_CHECK_LIB(
+-		[pthread],
+-		[pthread_create],
+-		[LIBFUSE_LITE_LIBS="${LIBFUSE_LITE_LIBS} -lpthread"],
+-		[AC_MSG_ERROR([Cannot find pthread library])]
+-	)
++	# Android keeps pthread functions in libc.
++	AC_CHECK_FUNC([pthread_create], [], [AC_MSG_ERROR([pthread_create is required])])
+ 	AC_DEFINE(
+ 		[_REENTRANT],
+ 		[1],
