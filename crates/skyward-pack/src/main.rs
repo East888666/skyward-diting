@@ -200,8 +200,8 @@ fn main() -> Result<()> {
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier
             // one. update_engine refuses a package built before the recovery
-            // itself unless both of the last two are set; the recovery checks
-            // packages against the installed system instead.
+            // itself unless both of the last two are set. Skyward checks
+            // device compatibility without build-date or security-patch-date limits.
             let stock_props = &rd
                 .find(paths::PROP_DEFAULT)
                 .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
