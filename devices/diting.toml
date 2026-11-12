@@ -6,6 +6,14 @@ ab = true
 soc = { hans = "第一代骁龙®8+移动平台", hant = "Snapdragon® 8+ Gen 1 行動平台", en = "Snapdragon® 8+ Gen 1 Mobile Platform" }
 os_version_prop = "ro.mi.os.version.incremental"
 
+[recovery]
+# After vendor is mounted, restarting stock adbd must still use its own
+# libraries. AviumUI's libbase/libcrypto omit interfaces stock adbd needs.
+# Installed hardware services declare their library paths separately.
+ramdisk_libraries_only = true
+# Keep Skyward and its child services' stderr in the recovery log.
+capture_stdio = true
+
 [display]
 # ro.vendor.display.default_size in the stock recovery's prop.default.
 width = 1220
@@ -83,10 +91,20 @@ ready_property = "servicemanager.ready"
 user = "system"
 groups = ["system", "readproc"]
 
-# Run the stock CPU/power setup with the accounts from init.qti.kernel.rc.
+# Run the vendor CPU/power setup with the accounts from init.qti.kernel.rc.
+# AviumUI's script exits 1 in recovery. This tuning is not a prerequisite
+# for secure storage: keep the failure in kmsg and let qseecomd/KeyMint
+# start. Use the recovery shell so the wrapper needs no additional files.
 [[service]]
-path = "/vendor/bin/sh"
-args = ["/vendor/bin/init.kernel.post_boot.sh"]
+path = "/system/bin/sh"
+args = ["-c", '''
+/vendor/bin/sh /vendor/bin/init.kernel.post_boot.sh
+status=$?
+if [ "$status" -ne 0 ]; then
+    echo "skyward: vendor post-boot setup exited $status; continuing hardware startup" > /dev/kmsg
+fi
+exit 0
+''']
 libraries = ["/system/lib64", "/vendor/lib64"]
 oneshot = true
 user = "root"
@@ -94,19 +112,48 @@ groups = ["root", "system", "wakelock", "graphics"]
 
 [[service]]
 path = "/vendor/bin/qseecomd"
+when = { property = "ro.vendor.build.version.sdk", value = "31" }
 libraries = ["/system/lib64", "/vendor/lib64"]
+ready_property = "vendor.sys.listeners.registered"
+user = "root"
+groups = ["root", "drmrpc"]
+
+# AviumUI's vendor libdmabufheap needs the newer C++ runtime shipped with
+# that vendor. Pair it with the installed system's bootstrap runtime.
+[[service]]
+path = "/vendor/bin/qseecomd"
+when = { property = "ro.vendor.build.version.sdk", value = "36" }
+loader = "/system/bin/bootstrap/linker64"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
 ready_property = "vendor.sys.listeners.registered"
 user = "root"
 groups = ["root", "drmrpc"]
 
 [[service]]
 path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+when = { property = "ro.vendor.build.version.sdk", value = "31" }
 # libbinder_ndk is absent from the recovery. Use the installed system's
 # Binder and its matching libc/loader for this NDK service.
 libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
 ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
 # This daemon also publishes the clock and shared-secret interfaces.
 # Let startup perform their agreement before credentials are checked.
+registers = [
+    "android.hardware.security.secureclock.ISecureClock/default",
+    "android.hardware.security.sharedsecret.ISharedSecret/default",
+]
+user = "system"
+groups = ["system", "drmrpc"]
+
+# Android 16's vendor libbinder defaults to /dev/vndbinder, but KeyMint is
+# an AIDL service consumed through /dev/binder. Prefer the installed system
+# libbinder (and its matching libbinder_ndk) before the vendor libraries.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.security.keymint-service-qti"
+when = { property = "ro.vendor.build.version.sdk", value = "36" }
+loader = "/system/bin/bootstrap/linker64"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64", "/vendor/lib64"]
+ready_service = "android.hardware.security.keymint.IKeyMintDevice/default"
 registers = [
     "android.hardware.security.secureclock.ISecureClock/default",
     "android.hardware.security.sharedsecret.ISharedSecret/default",
@@ -128,15 +175,40 @@ groups = ["system", "readproc"]
 
 [[service]]
 path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+when = { property = "ro.vendor.build.version.sdk", value = "31" }
 libraries = ["/system/lib64", "/vendor/lib64"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+user = "system"
+groups = ["system"]
+
+# Android 16's Gatekeeper library needs the newer vendor C++ runtime.
+# Keep its loader and system libraries aligned with the installed ROM.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+when = { property = "ro.vendor.build.version.sdk", value = "36" }
+loader = "/system/bin/bootstrap/linker64"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
 ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
 user = "system"
 groups = ["system"]
 
 [[service]]
 path = "/vendor/bin/hw/android.hardware.boot@1.2-service"
+# The stock/Flyme vendor is Android 12, even with an Android 16 system.
+when = { property = "ro.vendor.build.version.sdk", value = "31" }
 libraries = ["/system/lib64", "/vendor/lib64"]
 ready_hardware_service = "android.hardware.boot@1.2::IBootControl/default"
+user = "root"
+groups = ["root"]
+
+# AviumUI 16.2.1 carries an Android 16 vendor with AIDL boot control.
+# Select on the vendor SDK, rather than the system's Android version.
+[[service]]
+path = "/vendor/bin/hw/android.hardware.boot-service.qti"
+when = { property = "ro.vendor.build.version.sdk", value = "36" }
+loader = "/system/bin/bootstrap/linker64"
+libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+ready_service = "android.hardware.boot.IBootControl/default"
 user = "root"
 groups = ["root"]
 
