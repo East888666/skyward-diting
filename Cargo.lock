@@ -2298,6 +2298,7 @@ dependencies = [
  "libc",
  "procfs",
  "serde",
+ "tempfile",
  "zerocopy",
 ]
 
@@ -2308,8 +2309,10 @@ dependencies = [
  "abootimg-oxide",
  "anyhow",
  "cpio",
+ "flate2",
  "libc",
  "lz4_flex",
+ "sha1 0.10.7",
  "tempfile",
 ]
 
@@ -2443,6 +2446,7 @@ dependencies = [
 name = "skyward-pack"
 version = "0.2.0"
 dependencies = [
+ "abootimg-oxide",
  "anyhow",
  "clap",
  "serde_json",

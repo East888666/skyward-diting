@@ -162,6 +162,18 @@ cargo build --release -p skyward-pack
 RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --release -p skyward-system-init --target-dir target/system-init
 ```
 
+读取 NTFS U 盘时，若手机内核没有 NTFS 驱动，可在 Linux/WSL 构建静态 NTFS-3G：
+
+```sh
+sudo apt-get install -y make autoconf automake libtool pkg-config libgcrypt20-dev patch python3
+bash tools/build-ntfs3g.sh
+```
+
+脚本使用 `ANDROID_NDK_HOME`，下载并校验固定版本源码，生成 `target/ntfs3g`。
+在下方打包命令中增加 `--ntfs3g target/ntfs3g` 即可包含读取程序、许可证及对应源码。
+GitHub Actions 构建默认包含它。NTFS 以只读方式打开，不修复卷；
+数据分区无法读取时，不会改为显示 Ventoy 的 `VTOYEFI` 引导分区。
+
 打包工具从小米服务器上这个版本的完整更新包中取出原厂 recovery 分区，只读取这个分区所在的部分，并且按照设备配置文件核对 SHA-256：
 
 ```sh

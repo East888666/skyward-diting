@@ -213,6 +213,20 @@ is built as a static program:
 RUSTFLAGS="-C target-feature=+crt-static" cargo ndk -t arm64-v8a --platform 30 build --release -p skyward-system-init --target-dir target/system-init
 ```
 
+For NTFS USB drives on kernels without an NTFS driver, build the static NTFS-3G
+reader on Linux/WSL:
+
+```sh
+sudo apt-get install -y make autoconf automake libtool pkg-config libgcrypt20-dev patch python3
+bash tools/build-ntfs3g.sh
+```
+
+The script uses `ANDROID_NDK_HOME`, downloads checksum-pinned source, and writes
+`target/ntfs3g`. Add `--ntfs3g target/ntfs3g` to the packing command below to include
+the reader, its licence and corresponding source. GitHub Actions includes it by
+default. NTFS is opened read-only without volume repair. An unreadable data
+partition no longer falls back to showing Ventoy's `VTOYEFI` boot partition.
+
 The packer takes the stock recovery partition out of the build's full update
 package on Xiaomi's server, reading only the part of the package the partition is
 in, and checks its SHA-256 against the device file:
