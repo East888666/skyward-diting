@@ -1,0 +1,115 @@
+libntfs_3g_la-logging.lo: logging.c ../config.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdio.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/sys/cdefs.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/versioning.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/api-level.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/ndk-version.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/sys/types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stddef.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_header_macro.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_ptrdiff_t.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_size_t.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_wchar_t.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_null.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_max_align_t.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_offsetof.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stdint.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdint.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/wchar_limits.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/int-ll64.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/bitsperlong.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/bitsperlong.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/posix_types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/stddef.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/compiler_types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/compiler.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/posix_types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/posix_types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/pthread_types.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stdarg.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_header_macro.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg___gnuc_va_list.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_list.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_arg.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg___va_copy.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_copy.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/seek_constants.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/errno.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/errno.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/errno.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/errno.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/errno-base.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/string.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/xlocale.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/strcasecmp.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/strings.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdlib.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/alloca.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/wait.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/wait.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/malloc.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/legacy_stdlib_inlines.h \
+  /home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/syslog.h \
+  ../include/ntfs-3g/logging.h ../include/ntfs-3g/types.h \
+  ../include/ntfs-3g/misc.h
+../config.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdio.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/sys/cdefs.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/versioning.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/api-level.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/ndk-version.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/sys/types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stddef.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_header_macro.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_ptrdiff_t.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_size_t.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_wchar_t.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_null.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_max_align_t.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stddef_offsetof.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stdint.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdint.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/wchar_limits.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/int-ll64.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/bitsperlong.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/bitsperlong.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/posix_types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/stddef.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/compiler_types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/compiler.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/posix_types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/posix_types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/pthread_types.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/stdarg.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_header_macro.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg___gnuc_va_list.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_list.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_arg.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg___va_copy.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/21/include/__stdarg_va_copy.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/seek_constants.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/errno.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/errno.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/aarch64-linux-android/asm/errno.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/errno.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/asm-generic/errno-base.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/string.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/xlocale.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/strcasecmp.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/strings.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/stdlib.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/alloca.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/bits/wait.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/linux/wait.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/malloc.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/android/legacy_stdlib_inlines.h:
+/home/ndk29/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin/../sysroot/usr/include/syslog.h:
+../include/ntfs-3g/logging.h:
+../include/ntfs-3g/types.h:
+../include/ntfs-3g/misc.h:
