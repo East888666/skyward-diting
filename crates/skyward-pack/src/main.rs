@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 mod avb;
+mod recovery;
 
 use skyward_bootimg::{BootImage, Format, Ramdisk};
 
@@ -39,7 +40,8 @@ enum Cmd {
         out: PathBuf,
     },
     /// Build a Skyward recovery image on top of the device's stock recovery:
-    /// its init, adbd, SELinux policy and libraries stay, the recovery
+    /// its init, SELinux policy and libraries stay; adbd may be explicitly
+    /// replaced with --adbd. The recovery
     /// service becomes Skyward. Modern stock keeps its partition size and
     /// gets an unsigned AVB footer; legacy stock is rebuilt without a footer.
     Recovery {
@@ -66,6 +68,18 @@ enum Cmd {
         /// without an NTFS driver; includes its licence and source.
         #[arg(long)]
         ntfs3g: Option<PathBuf>,
+        /// A local static AArch64 shell to install as /system/bin/sh when
+        /// stock recovery has no usable shell. No binary is downloaded.
+        #[arg(long)]
+        shell: Option<PathBuf>,
+        /// 导入本地静态 ARM64 adbd，替换 stock init 的现有服务程序。
+        /// 免密钥需要从可信源码构建的 no-auth 实现；ELF 校验不能证明其认证行为。
+        #[arg(long)]
+        adbd: Option<PathBuf>,
+        /// Trust this computer's adbkey.pub in recovery, including stock
+        /// adbd builds that always require authentication.
+        #[arg(long)]
+        adb_key: Option<PathBuf>,
         /// The device configuration, devices/<codename>.toml.
         #[arg(long)]
         config: PathBuf,
@@ -117,7 +131,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, ntfs3g, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, ntfs3g, shell, adbd, adb_key, config, font, mono, mono_license, out } => {
             let mut img = BootImage::read(&stock)?;
             let size = match partition_size(&stock) {
                 Ok(size) => Some(size),
@@ -153,19 +167,16 @@ fn main() -> Result<()> {
                 };
                 rd.replace(path, fixed.into_bytes())?;
             }
-            rd.replace(paths::RECOVERY, read(&binary)?)?;
-            // Install scripts look for the commands a stock recovery lacks
-            // among its programs, and its unzip there too, a link to ziptool
-            // until it points here; the recovery binary is each of them.
-            let (_, recovery) = paths::RECOVERY.rsplit_once('/').expect("the recovery binary is in a folder");
-            for command in paths::COMMANDS {
-                // Android 10 stock may carry unzip as a real executable,
-                // rather than the newer ziptool symlink. Both are replaced
-                // deliberately by Skyward's streaming command.
-                if rd.find(command).is_some_and(|e| e.mode & 0o170000 == 0o100000) {
-                    rd.drop_at(command);
-                }
-                rd.link(command, recovery)?;
+            recovery::install(&mut rd, read(&binary)?)?;
+            recovery::install_shell(&mut rd, shell.map(|path| read(&path)).transpose()?)?;
+            if let Some(path) = adbd {
+                let data = read(&path)?;
+                let digest = Sha256::digest(&data);
+                let target = recovery::install_adbd(&mut rd, data)?;
+                println!("adbd: {} -> /{target}, SHA-256 {digest:x}；认证行为仍需源码核验与真机验证", path.display());
+            }
+            if let Some(key) = adb_key {
+                recovery::trust_adb_key(&mut rd, &read(&key)?)?;
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
             if let Some(bundle) = ntfs3g {
@@ -186,12 +197,15 @@ fn main() -> Result<()> {
             if rd.find(paths::TASK_PROFILES).is_none() {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
-            rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            // Legacy init also scans /system/etc/init. Keep its explicitly
+            // imported file at the ramdisk root so actions are parsed once.
+            let mtp_rc = if cfg.device.ab { paths::MTP_RC } else { "skyward-mtp.rc" };
+            rd.add(mtp_rc, 0o644, MTP_RC.to_vec())?;
             if !cfg.device.ab {
                 let entry = rd.find("init.rc").context("legacy stock has no init.rc")?;
                 let mut init = String::from_utf8(entry.data.clone()).context("init.rc is not text")?;
-                if !init.contains(paths::MTP_RC) {
-                    init = format!("import /{}\n{init}", paths::MTP_RC);
+                if !init.contains(&format!("import /{mtp_rc}")) {
+                    init = format!("import /{mtp_rc}\n{init}");
                     rd.replace("init.rc", init.into_bytes())?;
                 }
                 // Older vendor rules bind their kernel MTP function before
@@ -206,18 +220,18 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            // On an unlocked device adbd keeps root when ro.secure is 0 and
-            // lets any computer in without authorization when ro.adb.secure is
-            // 0; init lets a later line of a property file override an earlier
-            // one. update_engine refuses a package built before the recovery
+            // Remove stock assignments before setting recovery properties:
+            // legacy init may publish read-only properties as it parses them.
+            // Stock user-build adbd may still enforce authentication; adb_keys
+            // provides explicit host authorization in that case.
+            // update_engine refuses a package built before the recovery
             // itself unless both of the last two are set. Skyward checks
             // device compatibility without build-date or security-patch-date limits.
             let stock_props = &rd
                 .find(paths::PROP_DEFAULT)
                 .with_context(|| format!("{} is not in the ramdisk", paths::PROP_DEFAULT))?
                 .data;
-            let mut props = without(stock_props, &BUILD_VERSION);
-            props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+            let mut props = recovery_props(stock_props);
             if let Some(version) = &cfg.recovery.legacy_version {
                 props.extend_from_slice(format!("ro.build.version.release={}\nro.build.version.security_patch={}\n", version.release, version.security_patch).as_bytes());
             }
@@ -315,6 +329,15 @@ const TASK_PROFILES: &[u8] = include_bytes!("task_profiles.json");
 const MTP_RC: &[u8] = include_bytes!("mtp.rc");
 
 /// A property file without the lines that set any of `names`.
+fn recovery_props(stock: &[u8]) -> Vec<u8> {
+    let props = without(stock, &BUILD_VERSION);
+    let mut props = without(&props, &[
+        "ro.secure", "ro.adb.secure", "ro.debuggable", "ro.ota.allow_downgrade",
+    ]);
+    props.extend_from_slice(b"\nro.secure=0\nro.adb.secure=0\nro.debuggable=1\nro.ota.allow_downgrade=true\n");
+    props
+}
+
 fn without(props: &[u8], names: &[&str]) -> Vec<u8> {
     let mut out = Vec::with_capacity(props.len());
     for line in props.split_inclusive(|b| *b == b'\n') {
@@ -380,7 +403,9 @@ fn ramdisk_libraries_first(text: &str) -> Result<String> {
 /// Remove only old combined-port binding actions. A standalone ADB-ready
 /// trigger must not rebind ADB while Skyward is setting up MTP plus ADB.
 fn legacy_rc(name: &str, text: &str) -> String {
-    if name == skyward_config::ramdisk::MTP_RC { text.to_string() } else { legacy_usb_rules(text) }
+    if name == skyward_config::ramdisk::MTP_RC || name == "skyward-mtp.rc" {
+        text.to_string()
+    } else { legacy_usb_rules(text) }
 }
 
 fn legacy_usb_rules(text: &str) -> String {
@@ -472,6 +497,7 @@ mod tests {
         assert!(changed.contains("on property:sys.usb.config=mtp,adb\n    start adbd"));
         assert!(!changed.contains("mtp.gs0"));
         assert!(changed.contains("on property:sys.usb.ffs.ready=1 && property:sys.usb.config=adb"));
+        assert!(!changed.contains("on property:sys.usb.ffs.ready=1\n"));
         assert_eq!(legacy_usb_rules(&changed), changed);
         let modern = "on boot\n    start adbd\n";
         assert_eq!(legacy_usb_rules(modern), modern);
@@ -482,11 +508,36 @@ mod tests {
         let text = std::str::from_utf8(MTP_RC).unwrap();
         let kept = legacy_rc(skyward_config::ramdisk::MTP_RC, text);
         assert_eq!(kept, text);
+        assert_eq!(legacy_rc("skyward-mtp.rc", text), text);
+        let teardown = kept.split("on property:sys.usb.config=none && property:sys.usb.configfs=1\n").nth(1).unwrap();
+        for command in ["stop adbd", "setprop sys.usb.ffs.ready 0",
+            "rm /config/usb_gadget/g1/configs/b.1/f1", "setprop sys.usb.state none"] {
+            assert!(teardown.contains(command));
+        }
+        assert!(kept.contains("on property:sys.usb.config=mtp,adb\n    start adbd"));
         assert!(kept.contains("on property:sys.usb.configfs=1\n"));
         assert!(!kept.contains("on fs && property:sys.usb.configfs=1"));
-        assert!(kept.contains("property:sys.usb.ffs.mtp.ready=1 && property:sys.usb.configfs=1"));
+        assert!(kept.contains("on property:sys.usb.config=adb\n    start adbd"));
+        // Combined mode waits for both ADB and MTP descriptors. ADB-only
+        // binding belongs to stock init, so it has no action in this file.
+        assert!(kept.contains("on property:sys.usb.config=mtp,adb && property:sys.usb.ffs.ready=1 && property:sys.usb.ffs.mtp.ready=1 && property:sys.usb.configfs=1\n"));
+        assert!(kept.contains("symlink /config/usb_gadget/g1/functions/ffs.adb"));
         assert!(kept.contains("symlink /config/usb_gadget/g1/functions/ffs.mtp"));
         assert_ne!(legacy_rc("init.stock.rc", text), text);
+    }
+
+    #[test]
+    fn recovery_properties_replace_all_stock_security_assignments() {
+        let stock = b"ro.secure=1\nro.adb.secure=1\nro.debuggable=0\nro.adb.secure=1\nro.ota.allow_downgrade=false\nro.product.device=wayne\n";
+        let props = recovery_props(stock);
+        let text = std::str::from_utf8(&props).unwrap();
+        for (key, value) in [("ro.secure", "0"), ("ro.adb.secure", "0"),
+            ("ro.debuggable", "1"), ("ro.ota.allow_downgrade", "true")] {
+            let lines: Vec<_> = text.lines().filter(|line|
+                line.split_once('=').is_some_and(|(name, _)| name == key)).collect();
+            assert_eq!(lines, vec![format!("{key}={value}")]);
+        }
+        assert!(text.contains("ro.product.device=wayne\n"));
     }
 
     #[test]

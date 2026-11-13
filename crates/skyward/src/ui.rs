@@ -55,7 +55,7 @@ use skyward_vab::{Merge, Standing};
 use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "wifi")]
 use std::sync::{Arc, Mutex};
@@ -385,10 +385,27 @@ pub(crate) fn export_logs(recovery: bool, kernel: bool, into: &Path, zone: usize
     let ownership = ownership(there)?;
     let folder = into.join(skyward_ui::fmt::stamp(unix_now()?, zone));
     skyward_files::make_folders(&folder, ownership)?;
+    // Temporary exports must also be readable through a non-root stock
+    // adbd. Do not change permissions of exports to user storage.
+    let adb_export = into == Path::new(TMP_LOGS);
+    if adb_export {
+        for path in [into, folder.as_path()] {
+            std::os::unix::fs::chown(path, None, Some(2000))
+                .with_context(|| format!("give {} to the ADB shell group", path.display()))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o750))
+                .with_context(|| format!("allow ADB to browse {}", path.display()))?;
+        }
+    }
     let save = |name: &str, contents: &[u8]| -> Result<()> {
         let path = folder.join(name);
         let mut file = skyward_files::make_file(&path, ownership)?;
         file.write_all(contents).with_context(|| format!("write {}", path.display()))?;
+        if adb_export {
+            std::os::unix::fs::chown(&path, None, Some(2000))
+                .with_context(|| format!("give {} to the ADB shell group", path.display()))?;
+            file.set_permissions(fs::Permissions::from_mode(0o640))
+                .with_context(|| format!("allow ADB to read {}", path.display()))?;
+        }
         file.sync_all().with_context(|| format!("write {}", path.display()))
     };
     if recovery {
@@ -1168,9 +1185,25 @@ fn unmount_system() -> Result<()> {
     }
     let nested: Vec<_> = mounted.iter().filter(|(p, _)| roots.iter().any(|r| p.starts_with(r))).map(|(p, _)| p.clone()).collect();
     roots.extend(nested);
-    for point in crate::install_mounts::plan(&roots, &mounted) {
+    let plan = crate::install_mounts::plan(&roots, &mounted);
+    let namespace = std::fs::read_link("/proc/self/ns/mnt");
+    let _ = skyward_sys::kmsg(&format!("install: mount namespace {namespace:?}; unmount plan {plan:?}"));
+    for point in plan {
         if !mount::is_mount_point(&point)? { continue; }
+        let _ = skyward_sys::kmsg(&format!("install: unmounting {}", point.display()));
         if let Err(error) = mount::umount(&point) {
+            // Capture this process's view at the failing syscall. An ADB sync
+            // worker can live in another mount namespace and show stale mounts.
+            match std::fs::read_to_string("/proc/self/mountinfo") {
+                Ok(snapshot) => {
+                    for line in snapshot.lines() {
+                        let _ = skyward_sys::kmsg(&format!("install: mountinfo: {line}"));
+                    }
+                }
+                Err(read_error) => {
+                    let _ = skyward_sys::kmsg(&format!("install: read mountinfo: {read_error}"));
+                }
+            }
             let holders = match mount::visible(&point)? {
                 Some(shown) => format!("{:?}", mount::holding(shown.device)?),
                 None => "none".to_string(),

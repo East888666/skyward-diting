@@ -315,6 +315,21 @@ fn ensure_plain(dir: &Path) -> Result<()> {
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
         Some(libc::ENODATA | libc::EOPNOTSUPP | libc::ENOTTY) => Ok(()),
+        Some(libc::ENOENT) => {
+            // Old ext4_get_policy returns ENOENT whenever reading its
+            // encryption context fails, including malformed contexts. Check
+            // the inode flag on the same open descriptor before accepting it
+            // as policy-free; never reinterpret File::open's ENOENT here.
+            const GET_FLAGS: u32 = 0x8000_6601 | ((std::mem::size_of::<libc::c_long>() as u32) << 16);
+            let mut flags: libc::c_long = 0;
+            let result = unsafe { libc::ioctl(file.as_raw_fd(), GET_FLAGS as libc::Ioctl, &mut flags) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("inspect inode flags of {} after missing encryption policy", dir.display()));
+            }
+            crate::plain::ensure_unencrypted_flags(flags as u32)
+                .with_context(|| format!("inspect encryption of {}", dir.display()))
+        }
         _ => Err(error).with_context(|| format!("inspect encryption of {}", dir.display())),
     }
 }

@@ -181,6 +181,16 @@ static KEPT: OnceLock<Mutex<File>> = OnceLock::new();
 /// well, after what an earlier run left there.
 pub fn keep_log(path: &Path) -> Result<()> {
     let file = OpenOptions::new().create(true).append(true).open(path).with_context(|| format!("open {}", path.display()))?;
+    // Stock user-build adbd runs as shell (AID_SHELL=2000). Allow that
+    // group to read diagnostics without granting it write access.
+    #[cfg(target_os = "android")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::os::unix::fs::chown(path, None, Some(2000))
+            .context("give the recovery log to the ADB shell group")?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o640))
+            .context("allow ADB to read the recovery log")?;
+    }
     KEPT.set(Mutex::new(file)).map_err(|_| anyhow!("the log is kept in a file already"))
 }
 

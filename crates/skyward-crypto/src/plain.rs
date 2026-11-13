@@ -17,6 +17,15 @@ pub(crate) fn mount_options(options: &[String], writable: bool) -> Vec<String> {
     out
 }
 
+/// Old policy queries can report ENOENT for a missing or damaged context.
+/// FS_ENCRYPT_FL remains set on encrypted inodes even without their key.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn ensure_unencrypted_flags(flags: u32) -> Result<()> {
+    const ENCRYPTED: u32 = 0x0000_0800;
+    ensure!(flags & ENCRYPTED == 0, "inode is marked encrypted despite its missing encryption policy; data is not decrypted");
+    Ok(())
+}
+
 /// True only for an empty, policy-free filesystem needing media/0. A table
 /// can request FBE for the next Android boot without a freshly made
 /// filesystem already having keys or policies. Never infer this merely
@@ -28,8 +37,20 @@ pub(crate) fn inspect(root: &Path, file_encryption: bool, policy_free: impl Fn(&
     for name in ["", "media", "media/0", "user", "user/0", "user_de/0", "system_de/0"] {
         let path = root.join(name);
         if present(&path)? {
-            ensure!(fs::symlink_metadata(&path)?.is_dir(), "{} is not a directory", path.display());
-            policy_free(&path)?;
+            let metadata = fs::symlink_metadata(&path)?;
+            if name == "user/0" && metadata.file_type().is_symlink() {
+                // Android's owner app directory can alias /data/data.
+                // Accept only this alias, and inspect the actual directory
+                // rather than allowing arbitrary links to bypass a policy.
+                let target = root.join("data");
+                ensure!(fs::symlink_metadata(&target)?.is_dir(), "{} is not a directory", target.display());
+                let resolved = fs::canonicalize(&path).with_context(|| format!("resolve {}", path.display()))?;
+                ensure!(resolved == fs::canonicalize(&target)?, "{} does not point to the owner app directory", path.display());
+                policy_free(&resolved)?;
+            } else {
+                ensure!(metadata.is_dir(), "{} is not a directory", path.display());
+                policy_free(&path)?;
+            }
         }
     }
     let media = present(&root.join("media"))?;
@@ -62,6 +83,19 @@ fn present(path: &Path) -> Result<bool> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn missing_legacy_policy_requires_an_unencrypted_inode() {
+        assert!(ensure_unencrypted_flags(0).is_ok());
+        assert!(ensure_unencrypted_flags(0x0008_0000).is_ok()); // EXTENTS
+        assert!(ensure_unencrypted_flags(0x0000_0800).is_err());
+        assert!(ensure_unencrypted_flags(0x0008_0800).is_err());
+        let temp = Temp::new();
+        fs::create_dir_all(temp.0.join("media/0")).unwrap();
+        assert!(inspect(&temp.0, false, |path| {
+            ensure_unencrypted_flags(if path == temp.0.join("media/0") { 0x800 } else { 0 })
+        }).is_err(), "an unencrypted root must not hide encrypted media");
+    }
 
     #[test]
     fn data_mounts_replay_the_journal_before_inspection_and_keep_security_options() {
@@ -136,6 +170,38 @@ mod tests {
         fs::create_dir(temp.0.join("system_ce")).unwrap();
         assert!(temp.inspect(true).is_err());
         assert_eq!(fs::read(temp.0.join("media/0/keep")).unwrap(), b"keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_app_alias_is_checked_at_its_real_directory() {
+        for absolute in [false, true] {
+            let temp = Temp::new();
+            fs::create_dir_all(temp.0.join("media/0")).unwrap();
+            fs::create_dir(temp.0.join("data")).unwrap();
+            fs::create_dir(temp.0.join("user")).unwrap();
+            let target = if absolute { temp.0.join("data") } else { "../data".into() };
+            std::os::unix::fs::symlink(target, temp.0.join("user/0")).unwrap();
+            assert!(!temp.inspect(false).unwrap());
+            let actual = fs::canonicalize(temp.0.join("data")).unwrap();
+            assert!(inspect(&temp.0, false, |path| {
+                ensure!(path != actual, "encrypted owner app directory");
+                Ok(())
+            }).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_alias_cannot_point_elsewhere_or_be_dangling() {
+        for target in ["../media/0", "../absent"] {
+            let temp = Temp::new();
+            fs::create_dir_all(temp.0.join("media/0")).unwrap();
+            fs::create_dir(temp.0.join("data")).unwrap();
+            fs::create_dir(temp.0.join("user")).unwrap();
+            std::os::unix::fs::symlink(target, temp.0.join("user/0")).unwrap();
+            assert!(temp.inspect(false).is_err());
+        }
     }
 
     #[cfg(unix)]

@@ -65,13 +65,20 @@ pub struct Ran {
 /// The program `name`: the recovery's own, or the installed system's for
 /// one the recovery does not carry.
 pub fn find(name: &str) -> Result<Tool, Missing> {
-    look(name, Path::new(BIN), Path::new(SYSTEM_BIN))
+    look(name, Path::new(BIN), Path::new("/sbin"), Path::new(SYSTEM_BIN))
 }
 
-fn look(name: &str, bin: &Path, system_bin: &Path) -> Result<Tool, Missing> {
-    let own = bin.join(name);
-    if own.exists() {
-        return Ok(Tool { program: own, libraries: Vec::new() });
+fn look(name: &str, bin: &Path, legacy_bin: &Path, system_bin: &Path) -> Result<Tool, Missing> {
+    // Old recovery ramdisks keep static tools in /sbin. Prefer their own
+    // tools to an installed system that may be absent or about to be wiped.
+    let mut candidates = vec![bin.join(name), legacy_bin.join(name)];
+    if name == "mke2fs" {
+        candidates.push(legacy_bin.join("mke2fs_static"));
+    }
+    for own in candidates {
+        if own.is_file() {
+            return Ok(Tool { program: own, libraries: Vec::new() });
+        }
     }
     let installed = system_bin.join(name);
     if installed.exists() {
@@ -133,8 +140,34 @@ mod tests {
         for dir in [&bin, &system_bin] {
             std::fs::write(dir.join("fsck.f2fs"), []).unwrap();
         }
-        let found = look("fsck.f2fs", &bin, &system_bin).unwrap();
+        let found = look("fsck.f2fs", &bin, &bin.join("sbin"), &system_bin).unwrap();
         assert_eq!(found, Tool { program: bin.join("fsck.f2fs"), libraries: Vec::new() });
+    }
+
+    #[test]
+    fn legacy_static_mke2fs_does_not_require_a_mounted_system() {
+        let (bin, system_bin) = dirs("legacy-static");
+        let legacy_bin = bin.join("sbin");
+        std::fs::create_dir_all(&legacy_bin).unwrap();
+        let static_tool = legacy_bin.join("mke2fs_static");
+        std::fs::write(&static_tool, []).unwrap();
+        let found = look("mke2fs", &bin, &legacy_bin, &system_bin).unwrap();
+        assert_eq!(found, Tool { program: static_tool, libraries: Vec::new() });
+        std::fs::create_dir_all(&system_bin).unwrap();
+        std::fs::write(system_bin.join("mke2fs"), []).unwrap();
+        assert!(look("mke2fs", &bin, &legacy_bin, &system_bin).unwrap().libraries.is_empty());
+        std::fs::write(bin.join("mke2fs"), []).unwrap();
+        assert_eq!(look("mke2fs", &bin, &legacy_bin, &system_bin).unwrap().program, bin.join("mke2fs"));
+    }
+
+    #[test]
+    fn legacy_tools_are_used_without_system_libraries() {
+        let (bin, system_bin) = dirs("legacy-tools");
+        let legacy_bin = bin.join("sbin");
+        std::fs::create_dir_all(&legacy_bin).unwrap();
+        std::fs::write(legacy_bin.join("e2fsck"), []).unwrap();
+        assert_eq!(look("e2fsck", &bin, &legacy_bin, &system_bin).unwrap(),
+            Tool { program: legacy_bin.join("e2fsck"), libraries: Vec::new() });
     }
 
     #[test]
@@ -142,16 +175,16 @@ mod tests {
         let (bin, system_bin) = dirs("installed");
         std::fs::create_dir_all(&system_bin).unwrap();
         std::fs::write(system_bin.join("e2fsck"), []).unwrap();
-        let found = look("e2fsck", &bin, &system_bin).unwrap();
+        let found = look("e2fsck", &bin, &bin.join("sbin"), &system_bin).unwrap();
         assert_eq!(found.program, system_bin.join("e2fsck"));
         assert_eq!(found.libraries, ["/mnt/system/system/lib64", "/system/lib64"]);
-        assert_eq!(look("tune2fs", &bin, &system_bin), Err(Missing::Absent("tune2fs".into())));
+        assert_eq!(look("tune2fs", &bin, &bin.join("sbin"), &system_bin), Err(Missing::Absent("tune2fs".into())));
     }
 
     #[test]
     fn an_unmounted_system_holds_its_programs_out_of_reach() {
         let (bin, system_bin) = dirs("unmounted");
-        assert_eq!(look("e2fsck", &bin, &system_bin), Err(Missing::Unmounted("system")));
+        assert_eq!(look("e2fsck", &bin, &bin.join("sbin"), &system_bin), Err(Missing::Unmounted("system")));
     }
 
     #[test]

@@ -19,7 +19,8 @@ pub fn plan(roots: &[PathBuf], mounts: &[(PathBuf, (u32, u32))]) -> Vec<PathBuf>
         .map(|(p, _)| p.clone())
         .collect();
     points.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-    points.dedup();
+    // Each mountinfo entry is a distinct mount, even when several are
+    // stacked at the same path. Unmount every layer before its parent.
     points
 }
 
@@ -57,6 +58,21 @@ mod tests {
         assert!(!points
             .iter()
             .any(|p| p == Path::new("/") || p.starts_with("/data") || p.starts_with("/sdcard")));
+    }
+
+    #[test]
+    fn stacked_children_are_all_released_before_the_parent() {
+        let roots = [PathBuf::from("/vendor")];
+        let mounts = [
+            ("/vendor", (259, 30)),
+            ("/vendor/firmware_mnt", (259, 24)),
+            ("/vendor/firmware_mnt", (259, 24)),
+        ].map(|(p, d)| (PathBuf::from(p), d));
+        assert_eq!(plan(&roots, &mounts), vec![
+            PathBuf::from("/vendor/firmware_mnt"),
+            PathBuf::from("/vendor/firmware_mnt"),
+            PathBuf::from("/vendor"),
+        ]);
     }
 
     #[test]
