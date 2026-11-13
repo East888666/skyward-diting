@@ -1,0 +1,155 @@
+# Xiaomi MI 6X / wayne. Reference layout: devices/polaris.toml.
+# Checked against wayne/{boot,recovery,vendor}.img, MIUI V12.0.2.0.PDCCNXM.
+# See wayne-notes.md for evidence, build requirements and remaining blockers.
+# The packer detects the supplied /sbin/recovery layout automatically.
+# Build static API 28 programs; shell tools and stock FDE remain separate
+# runtime limitations documented in wayne-notes.md.
+
+[device]
+codename = "wayne"
+brand = "Xiaomi"
+model = "MI 6X"
+ab = false
+soc = { hans = "骁龙®660移动平台", hant = "Snapdragon® 660 行動平台", en = "Snapdragon® 660 Mobile Platform" }
+os_version_prop = "ro.build.version.incremental"
+
+[recovery]
+# No logd in the supplied ramdisk. Keep process output in RAM:
+# /skyward/run/recovery.log; export it before rebooting.
+capture_stdio = true
+# Stock executables are static; there is no system/etc/ld.config.txt.
+# Polaris's ramdisk library flags do not apply to this recovery.
+# No legacy_version override: supplied boot and recovery both report
+# Android 9 / 2020-11, matching prop.default's 2020-11-05 patch level.
+
+[display]
+width = 1080
+height = 2160
+density = 440
+diagonal = 5.99
+# WAYNE's NT36672 Tianma/JDI panels specify a 4095 brightness range.
+normal_max_brightness = 4095
+# CONFIG_FB_MSM_MDSS=y, CONFIG_DRM is unset. The existing fbdev backend
+# is selected automatically; Polaris's KMS workarounds are not enabled.
+
+[firmware]
+# Kernel command line: firmware_class.path=/vendor/firmware_mnt/image.
+partition = "modem"
+
+[modules]
+sources = ["vendor"]
+# Ported MIUI vendors may omit modules.dep. exfat is not required for
+# internal ext4 storage or Binder, so do not make it a boot dependency.
+# To enable exFAT, verify modules.dep, exfat.ko and kernel compatibility
+# on the installed vendor before adding "exfat" here.
+load = []
+# CONFIG_TOUCHSCREEN_NT36xxx=y and CONFIG_TOUCHSCREEN_NVT_D2S=y;
+# no external touch module or unverified touch sysfs writes are needed.
+
+[backup]
+partitions = ["boot", "recovery", "system", "vendor", "cust", "cache", "data"]
+
+[wipe]
+# No metadata partition is established by the supplied images.
+# Keep firmware, calibration and regional cust data out of format targets.
+formats = ["data", "cache", "system", "vendor"]
+
+# From /etc/recovery.fstab in the supplied recovery. The packer writes
+# these lines to /system/etc/skyward.fstab, which the runtime reads.
+# Installed /system is mounted at /system_root to preserve the ramdisk.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/system"
+mount_point = "/system"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,verify,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/vendor"
+mount_point = "/vendor"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,verify,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1,data=ordered"
+extras = "wait,check,formattable"
+
+# Stock recovery: encryptable=footer; stock vendor: forceencrypt=footer.
+# This is FDE. Skyward's current FBE implementation cannot unlock it.
+# Keep the flag truthful; removing it does not decrypt existing data.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/userdata"
+mount_point = "/data"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1,data=ordered,noauto_da_alloc"
+extras = "wait,check,encryptable=footer,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cust"
+mount_point = "/cust"
+filesystem = "ext4"
+options = "ro,nosuid,nodev,barrier=1"
+extras = "wait,check"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/boot"
+mount_point = "/boot"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/recovery"
+mount_point = "/recovery"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/misc"
+mount_point = "/misc"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+# Additional real partitions and mount points from vendor/etc/fstab.qcom.
+# Only modem is mounted automatically above; the other entries describe
+# their filesystems without starting unrelated radio/sensor services.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/modem"
+mount_point = "/vendor/firmware_mnt"
+filesystem = "vfat"
+options = "ro,shortname=lower,uid=0,gid=1000,dmask=227,fmask=337,context=u:object_r:firmware_file:s0"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/bluetooth"
+mount_point = "/vendor/bt_firmware"
+filesystem = "vfat"
+options = "ro,shortname=lower,uid=1002,gid=3002,dmask=227,fmask=337,context=u:object_r:bt_firmware_file:s0"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/dsp"
+mount_point = "/vendor/dsp"
+filesystem = "ext4"
+options = "ro,nosuid,nodev,barrier=1"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/persist"
+mount_point = "/mnt/vendor/persist"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1"
+extras = "wait,check"
+
+# Do not copy the stock mmcblk1p1 /sdcard placeholder: /sdcard is used for
+# shared internal storage. This image alone does not prove a card exists.
+# No [haptics]: CONFIG_QPNP_HAPTIC + ANDROID_TIMED_OUTPUT uses enable;
+# current timed haptics requires duration/activate. Polaris's node differs.
+# No [wlan] or Keymaster service set: those need separate runtime support
+# and testing. No [stock] until a matching OTA URL/hash is verified.
