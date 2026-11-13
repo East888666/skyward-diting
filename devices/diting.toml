@@ -203,11 +203,14 @@ groups = ["root"]
 
 # AviumUI 16.2.1 carries an Android 16 vendor with AIDL boot control.
 # Select on the vendor SDK, rather than the system's Android version.
+# Like KeyMint, AIDL boot control must use the system Binder libraries:
+# vendor libbinder selects /dev/vndbinder, which has no service manager
+# in this recovery, and the service never registers on /dev/binder.
 [[service]]
 path = "/vendor/bin/hw/android.hardware.boot-service.qti"
 when = { property = "ro.vendor.build.version.sdk", value = "36" }
 loader = "/system/bin/bootstrap/linker64"
-libraries = ["/mnt/system/system/lib64/bootstrap", "/vendor/lib64", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]
+libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64", "/vendor/lib64"]
 ready_service = "android.hardware.boot.IBootControl/default"
 user = "root"
 groups = ["root"]
