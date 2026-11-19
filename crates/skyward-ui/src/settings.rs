@@ -214,7 +214,7 @@ fn tick(kept: &[String], offered: Vec<BackupChoice>) -> Vec<BackupChoice> {
 
 /// The names of those of `all` that are `ticked`.
 fn names(ticked: &[bool], all: &[&str]) -> Vec<String> {
-    all.iter().zip(ticked).filter(|(_, &on)| on).map(|(name, _)| name.to_string()).collect()
+    all.iter().zip(ticked).filter(|&(_, &on)| on).map(|(name, _)| name.to_string()).collect()
 }
 
 /// Which of `all` the names `kept` tick.

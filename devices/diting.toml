@@ -7,6 +7,9 @@ soc = { hans = "第一代骁龙®8+移动平台", hant = "Snapdragon® 8+ Gen 1 
 os_version_prop = "ro.mi.os.version.incremental"
 
 [recovery]
+# These verified per-vendor-SDK services need explicit loader/library order.
+# Do not also start upstream's automatically discovered key services.
+manual_key_services = true
 # After vendor is mounted, restarting stock adbd must still use its own
 # libraries. AviumUI's libbase/libcrypto omit interfaces stock adbd needs.
 # Installed hardware services declare their library paths separately.

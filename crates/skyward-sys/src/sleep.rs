@@ -2,12 +2,12 @@
 //! does once its screen is off: the kernel suspends it until a key, the
 //! charger, an alarm or the network wakes it.
 
+use crate::worker::{self, Told};
 use anyhow::{Context, Result};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -64,9 +64,7 @@ struct Leave {
 /// what woke the phone, such as the power key, before it sleeps again.
 pub struct Sleeper {
     leave: Arc<(Mutex<Leave>, Condvar)>,
-    told: Receiver<Slept>,
-    /// Readable while sleeps wait to be told.
-    wake: OwnedFd,
+    told: Told<Slept>,
 }
 
 impl Sleeper {
@@ -83,14 +81,8 @@ impl Sleeper {
         } else {
             IDLE
         };
-        let mut fds = [0; 2];
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error()).context("make the sleeper's wake pipe");
-        }
-        let (wake, signal) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new(),
-        ));
-        let (tx, told) = mpsc::channel();
+        let (tell, told) = worker::telling().context("make the sleeper's wake pipe")?;
+        let leave = Arc::new((Mutex::new(Leave { allowed: false, not_before: Instant::now() }), Condvar::new()));
         let shared = leave.clone();
         thread::Builder::new()
             .name("sleeper".into())
@@ -126,16 +118,16 @@ impl Sleeper {
                     }
                     // The screen's loop only stops listening once the
                     // recovery ends.
-                    let _ = tx.send(slept);
-                    unsafe { libc::write(signal.as_raw_fd(), [1u8].as_ptr().cast(), 1) };
+                    tell.tell(slept);
                 }
             })
             .context("start the sleeper")?;
-        Ok(Sleeper { leave, told, wake })
+        Ok(Sleeper { leave, told })
     }
 
+    /// Readable while sleeps wait to be told.
     pub fn fd(&self) -> RawFd {
-        self.wake.as_raw_fd()
+        self.told.fd()
     }
 
     /// Let the phone sleep, or keep it awake. Let, the thread suspends it as
@@ -151,9 +143,7 @@ impl Sleeper {
 
     /// The sleeps since the last call, and how each went.
     pub fn slept(&self) -> Vec<Slept> {
-        let mut drain = [0u8; 64];
-        while unsafe { libc::read(self.wake.as_raw_fd(), drain.as_mut_ptr().cast(), drain.len()) } > 0 {}
-        self.told.try_iter().collect()
+        self.told.take()
     }
 }
 
