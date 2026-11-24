@@ -85,8 +85,10 @@ user = "system"
 group = "system"
 mode = 0o600
 
-# This stock recovery carries no Binder service directory. Start the
-# installed system's directory before KeyMint tries to register with it.
+# This stock recovery carries no Binder service directory. Skyward must
+# write the recovery VINTF descriptions before starting this program,
+# without querying Binder or asking init to restart a nonexistent service.
+# Start the installed system's directory before KeyMint registers with it.
 [[service]]
 path = "/mnt/system/system/bin/servicemanager"
 libraries = ["/mnt/system/system/lib64/bootstrap", "/mnt/system/system/lib64", "/mnt/system_ext/lib64"]

@@ -11,6 +11,32 @@ const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const PT_INTERP: u32 = 3;
 
+/// Non-A/B describes the partition layout, not the init generation. A newer
+/// recovery may keep its main rc under /system even on a fixed-partition device.
+/// Keep the existing root-rc behavior when present; do not invent a second rc.
+pub fn import_legacy_rc(rd: &mut Ramdisk, import: &str) -> Result<()> {
+    let path = ["init.rc", "system/etc/init/hw/init.rc"]
+        .into_iter()
+        .find(|path| rd.find(path).is_some())
+        .context("non-A/B recovery has neither init.rc nor system/etc/init/hw/init.rc")?;
+    let entry = rd.find(path).expect("the selected init script exists");
+    anyhow::ensure!(entry.mode & 0o170000 == 0o100000,
+        "recovery init script /{path} is not a regular file");
+    let text = std::str::from_utf8(&entry.data)
+        .with_context(|| format!("/{path} is not UTF-8 text"))?;
+    let target = format!("/{import}");
+    let imported = text.lines().any(|line| {
+        let words: Vec<_> = line.split('#').next().unwrap_or_default()
+            .split_whitespace().collect();
+        words == ["import", target.as_str()]
+    });
+    if !imported {
+        let changed = format!("import {target}\n{text}").into_bytes();
+        rd.replace(path, changed)?;
+    }
+    Ok(())
+}
+
 /// Ensure scripts can execute `/system/bin/sh`, using only a shell already in
 /// the stock ramdisk or a caller-provided static ARM64 ELF.
 pub fn install_shell(rd: &mut Ramdisk, shell: Option<Vec<u8>>) -> Result<()> {
@@ -222,6 +248,57 @@ pub fn trust_adb_key(rd: &mut Ramdisk, key: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_mtp_import_supports_both_init_locations_and_is_idempotent() {
+        for path in ["init.rc", "system/etc/init/hw/init.rc"] {
+            let mut rd = Ramdisk { entries: Vec::new() };
+            rd.add(path, 0o644, b"on init\n    start recovery\n".to_vec()).unwrap();
+            import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap();
+            let expected = b"import /skyward-mtp.rc\non init\n    start recovery\n";
+            assert_eq!(rd.find(path).unwrap().data, expected);
+            import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap();
+            assert_eq!(rd.find(path).unwrap().data, expected);
+            if path != "init.rc" { assert!(rd.find("init.rc").is_none()); }
+        }
+    }
+
+    #[test]
+    fn legacy_mtp_import_keeps_root_init_precedence() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        for path in ["init.rc", "system/etc/init/hw/init.rc"] {
+            rd.add(path, 0o644, b"on init\n".to_vec()).unwrap();
+        }
+        import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap();
+        assert!(rd.find("init.rc").unwrap().data.starts_with(b"import /skyward-mtp.rc\n"));
+        assert_eq!(rd.find("system/etc/init/hw/init.rc").unwrap().data, b"on init\n");
+    }
+
+    #[test]
+    fn legacy_mtp_import_checks_exact_directives() {
+        for text in ["# import /skyward-mtp.rc\n", "import /skyward-mtp.rc.backup\n"] {
+            let mut rd = Ramdisk { entries: Vec::new() };
+            rd.add("init.rc", 0o644, text.as_bytes().to_vec()).unwrap();
+            import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap();
+            assert_eq!(rd.find("init.rc").unwrap().data,
+                format!("import /skyward-mtp.rc\n{text}").into_bytes());
+        }
+        let mut rd = Ramdisk { entries: Vec::new() };
+        let text = b"import  /skyward-mtp.rc # already imported\n";
+        rd.add("init.rc", 0o644, text.to_vec()).unwrap();
+        import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap();
+        assert_eq!(rd.find("init.rc").unwrap().data, text);
+    }
+
+    #[test]
+    fn legacy_mtp_import_rejects_missing_or_invalid_main_script() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        assert!(import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap_err().to_string()
+            .contains("neither init.rc nor system/etc/init/hw/init.rc"));
+        rd.add("system/etc/init/hw/init.rc", 0o644, vec![0xff]).unwrap();
+        assert!(import_legacy_rc(&mut rd, "skyward-mtp.rc").unwrap_err().to_string()
+            .contains("not UTF-8 text"));
+    }
 
     fn stock(path: &str) -> Ramdisk {
         let mut rd = Ramdisk {

@@ -51,23 +51,29 @@ pub struct Ramdisk {
 /// How a boot image's ramdisk is compressed. The kernel reads whichever
 /// format its own build allows, so a recovery is packed as the base it is
 /// built on already is: gzip where a 4.4 or 4.19 Qualcomm kernel is built
-/// with RD_GZIP, LZ4 where the newer ones ship RD_LZ4.
+/// with RD_GZIP, LZ4 where the newer ones ship RD_LZ4. An explicit
+/// device override may select LZMA-alone on a verified RD_LZMA kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Gzip,
     Lz4,
+    /// LZMA-alone, not XZ; requires CONFIG_RD_LZMA in the target kernel.
+    Lzma,
 }
 
 impl Format {
     /// The format `bytes` are compressed with: gzip, or LZ4 in either
     /// the frame or the legacy block framing the kernel's initramfs
-    /// unpacker reads.
+    /// unpacker reads, or LZMA-alone with the default LZMA properties.
     pub fn of(bytes: &[u8]) -> Result<Format> {
         match bytes {
             [0x1f, 0x8b, ..] => Ok(Format::Gzip),
+            // Default LZMA lc/lp/pb properties and a page-aligned dictionary,
+            // as the kernel's initramfs decoder identifies LZMA-alone.
+            [0x5d, 0x00, ..] => Ok(Format::Lzma),
             [0x04, b'"', b'M', 0x18, ..] | [0x02, 0x21, 0x4c, 0x18, ..] => Ok(Format::Lz4),
             other => bail!(
-                "ramdisk starts with {}, which is neither gzip nor LZ4",
+                "ramdisk starts with {}, which is neither gzip, LZ4 nor LZMA-alone",
                 other
                     .iter()
                     .take(4)
@@ -89,6 +95,11 @@ impl Ramdisk {
             }
             Format::Lz4 => {
                 std::io::copy(&mut lz4_flex::frame::FrameDecoder::new(compressed), &mut cpio).context("lz4 decode")?
+            }
+            Format::Lzma => {
+                lzma_rs::lzma_decompress(&mut Cursor::new(compressed), &mut cpio)
+                    .context("LZMA-alone decode")?;
+                cpio.len() as u64
             }
         };
         let mut entries = Vec::new();
@@ -122,9 +133,8 @@ impl Ramdisk {
         self.encode_as(Format::Lz4)
     }
 
-    /// Pack as a newc archive compressed the way the base image was: gzip in
-    /// process, or LZ4 in the legacy framing the kernel's initramfs unpacker
-    /// reads, which the reference `lz4` tool writes.
+    /// Pack as a newc archive in the selected format: gzip in process,
+    /// legacy LZ4 through the lz4 tool, or LZMA-alone through xz --format=lzma.
     pub fn encode_as(&self, format: Format) -> Result<Vec<u8>> {
         let cpio = self.archive()?;
         match format {
@@ -134,6 +144,7 @@ impl Ramdisk {
                 gz.finish().context("gzip encode")
     }
             Format::Lz4 => lz4_tool(&cpio),
+            Format::Lzma => lzma_tool(&cpio),
         }
     }
 
@@ -355,9 +366,51 @@ fn lz4_tool(input: &[u8]) -> Result<Vec<u8>> {
     Ok(out.stdout)
 }
 
+/// The host encoder writes LZMA-alone with an 8 MiB dictionary. Do not
+/// use xz's default XZ container: old Android kernels may only enable LZMA.
+fn lzma_tool(input: &[u8]) -> Result<Vec<u8>> {
+    let mut child = Command::new("xz")
+        .args(["--format=lzma", "-6", "--stdout"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("run xz for LZMA-alone (install xz-utils on Debian/Ubuntu)")?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child.wait_with_output().context("LZMA-alone encoder")?;
+    let fed = writer.join().expect("LZMA writer thread");
+    if !out.status.success() {
+        bail!("LZMA-alone encoder exited with {}", out.status);
+    }
+    fed.context("feed LZMA encoder")?;
+    Ok(out.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lzma_alone_round_trip_preserves_links_and_device_nodes() {
+        let mut rd = Ramdisk { entries: Vec::new() };
+        rd.add("system/bin/recovery", 0o750, b"recovery data".repeat(64)).unwrap();
+        rd.link("init", "/system/bin/init").unwrap();
+        rd.entries.push(Entry {
+            name: "dev/console".into(), mode: 0o020600, uid: 1, gid: 2,
+            mtime: 123, nlink: 1, dev: (0, 0), rdev: (5, 1), data: Vec::new(),
+        });
+        let bytes = rd.encode_as(Format::Lzma).unwrap();
+        assert_eq!(Format::of(&bytes).unwrap(), Format::Lzma);
+        let back = Ramdisk::decode(&bytes).unwrap();
+        for (a, b) in rd.entries.iter().zip(&back.entries) {
+            assert_eq!((&a.name, a.mode, a.uid, a.gid, a.mtime, a.nlink, a.dev, a.rdev, &a.data),
+                (&b.name, b.mode, b.uid, b.gid, b.mtime, b.nlink, b.dev, b.rdev, &b.data));
+        }
+        assert_eq!(rd.entries.len(), back.entries.len());
+        assert!(Ramdisk::decode(&bytes[..bytes.len() / 2]).is_err());
+        assert!(Format::of(b"\xfd7zXZ\0").is_err(), "do not confuse XZ with LZMA-alone");
+    }
 
     #[test]
     fn round_trip_keeps_metadata() {

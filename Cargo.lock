@@ -2441,6 +2441,7 @@ dependencies = [
  "flate2",
  "libc",
  "lz4_flex 0.14.0",
+ "lzma-rs",
  "sha1 0.10.7",
  "tempfile",
 ]

@@ -1198,6 +1198,8 @@ pub mod fb {
         vsync: Option<PathBuf>,
         /// Which flip the kernel took has been told about once already.
         told: bool,
+        /// Leave already-working panels powered at startup when opted in.
+        skip_initial_power_cycle: bool,
         /// Whether the visible page can be moved at all. A driver with no pan
         /// step has no flip to answer, only a buffer to be drawn into.
         flip: bool,
@@ -1220,7 +1222,7 @@ pub mod fb {
     }
 
     impl FbSurface {
-        pub fn open(path: &str) -> Result<Self> {
+        pub fn open(path: &str, skip_initial_power_cycle: bool) -> Result<Self> {
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -1368,6 +1370,7 @@ pub mod fb {
                 order,
                 vsync,
                 told: false,
+                skip_initial_power_cycle,
                 flip: pages >= 2,
                 frames: 0,
                 lit_at,
@@ -1439,7 +1442,7 @@ pub mod fb {
             if ioctl(fd, GET_VSCREENINFO, &mut var).is_ok() {
                 self.var = var;
             }
-            self.take_over("after it was turned off");
+            self.take_over("after it was turned off", true);
         }
 
         /// Make the panel look at the memory the driver owns, the way the
@@ -1452,7 +1455,7 @@ pub mod fb {
         /// answering success, so the cycle is repeated until the driver reports
         /// the panel lit. A failure here is told and not returned: a recovery
         /// that goes on drawing is worth more than no recovery.
-        fn take_over(&mut self, why: &str) {
+        fn take_over(&mut self, why: &str, cycle_power: bool) {
             let fd = self.file.as_raw_fd();
             // The number is what the working recovery asks for, not what it
             // gets back: the driver is free to widen a virtual height it
@@ -1468,22 +1471,26 @@ pub mod fb {
                 "ask the driver for {} rows of {} bits, activate as read {}: {asked:?}",
                 ask.yres_virtual, ask.bits_per_pixel, ask.activate
             );
-            for try_no in 1..=3 {
-                let down = ioctl_int(fd, BLANK, BLANK_POWERDOWN);
-                let up = ioctl_int(fd, BLANK, BLANK_UNBLANK);
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                let now = self
-                    .lit_at
-                    .as_ref()
-                    .and_then(|at| std::fs::read_to_string(at).ok())
-                    .unwrap_or_default();
-                eprintln!(
-                    "take over the panel {why} ({try_no}): down {down:?} up {up:?}, lit reads {:?}",
-                    now.trim()
-                );
-                if now.trim().ends_with('1') {
-                    break;
+            if cycle_power {
+                for try_no in 1..=3 {
+                    let down = ioctl_int(fd, BLANK, BLANK_POWERDOWN);
+                    let up = ioctl_int(fd, BLANK, BLANK_UNBLANK);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let now = self
+                        .lit_at
+                        .as_ref()
+                        .and_then(|at| std::fs::read_to_string(at).ok())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "take over the panel {why} ({try_no}): down {down:?} up {up:?}, lit reads {:?}",
+                        now.trim()
+                    );
+                    if now.trim().ends_with('1') {
+                        break;
+                    }
                 }
+            } else {
+                eprintln!("kept the fbdev panel powered {why}; startup power cycle skipped by configuration");
             }
             // The buffer the engine reads now is the one allocated during the
             // takeover, so the mapping made before it has to follow. Both
@@ -1638,7 +1645,7 @@ pub mod fb {
                 self.told = true;
                 // A frame is in memory and pointed at now, so this is where the
                 // boot loader's picture is replaced.
-                self.take_over("after the first frame");
+                self.take_over("after the first frame", !self.skip_initial_power_cycle);
             }
             self.frames += 1;
             // The driver only recomputes its rate once a target number of
@@ -1719,13 +1726,13 @@ pub enum Display {
 
 #[cfg(target_os = "android")]
 impl Display {
-    pub fn open(blocking_commits: bool, pipelined_commits: bool) -> Result<Display> {
+    pub fn open(blocking_commits: bool, pipelined_commits: bool, fbdev_skip_initial_power_cycle: bool) -> Result<Display> {
         if std::path::Path::new("/dev/dri/card0").exists() {
             return Ok(Display::Kms(kms::KmsSurface::open("/dev/dri/card0", blocking_commits, pipelined_commits)?));
         }
         for path in ["/dev/graphics/fb0", "/dev/fb0"] {
             if std::path::Path::new(path).exists() {
-                return Ok(Display::Fb(fb::FbSurface::open(path)?));
+                return Ok(Display::Fb(fb::FbSurface::open(path, fbdev_skip_initial_power_cycle)?));
             }
         }
         Err(anyhow::anyhow!(

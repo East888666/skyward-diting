@@ -89,6 +89,12 @@ impl StoredKey {
         Ok(StoredKey { encrypted: read(FN_ENCRYPTED_KEY)?, key_blob, secdiscardable_hash })
     }
 
+    /// Whether the key has a hardware wrapping blob. Modern CE keys use
+    /// a synthetic-password secret even on a filesystem with a v1 policy.
+    pub fn hardware_bound(&self) -> bool {
+        self.key_blob.is_some()
+    }
+
     /// What the wrapping is bound to: the directory's own hash and whatever
     /// secret guards it. A wrong secret gives a wrong binding, and the
     /// unwrapping fails rather than producing a key that looks usable.

@@ -23,7 +23,7 @@ const BUNDLE_MOUNT: &str = "/apex";
 const BUNDLE_LIBS: &str = "lib64";
 
 // Only bundles opened by this process are ours to release.
-static OPEN_BUNDLES: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+static OPEN_BUNDLES: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
 
 /// Called only after the services using these libraries have exited.
 /// Drop the filesystem and the loop's backing reference before system is
@@ -34,8 +34,10 @@ pub fn release_bundles() -> Result<()> {
         if skyward_block::mount::is_mount_point(at)? {
             skyward_block::mount::umount(at)?;
         }
-        skyward_block::loopdev::detach(device)?;
-        let _ = skyward_sys::kmsg(&format!("install: released {} and {}", at.display(), device.display()));
+        if let Some(device) = device {
+            skyward_block::loopdev::detach(device)?;
+        }
+        let _ = skyward_sys::kmsg(&format!("install: released APEX {}", at.display()));
         bundles.pop();
     }
     Ok(())
@@ -127,7 +129,7 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // Recent libhidlbase checks these standard executable paths before it
     // talks to a hardware directory, even when that directory is running.
     let hardware_program = Path::new("/system/bin/hwservicemanager");
-    let installed_hardware = ["/mnt/system_ext/bin/hwservicemanager", "/system_root/system/bin/hwservicemanager"].iter().map(Path::new).find(|p| p.is_file());
+    let installed_hardware = ["/mnt/system_ext/bin/hwservicemanager", "/system_root/system/system_ext/bin/hwservicemanager", "/system_root/system/bin/hwservicemanager"].iter().map(Path::new).find(|p| p.is_file());
     if let Some(installed_hardware) = installed_hardware.filter(|_| !hardware_program.exists()) {
         std::os::unix::fs::symlink(installed_hardware, hardware_program).context("expose installed hardware service directory")?;
     }
@@ -163,6 +165,9 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     let manifest_dir = Path::new(RECOVERY_MANIFEST).parent().expect("manifest directory");
     fs::set_permissions(manifest_dir, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .context("let service directories traverse recovery VINTF directory")?;
+    // HIDL-only devices do not pass through publish_descriptions. Their
+    // directory still reads every stock fragment as a framework fragment.
+    say_framework(Path::new(RECOVERY_DESCRIPTIONS))?;
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
@@ -179,7 +184,9 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
 /// holds the two.
 fn describe_hardware(wanted: &[String]) -> Result<String> {
     let mut out = String::from("<manifest version=\"1.0\" type=\"framework\">\n");
+    let mut seen = BTreeSet::new();
     for name in std::iter::once(HARDWARE_DIRECTORY).chain(wanted.iter().map(String::as_str)) {
+        if !seen.insert(name) { continue; }
         let (package, rest) = name
             .split_once('@')
             .with_context(|| format!("{name} does not read as a hardware service's name"))?;
@@ -205,6 +212,18 @@ pub fn libraries() -> Result<Option<PathBuf>> {
     Ok(at.map(|at| at.join(BUNDLE_LIBS)))
 }
 
+/// Open modules explicitly named by the selected services' loader and
+/// library paths, including legacy vendors with no ro.vndk.version.
+pub fn prepare_bundles<'a>(services: impl Iterator<Item = &'a skyward_config::Service>) -> Result<()> {
+    let names: BTreeSet<_> = services.flat_map(|s| s.loader.iter().chain(s.libraries.iter()))
+        .filter_map(|path| crate::bundles::named_by(Path::new(path)))
+        .collect();
+    for name in names {
+        bundle(name)?;
+    }
+    Ok(())
+}
+
 /// Open the bundle of this name where it lies, and give where it is. A
 /// bundle the phone does not carry gives nothing; one already open is left
 /// as it is.
@@ -213,12 +232,57 @@ fn bundle(name: &str) -> Result<Option<PathBuf>> {
     if skyward_block::mount::is_mount_point(&at)? {
         return Ok(Some(at));
     }
-    let Some(file) = BUNDLE_DIRS.iter().map(|d| Path::new(d).join(format!("{name}.apex"))).find(|p| p.is_file()) else {
-        return Ok(None);
+    let directories: Vec<_> = BUNDLE_DIRS.iter().map(Path::new).collect();
+    let file = match crate::bundles::find(&directories, name) {
+        None => return Ok(None),
+        Some(crate::bundles::Source::Packaged(file)) => file,
+        Some(crate::bundles::Source::Flattened(from)) => {
+            fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
+            skyward_block::mount::bind(&from, &at)?;
+            // The installed partitions were mounted read-only; the bind
+            // inherits that flag and does not require a loop device.
+            OPEN_BUNDLES.lock().expect("bundle list poisoned").push((at.clone(), None));
+            skyward_sys::kmsg(&format!("flattened APEX {} is mounted at {}", from.display(), at.display()))?;
+            return Ok(Some(at));
+        }
     };
     let (offset, length) = image(&file)?;
-    let device = skyward_block::loopdev::attach(&file, offset, length)?;
-    OPEN_BUNDLES.lock().expect("bundle list poisoned").push((at.clone(), device.clone()));
+    // Android's loop worker uses the context of the opener's descriptor.
+    // A legacy policy can deny kernel -> recovery:fd use although recovery
+    // itself is permissive. Only the configured one-shot helper changes
+    // domain; the recovery and its service children do not.
+    let config = Path::new("/").join(skyward_config::ramdisk::CONFIG);
+    let context = if config.is_file() {
+        skyward_config::DeviceConfig::load(&config)?.recovery.apex_loop_context
+    } else {
+        None
+    };
+    let device = match context {
+        None => skyward_block::loopdev::attach(&file, offset, length)?,
+        Some(context) => {
+            let output = std::process::Command::new("/system/bin/runcon")
+                .arg(&context)
+                .arg(std::env::current_exe().context("locate the APEX loop helper")?)
+                .arg("apex-loop")
+                .arg(&file)
+                .arg(offset.to_string())
+                .arg(length.to_string())
+                .output()
+                .with_context(|| format!("start the APEX loop helper in {context}"))?;
+            ensure!(output.status.success(), "APEX loop helper in {context} ended with {}: {}",
+                output.status, String::from_utf8_lossy(&output.stderr).trim());
+            let text = std::str::from_utf8(&output.stdout).context("APEX loop helper returned a non-text device")?.trim();
+            let device = PathBuf::from(text);
+            ensure!(device.is_absolute() && device.exists()
+                && device.file_name().and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("loop"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())),
+                "APEX loop helper returned an invalid device: {text:?}");
+            skyward_sys::kmsg(&format!("{} opened for {} by the {context} loop helper", device.display(), file.display()))?;
+            device
+        }
+    };
+    OPEN_BUNDLES.lock().expect("bundle list poisoned").push((at.clone(), Some(device.clone())));
     fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
     skyward_block::mount::mount_ro(&device, &at)?;
     Ok(Some(at))
@@ -276,27 +340,33 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
     // these. One an earlier run of the recovery service had start again
     // knows them already, and is left with what has registered with it
     // since.
-    let binder = skyward_binder::driver::Binder::open()?;
-    // The first it does not know described settles that it starts again.
-    let mut unknown = false;
-    for name in wanted {
-        if !skyward_binder::service::declared(&binder, name).with_context(|| format!("ask the service directory whether it knows {name} described"))? {
-            unknown = true;
-            break;
-        }
-    }
-    if unknown || rewritten > 0 {
-        // It comes back knowing nothing of what had registered with it,
-        // and nothing registers again by itself, so init starts each of
-        // those services again, as the installed system's init does
-        // whenever its directory restarts.
-        let registered = registered()?;
-        let was = crate::services::running(DIRECTORY_PROGRAM);
-        skyward_sys::set_prop("ctl.restart", DIRECTORY_SERVICE).context("have the service directory start again")?;
-        answering_again(was)?;
-        register_again(&registered)?;
-    }
-    Ok(())
+    // Some stock recoveries carry no servicemanager. Their configuration
+    // starts the installed system's directory later, after these files are
+    // ready. It cannot answer Binder calls yet, and init cannot restart it.
+    crate::directory::refresh(
+        Path::new(DIRECTORY_PROGRAM).is_file(),
+        rewritten > 0,
+        || {
+            let binder = skyward_binder::driver::Binder::open()?;
+            for name in wanted {
+                if !skyward_binder::service::declared(&binder, name)
+                    .with_context(|| format!("ask the service directory whether it knows {name} described"))?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        || {
+            // Restarting the directory also requires every service already
+            // registered with it to register again.
+            let registered = registered()?;
+            let was = crate::services::running(DIRECTORY_PROGRAM);
+            skyward_sys::set_prop("ctl.restart", DIRECTORY_SERVICE).context("have the service directory start again")?;
+            answering_again(was)?;
+            register_again(&registered)
+        },
+    )
 }
 
 /// Match Binder's protocol to the executable selected by the configuration.

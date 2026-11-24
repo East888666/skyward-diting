@@ -45,6 +45,15 @@ pub struct Fastboot {
 }
 
 impl App {
+    /// Apply the device capability before drawing the reboot picker.
+    pub fn set_fastbootd(&mut self, enabled: bool) {
+        self.state.fastbootd = enabled;
+        if !enabled && TARGETS.get(self.state.reboot) == Some(&Target::Fastboot) {
+            self.state.reboot = 0;
+        }
+        self.refresh();
+    }
+
     /// The runtime read whether fastbootd runs and how far a computer has
     /// the port: keep it and show it if it changed.
     pub fn set_fastboot(&mut self, running: bool, link: UsbLink) {
@@ -68,6 +77,29 @@ impl App {
 mod tests {
     use super::*;
     use crate::app::testing::*;
+
+    #[test]
+    fn disabled_fastbootd_is_hidden_and_rejected_but_bootloader_still_works() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Reboot, W, H, PPD);
+        let fastboot = TARGETS.iter().position(|t| *t == Target::Fastboot).unwrap();
+        let bootloader = TARGETS.iter().position(|t| *t == Target::Bootloader).unwrap();
+        tap(&mut app, &f, &i, Action::RebootTarget(fastboot));
+        app.set_fastbootd(false);
+        assert_eq!(app.state.reboot, 0, "a selection being hidden is reset");
+        let frame = app.frame(&f, &i);
+        assert!(!frame.hits.iter().any(|h| h.action == Action::RebootTarget(fastboot)));
+        assert!(frame.hits.iter().any(|h| h.action == Action::RebootTarget(bootloader)));
+        app.act(Action::RebootTarget(fastboot), 0);
+        assert_eq!(app.state.reboot, 0);
+        assert!(app.act(Action::RebootTo(Target::Fastboot), 0).is_empty());
+        app.state.reboot = fastboot;
+        assert!(app.confirmed(Confirm::Reboot, 0).is_empty(), "stale selection cannot bypass capability");
+        app.act(Action::RebootTarget(bootloader), 0);
+        assert_eq!(swipe(&mut app, &f, &i, Confirm::Reboot), vec![Effect::Reboot(Target::Bootloader)]);
+        app.set_fastbootd(true);
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::RebootTarget(fastboot)));
+    }
 
     #[test]
     fn swiping_the_knob_reboots_to_the_chosen_target() {

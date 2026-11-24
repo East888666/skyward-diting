@@ -135,9 +135,9 @@ pub fn shared_storage() -> PathBuf {
 }
 
 /// Open old v1 FBE with Keymaster 3 and the inherited fscrypt keyring.
-/// Only hardware-bound nopassword CE keys are supported here; synthetic
-/// password and credential-protected CE layouts fail rather than being
-/// reported as decrypted. Replay the filesystem journal before inspecting
+/// Hardware-bound nopassword CE and v3 secdiscardable synthetic-password
+/// protectors without screen locks are supported. Credential/Weaver layouts
+/// fail rather than being reported as decrypted. Replay the journal before inspecting
 /// keys, with ordinary directory writes still disabled.
 pub fn open_legacy_without_credential() -> Result<Opening> {
     use crate::{fscrypt, keymaster3::Keymaster3};
@@ -182,7 +182,22 @@ pub fn open_legacy_without_credential() -> Result<Opening> {
         }
         for user in users {
             let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
-            install(&dir, None).context("legacy CE key requires a supported nopassword hardware layout")?;
+            let stored = StoredKey::load(&dir)?;
+            if stored.hardware_bound() {
+                install(&dir, None).context("unwrap legacy hardware-bound CE key")?;
+            } else {
+                let protector = protector(user)?;
+                anyhow::ensure!(!made_up(user, &protector.id), "legacy FBE does not support a credential tied to another user");
+                let held = crate::keystore2::key_blob(Path::new(crate::keystore2::DATABASE), &protector.key_alias())?;
+                let mut secret = crate::user::file_secret_without_credential(&protector, &service, &held)
+                    .context("recover legacy CE synthetic-password secret")?;
+                let unwrapped = stored.unwrap(Unwrap::<Keymaster3>::Secret(&secret));
+                secret.fill(0);
+                let mut raw = unwrapped.with_context(|| format!("unwrap legacy CE key in {}", dir.display()))?;
+                let installed = fscrypt::legacy_add_key(&raw, None);
+                raw.fill(0);
+                installed?;
+            }
             for prefix in ["user", "system_ce", "media"] {
                 let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
                 if dir.is_dir() { anyhow::ensure!(fscrypt::legacy_unlocked(&dir)?, "legacy CE key does not open {}", dir.display()); }

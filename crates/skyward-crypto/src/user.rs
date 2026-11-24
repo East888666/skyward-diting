@@ -255,6 +255,38 @@ pub fn content(blob: &[u8]) -> Result<&[u8]> {
     Ok(rest)
 }
 
+/// Recover a modern protector's file secret through an older hardware
+/// service. Credential-protected and Weaver protectors require their own
+/// authentication paths and are rejected before asking hardware.
+pub fn file_secret_without_credential(
+    protector: &Protector,
+    service: &impl crate::keystore::Decryptor,
+    held: &[u8],
+) -> Result<Vec<u8>> {
+    ensure!(protector.lock.is_none(), "legacy FBE protector requires a screen-lock credential");
+    let Bound::Secdiscardable(secdiscardable) = &protector.bound else {
+        bail!("legacy FBE protector requires unsupported Weaver authentication");
+    };
+    let content = content(&protector.blob)?;
+    ensure!(content.len() >= NONCE_BYTES + 16, "the user's blob is too short to hold anything");
+    let mut secret = protector_secret(&stretched_without_credential(), secdiscardable);
+    let (nonce, body) = content.split_at(NONCE_BYTES);
+    let opened = service.gcm_decrypt(held, &[], nonce, body);
+    let recovered = match opened {
+        Ok(mut inner) => {
+            let result = open_inner(&secret, &inner);
+            inner.fill(0);
+            result
+        }
+        Err(error) => Err(error),
+    };
+    secret.fill(0);
+    let mut password = recovered?;
+    let key = file_secret(&password);
+    password.fill(0);
+    Ok(key)
+}
+
 /// The secret a user's own files are wrapped with, from the synthetic
 /// password the blob held.
 pub fn file_secret(synthetic_password: &[u8]) -> Vec<u8> {
@@ -330,6 +362,59 @@ mod tests {
         assert_eq!(open_inner(b"the secret", &blob).unwrap(), b"the password");
         assert!(open_inner(b"another secret", &blob).is_err());
         assert!(open_inner(b"the secret", &blob[..20]).is_err());
+    }
+
+    struct TestHardware;
+
+    impl crate::keystore::Decryptor for TestHardware {
+        fn gcm_decrypt(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+            assert_eq!(blob, b"hardware handle");
+            assert!(app_id.is_empty());
+            Aes256Gcm::new_from_slice(&[9; 32]).unwrap()
+                .decrypt(Nonce::from_slice(nonce), body)
+                .map_err(|_| anyhow::anyhow!("hardware authentication failed"))
+        }
+    }
+
+    fn no_lock_protector() -> Protector {
+        let secret = protector_secret(&stretched_without_credential(), b"binding bytes");
+        let mut inner_key = personalized_hash(PROTECTOR_SECRET, &[&secret]);
+        inner_key.truncate(KEY_BYTES);
+        let inner_cipher = Aes256Gcm::new_from_slice(&inner_key).unwrap();
+        let mut inner = vec![4; NONCE_BYTES];
+        inner.extend(inner_cipher.encrypt(Nonce::from_slice(&[4; NONCE_BYTES]), &b"synthetic password"[..]).unwrap());
+        let mut blob = vec![3, 0];
+        blob.extend([5; NONCE_BYTES]);
+        blob.extend(Aes256Gcm::new_from_slice(&[9; 32]).unwrap()
+            .encrypt(Nonce::from_slice(&[5; NONCE_BYTES]), inner.as_slice()).unwrap());
+        Protector { id: "01".into(), blob, bound: Bound::Secdiscardable(b"binding bytes".to_vec()), lock: None }
+    }
+
+    #[test]
+    fn no_lock_synthetic_password_opens_through_a_decryptor_without_keymint() {
+        let mut protector = no_lock_protector();
+        assert_eq!(
+            file_secret_without_credential(&protector, &TestHardware, b"hardware handle").unwrap(),
+            file_secret(b"synthetic password")
+        );
+        protector.bound = Bound::Secdiscardable(b"wrong binding".to_vec());
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"hardware handle").is_err());
+        protector = no_lock_protector();
+        *protector.blob.last_mut().unwrap() ^= 1;
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"hardware handle").is_err());
+    }
+
+    #[test]
+    fn no_lock_path_rejects_authenticated_or_unsupported_protectors() {
+        let mut protector = no_lock_protector();
+        protector.lock = Some(Lock { kind: Lock::PIN, cost: [11, 3, 1], salt: vec![], enrolled: vec![] });
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"must not call hardware").is_err());
+        protector.lock = None;
+        protector.bound = Bound::Weaver(0);
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"must not call hardware").is_err());
+        protector.bound = Bound::Secdiscardable(b"binding bytes".to_vec());
+        protector.blob[0] = 2;
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"must not call hardware").is_err());
     }
 
     #[test]

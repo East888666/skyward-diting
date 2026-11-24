@@ -5,6 +5,12 @@
 # Build static API 28 programs; shell tools and stock FDE remain separate
 # runtime limitations documented in wayne-notes.md.
 
+# Recovery capacity verified with blockdev: 64 MiB (67,108,864 bytes).
+# Pass --partition-size 67108864 to skyward-pack recovery; this is a build-time
+# capacity check, not a TOML key or a requirement to pad the output image.
+# The current local recovery.img has a newer /system/etc/init/hw/init.rc layout;
+# the MIUI image observations below describe the original baseline only.
+
 [device]
 codename = "wayne"
 brand = "Xiaomi"
@@ -29,6 +35,10 @@ density = 440
 diagonal = 5.99
 # WAYNE's NT36672 Tianma/JDI panels specify a 4095 brightness range.
 normal_max_brightness = 4095
+# The current Melon fbdev panel displays frames already. Avoid the visible
+# startup blank/unblank cycle; screen-off/wake still uses the existing path.
+# Requires the matching runtime source; other devices keep their default.
+fbdev_skip_initial_power_cycle = true
 # CONFIG_FB_MSM_MDSS=y, CONFIG_DRM is unset. The existing fbdev backend
 # is selected automatically; Polaris's KMS workarounds are not enabled.
 
@@ -45,6 +55,13 @@ sources = ["vendor"]
 load = []
 # CONFIG_TOUCHSCREEN_NT36xxx=y and CONFIG_TOUCHSCREEN_NVT_D2S=y;
 # no external touch module or unverified touch sysfs writes are needed.
+
+# Live Melon kernel: qti-haptics on event2 advertises FF_PERIODIC.
+# DT waveform 0 plays for 15 ms; CLI test succeeded and the owner felt it.
+# This replaces the old MIUI timed-output assumption for this recovery.
+[haptics]
+click = 0
+strength = { lightest = 0.5, strongest = 1.0 }
 
 [backup]
 partitions = ["boot", "recovery", "system", "vendor", "cust", "cache", "data"]
@@ -149,7 +166,5 @@ extras = "wait,check"
 
 # Do not copy the stock mmcblk1p1 /sdcard placeholder: /sdcard is used for
 # shared internal storage. This image alone does not prove a card exists.
-# No [haptics]: CONFIG_QPNP_HAPTIC + ANDROID_TIMED_OUTPUT uses enable;
-# current timed haptics requires duration/activate. Polaris's node differs.
 # No [wlan] or Keymaster service set: those need separate runtime support
 # and testing. No [stock] until a matching OTA URL/hash is verified.

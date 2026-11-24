@@ -1,0 +1,263 @@
+# Xiaomi Mi Note 3 / jason.
+# Structure follows polaris.toml and wayne.toml; device facts come from
+# jason/{boot,recovery}.img (LineageOS 22.2, Android 15, 2026-06-01).
+# Both images contain the same 4.19.325 kernel and non-A/B fstab.
+# Partition mapping comes from that recovery; installed-OS service profiles
+# cover the inspected MIUI 12/API29, Android 13/API33 and LOS 22.2/API35 layouts.
+# Use the smaller fixed-weight font from jason-notes.md when packing.
+# Merely fitting the 64 MiB partition did not ensure this bootloader booted it.
+# See jason-notes.md for provenance, build commands and untested features.
+# The LOS 23.2 / 4.4 base needs devices/jason-los23.toml instead.
+
+[device]
+codename = "jason"
+brand = "Xiaomi"
+model = "Mi Note 3"
+ab = false
+soc = { hans = "骁龙®660移动平台", hant = "Snapdragon® 660 行動平台", en = "Snapdragon® 660 Mobile Platform" }
+os_version_prop = "ro.build.version.incremental"
+
+[recovery]
+# Keep stdout/stderr in /skyward/run/recovery.log independently of logd.
+capture_stdio = true
+# Keep the v1-FBE fallback for custom ROMs. Plain MIUI data opens first
+# only after policy/key-directory checks; this flag does not force FBE.
+legacy_fbe = true
+# The stock policy denies kernel -> recovery:fd use. Open only APEX loop
+# backing files in a one-shot su helper; keep the UI in recovery's domain.
+# SELinux remains enforcing and the installed system is not modified.
+apex_loop_context = "u:r:su:s0"
+# Preserve the supplied Android 15 header and properties. Do not copy
+# Polaris's Android 12 legacy_version or its stock Android 10 library fixes.
+# Keep stock fastbootd at the existing default; ab=false does not disable it.
+
+[display]
+# Jason's JDI R63452 and Sharp TD4322 device-tree panels are 1080 x 1920.
+width = 1080
+height = 1920
+# ro.sf.lcd_density from the supplied prop.default.
+density = 420
+diagonal = 5.5
+# Both Jason panels declare this maximum, unlike a guessed 255 scale.
+normal_max_brightness = 4095
+# CONFIG_FB_MSM_MDSS=y; CONFIG_DRM is unset. fbdev is chosen automatically.
+# The first-frame power cycle left this Synaptics input without events;
+# a normal sleep/wake restored touch. Keep the bootloader-lit panel alive.
+fbdev_skip_initial_power_cycle = true
+# Panel powerdown/resume can leave Synaptics IRQ disabled after sleep.
+# Black out the framebuffer and backlight without powering the panel down.
+# This also prevents system suspend: higher recovery screen-off power use.
+keep_powered = true
+
+[firmware]
+partition = "modem"
+
+[modules]
+# "vendor" is the supported module source for /vendor/lib/modules.
+# On this ROM that directory is on cust, mounted as /vendor by the fstab.
+sources = ["vendor"]
+# Synaptics DSX FORCE, ST touch, USB storage and both data filesystems
+# are built into the supplied kernel; no external modules are established.
+load = []
+
+[haptics]
+# Verified qpnp-haptic timed_output interface; milliseconds go to enable.
+# Keep the driver's voltage and waveform calibration unchanged.
+timed_output = "/sys/class/timed_output/vibrator"
+drive = 60
+strength = { lightest = 0.5, strongest = 1.0 }
+
+[backup]
+# Real partition names, not mount aliases: vendor is stored in cust.
+partitions = ["boot", "recovery", "system", "cust", "cache", "data"]
+
+[wipe]
+# "vendor" resolves through its /vendor mount entry to the cust partition.
+# No metadata partition is established by either supplied fstab.
+formats = ["data", "cache", "system", "vendor"]
+
+# Entries below follow the supplied recovery.fstab and boot fstab.qcom.
+# formattable explicitly permits the four wipe targets above.
+# The runtime mounts /system at /system_root, preserving the recovery root.
+[[fstab]]
+device = "/dev/block/by-name/system"
+mount_point = "/system"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,first_stage_mount,formattable"
+
+# Important: this custom ROM repurposes cust as vendor. There is no
+# separate vendor partition in either supplied table; do not alias twice.
+[[fstab]]
+device = "/dev/block/by-name/cust"
+mount_point = "/vendor"
+filesystem = "ext4"
+options = "ro,barrier=1"
+extras = "wait,first_stage_mount,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/boot"
+mount_point = "/boot"
+filesystem = "emmc"
+options = "defaults"
+extras = "recoveryonly"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/recovery"
+mount_point = "/recovery"
+filesystem = "emmc"
+options = "defaults"
+extras = "recoveryonly"
+
+# Do not force one installed ROM's encryption marker onto another ROM.
+# Actual policies and key directories distinguish plain MIUI from v1 FBE.
+# The legacy-FBE path reads its mode from /data/unencrypted/mode, not here.
+# This does not add support for genuinely encrypted legacy FDE userdata.
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/userdata"
+mount_point = "/data"
+filesystem = "f2fs"
+options = "nosuid,nodev,noatime,background_gc=off,fsync_mode=nobarrier"
+extras = "wait,check,quota,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/userdata"
+mount_point = "/data"
+filesystem = "ext4"
+options = "nosuid,nodev,barrier=1,noauto_da_alloc,noatime,lazytime,errors=panic"
+extras = "wait,check,quota,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/misc"
+mount_point = "/misc"
+filesystem = "emmc"
+options = "defaults"
+extras = "defaults"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/modem"
+mount_point = "/vendor/firmware_mnt"
+filesystem = "vfat"
+options = "ro,shortname=lower,uid=1000,gid=1000,dmask=227,fmask=337,context=u:object_r:firmware_file:s0"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/bluetooth"
+mount_point = "/vendor/bt_firmware"
+filesystem = "vfat"
+options = "ro,shortname=lower,uid=1002,gid=3002,dmask=227,fmask=337,context=u:object_r:bt_firmware_file:s0"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/dsp"
+mount_point = "/vendor/dsp"
+filesystem = "ext4"
+options = "ro,nosuid,nodev,barrier=1"
+extras = "wait"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "f2fs"
+options = "nosuid,nodev,noatime,background_gc=off,fsync_mode=nobarrier"
+extras = "wait,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cache"
+mount_point = "/cache"
+filesystem = "ext4"
+options = "nosuid,nodev,noatime,barrier=1"
+extras = "wait,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/persist"
+mount_point = "/mnt/vendor/persist"
+filesystem = "ext4"
+options = "noatime,nosuid,nodev,barrier=1"
+extras = "wait"
+
+# The original table's USB glob is for vold, not a fixed block partition.
+# Leave it in stock; do not invent an sda1-only override for removable media.
+# No [wlan] or [stock] URL/hash without matching vendor/system contents
+# or a verified full OTA.
+
+# Installed Android 15 / LOS 22.2 service profile, retained from the
+# previously verified system/vendor. Do not run these paths on MIUI 12.
+[[service]]
+when = { property = "ro.build.version.sdk", value = "35" }
+path = "/system_root/system/system_ext/bin/hwservicemanager"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64", "/system_root/system/system_ext/lib64"]
+user = "system"
+groups = ["system", "readproc"]
+ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "35" }
+path = "/vendor/bin/qseecomd"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "root"
+groups = ["root"]
+ready_property = "vendor.sys.listeners.registered"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "35" }
+path = "/vendor/bin/hw/android.hardware.keymaster@3.0-service"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "nobody"
+groups = ["drmrpc"]
+ready_hardware_service = "android.hardware.keymaster@3.0::IKeymasterDevice/default"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "35" }
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "system"
+groups = ["system"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+
+# Installed Android 13 service profile from the inspected API33 system.
+# This describes installed services, independently of recovery kernel version.
+[[service]]
+when = { property = "ro.build.version.sdk", value = "33" }
+path = "/system_root/system/bin/hwservicemanager"
+# Use the installed Android 13 loader with its matching libc.
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "system"
+groups = ["system", "readproc"]
+ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "33" }
+path = "/vendor/bin/qseecomd"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "root"
+groups = ["root"]
+ready_property = "vendor.sys.listeners.registered"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "33" }
+path = "/vendor/bin/hw/android.hardware.keymaster@3.0-service"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "nobody"
+groups = ["drmrpc"]
+ready_hardware_service = "android.hardware.keymaster@3.0::IKeymasterDevice/default"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "33" }
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "system"
+groups = ["system"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+
+# MIUI 12/API29 has plain userdata in the verified installation. No FBE
+# service chain is selected for it. Other SDK versions need verified service
+# profiles before claiming encrypted-data support.

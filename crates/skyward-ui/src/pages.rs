@@ -823,9 +823,12 @@ pub fn reboot(cx: &Ctx) -> Frame {
     let mut out = Vec::new();
     let top = t.m.content_top;
     let mut y = widgets::section_first(&mut c, t, f, top, l.pick(["重启到", "重新啟動到", "Reboot to"]));
-    let rows: Vec<Row> = REBOOT_TARGETS
+    let available: Vec<usize> = (0..TARGETS.len())
+        .filter(|&k| s.fastbootd || TARGETS[k] != Target::Fastboot)
+        .collect();
+    let rows: Vec<Row> = available
         .iter()
-        .enumerate()
+        .map(|&k| (k, &REBOOT_TARGETS[k]))
         .map(|(k, &(title, sub))| {
             let r = Row::new(l.pick(title)).trail(Trail::Check(s.reboot == k));
             match sub {
@@ -835,7 +838,7 @@ pub fn reboot(cx: &Ctx) -> Frame {
         })
         .collect();
     let targets = widgets::list(&mut c, t, f, y, &rows);
-    let picks: Vec<Action> = (0..TARGETS.len()).map(Action::RebootTarget).collect();
+    let picks: Vec<Action> = available.into_iter().map(Action::RebootTarget).collect();
     out.extend(hits(&targets.rows, &picks));
     y = targets.bottom;
     if let Some(slot) = cx.info.slot {

@@ -159,8 +159,20 @@ pub fn legacy_unlocked(dir: &Path) -> Result<bool> {
     let mut policy = [0u8; 12];
     if unsafe { libc::ioctl(folder.as_raw_fd(), 0x400c6615u32 as libc::Ioctl, policy.as_mut_ptr()) } != 0 {
         let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ENODATA) { return Ok(true); }
-        return Err(error).context("read legacy encryption policy");
+        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::ENOENT)) {
+            return Err(error).with_context(|| format!("read legacy encryption policy of {}", dir.display()));
+        }
+        // Downstream ext4 can report ENOENT instead of ENODATA for an
+        // inode without a policy. Inspect this same open inode; a missing
+        // context on an encrypted inode must still fail.
+        const GET_FLAGS: u32 = 0x8000_6601 | ((std::mem::size_of::<libc::c_long>() as u32) << 16);
+        let mut flags: libc::c_long = 0;
+        if unsafe { libc::ioctl(folder.as_raw_fd(), GET_FLAGS as libc::Ioctl, &mut flags) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("read inode flags of {} after missing encryption policy", dir.display()));
+        }
+        return crate::plain::ensure_unencrypted_flags(flags as u32).map(|()| true)
+            .with_context(|| format!("inspect legacy encryption of {}", dir.display()));
     }
     anyhow::ensure!(policy[0] == 0 && matches!(policy[1], 1 | 127) && policy[2] == 4, "unsupported legacy encryption policy");
     let name: String = policy[4..12].iter().map(|b| format!("{b:02x}")).collect();

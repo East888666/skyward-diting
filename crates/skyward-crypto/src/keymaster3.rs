@@ -35,7 +35,10 @@ fn hardware_blob(blob: &[u8]) -> Result<&[u8]> {
 fn parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Option<&[u8]>) -> Result<()> {
     let mut values: Vec<(u32, u64, &[u8])> = Vec::new();
     if let Some(app_id) = app_id {
-        values.extend([(0x20000004, 32, &[][..]), (0x20000006, 1, &[][..]), (0x300003eb, 128, &[][..]), (0x90000259, 0, app_id)]);
+        values.extend([(0x20000004, 32, &[][..]), (0x20000006, 1, &[][..]), (0x300003eb, 128, &[][..])]);
+        // Keystore's synthetic-password keys have no application binding.
+        // Old Qualcomm HALs fail allocating an explicitly empty blob.
+        if !app_id.is_empty() { values.push((0x90000259, 0, app_id)); }
     }
     if let Some(nonce) = nonce { values.push((0x900003e9, 0, nonce)); }
     let mut raw = vec![0; values.len() * PARAM_BYTES];
@@ -48,6 +51,7 @@ fn parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Option<&[u8]>) -
 }
 
 fn upgrade_parameters(call: &mut Message, app_id: &[u8]) -> Result<()> {
+    if app_id.is_empty() { return call.structures(&[], PARAM_BYTES, &[]); }
     let mut raw = [0u8; PARAM_BYTES];
     raw[..4].copy_from_slice(&0x90000259u32.to_le_bytes());
     call.structures(&raw, PARAM_BYTES, &[(16, app_id)])
@@ -190,6 +194,22 @@ mod tests {
         assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 128);
         assert_eq!(u32::from_le_bytes(bytes[120..124].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(bytes[152..156].try_into().unwrap()), 12);
+    }
+
+    #[test]
+    fn unbound_keys_omit_the_empty_application_id_parameter() {
+        let mut call = Message::default();
+        parameters(&mut call, Some(&[]), Some(&[1; 12])).unwrap();
+        let offsets = call.addresses();
+        let raw = &call.values()[offsets[1] as usize..];
+        let at = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        assert_eq!(len, 4 * PARAM_BYTES);
+        assert!(bytes.as_chunks::<PARAM_BYTES>().0.iter()
+            .all(|p| u32::from_le_bytes(p[..4].try_into().unwrap()) != 0x90000259));
+        let mut upgrade = Message::default();
+        upgrade_parameters(&mut upgrade, &[]).unwrap();
     }
 
     #[test]

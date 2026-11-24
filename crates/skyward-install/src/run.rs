@@ -861,6 +861,15 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
     }
     let slot = skyward_vab::current_slot()?;
     extract_script()?;
+    // Fail before hold/detach/cache preparation if this updater's Bionic
+    // needs a kernel facility the booted stock recovery cannot provide.
+    if let Err(error) = script::check_kernel(&fs::read(BINARY).context("read installer for kernel check")?) {
+        let why = format!("{error:#}");
+        fs::write(SCRIPT_LOG, format!("[kernel preflight] {why}\n"))
+            .with_context(|| format!("write {SCRIPT_LOG}"))?;
+        let _ = kmsg(&format!("install: kernel preflight refused before detach: {why}"));
+        return Err(error);
+    }
     shell_at_sbin()?;
     let kept = hold(ctx, slot)?;
     installed_boot_set()?;
@@ -876,6 +885,17 @@ fn run_script(ctx: &mut Context, size: u64) -> Result<Done> {
         }
         (None, _) => SlotMaps::default(),
     };
+    // Legacy block-image updaters need a mounted cache and /cache/recovery,
+    // even for full updates with no stashes. Do this AFTER detach_once:
+    // its unmount plan also releases cache, hiding any directory prepared
+    // earlier. Include this mount in the baseline before running the script
+    // so cleanup leaves the recovery's cache in place.
+    // Slotted phones and tables without cache keep their existing path.
+    if slot.is_none() && !skyward_block::fstab::read("/cache")?.is_empty() {
+        let cache = skyward_block::fstab::mount("/cache").context("mount cache for the install script")?;
+        let directory = script::prepare_cache_dir(&cache)?;
+        let _ = kmsg(&format!("install: legacy script cache ready after detach at {}", directory.display()));
+    }
     let mounted = skyward_block::mount::mount_ids()?;
     let ran = run_binary(ctx);
     if let Err(e) = clean_up(&mounted, &mapped) {

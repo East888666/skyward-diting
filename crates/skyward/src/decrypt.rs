@@ -79,7 +79,7 @@ pub fn open_data() -> Result<Opening, String> {
                 return Err(format!("data filesystem could not be read; check its filesystem before retrying: {plain:#}"));
             }
             let legacy = skyward_config::DeviceConfig::load("/skyward/device.toml")
-                .is_ok_and(|cfg| cfg.recovery.legacy_version.is_some());
+                .is_ok_and(|cfg| cfg.recovery.uses_legacy_fbe());
             if legacy {
                 return data::open_legacy_without_credential()
                     .map_err(|error| format!("plain data: {plain:#}; legacy FBE: {error:#}"));

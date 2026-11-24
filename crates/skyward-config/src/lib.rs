@@ -99,8 +99,16 @@ pub struct DeviceConfig {
 }
 
 /// Opt-in changes to the stock recovery runtime.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Recovery {
+    /// Override stock ramdisk compression only where the kernel supports it.
+    /// None preserves the base image's format for existing devices.
+    #[serde(default)]
+    pub ramdisk_compression: Option<RamdiskCompression>,
+    /// Keep userspace fastboot and its dedicated ramdisk resources. This is
+    /// independent of A/B slots and defaults to enabled for existing devices.
+    #[serde(default = "default_true")]
+    pub fastbootd: bool,
     /// Keep the device's explicitly configured key services and loader/library
     /// overrides instead of discovering a second set from installed partitions.
     #[serde(default)]
@@ -122,6 +130,47 @@ pub struct Recovery {
     /// Applies only to non-A/B, v0-v2 recovery images.
     #[serde(default)]
     pub legacy_version: Option<LegacyRecoveryVersion>,
+    /// Use Keymaster 3 and the session keyring for v1 FBE, independently
+    /// of any boot-header version override. Only non-A/B layouts support it.
+    #[serde(default)]
+    pub legacy_fbe: bool,
+    /// Optional SELinux domain for the short-lived APEX loop helper.
+    /// Some legacy policies deny kernel threads access to recovery-owned
+    /// file descriptors even when the recovery domain is permissive.
+    /// The UI and hardware services keep their original domain.
+    #[serde(default)]
+    pub apex_loop_context: Option<String>,
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self {
+            ramdisk_compression: None,
+            fastbootd: true,
+            manual_key_services: false,
+            ramdisk_libraries_first: false,
+            ramdisk_libraries_only: false,
+            capture_stdio: false,
+            legacy_version: None,
+            legacy_fbe: false,
+            apex_loop_context: None,
+        }
+    }
+}
+
+/// A kernel-supported initramfs encoding, explicitly selected by a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RamdiskCompression {
+    Gzip,
+    Lz4,
+    Lzma,
+}
+
+impl Recovery {
+    pub fn uses_legacy_fbe(&self) -> bool {
+        self.legacy_fbe || self.legacy_version.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -334,6 +383,10 @@ pub struct Haptics {
     /// be loaded even if the motor's frequency were known.
     #[serde(default)]
     pub timed: Option<String>,
+    /// A legacy timed_output driver folder. Its enable file takes the
+    /// duration in milliseconds, or 0 to stop, without duration/activate.
+    #[serde(default)]
+    pub timed_output: Option<String>,
     /// How long a drive lasts at the slider's fullest, in whole
     /// milliseconds, for such a driver.
     #[serde(default = "Haptics::shortest_drive")]
@@ -434,6 +487,11 @@ pub struct Display {
     /// frame can overlap the ioctl. Requires blocking_commits.
     #[serde(default)]
     pub pipelined_commits: bool,
+    /// Keep a working fbdev panel powered when presenting its first frame.
+    /// Older panels still perform their original startup power cycle by default;
+    /// wake after screen-off retains the full power and mapping recovery path.
+    #[serde(default)]
+    pub fbdev_skip_initial_power_cycle: bool,
     /// How round the screen's corners are, as a radius in pixels; a page
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
@@ -665,6 +723,12 @@ impl DeviceConfig {
             ensure!(!cfg.device.ab, "legacy_version is only for non-A/B recovery");
             version.encoded()?;
         }
+        ensure!(!cfg.recovery.legacy_fbe || !cfg.device.ab, "legacy_fbe is only for non-A/B recovery");
+        if let Some(context) = &cfg.recovery.apex_loop_context {
+            ensure!(!context.is_empty() && context.split(':').count() >= 4
+                && context.bytes().all(|c| c.is_ascii_alphanumeric() || b"_:-,.".contains(&c)),
+                "apex_loop_context must be a SELinux context without whitespace");
+        }
         ensure!(cfg.display.normal_max_brightness != Some(0),
             "[display] normal_max_brightness must be greater than zero");
         ensure!(!cfg.display.pipelined_commits || cfg.display.blocking_commits,
@@ -718,7 +782,7 @@ impl DeviceConfig {
             ensure!(plain && !folder.is_empty(), "[backup] data_skipped: {folder} is not a path from the top of {DATA}");
         }
         if let Some(haptics) = &cfg.haptics {
-            // A motor is reached one of two ways: through the kernel's
+            // A motor is reached through exactly one backend: through the kernel's
             // force-feedback events, where its click is a waveform the
             // driver keeps or samples made at the motor's resonant
             // frequency, or through a driver folder of its own that plays
@@ -726,10 +790,10 @@ impl DeviceConfig {
             // frequency is known, and are the click's own waveform where
             // it is not.
             let events = haptics.click.is_some() || haptics.resonance.is_some();
-            let kinds = [events, haptics.timed.is_some()].into_iter().filter(|has| *has).count();
+            let kinds = [events, haptics.timed.is_some(), haptics.timed_output.is_some()].into_iter().filter(|has| *has).count();
             ensure!(
                 kinds == 1,
-                "[haptics] names a motor reached one way: a kept waveform, the file it says the motor's resonant frequency in, or a driver folder to write a timed drive to"
+                "[haptics] names a motor reached one way: a kept waveform, the file it says the motor's resonant frequency in, or a driver folder using timed or timed_output"
             );
             if let Some(file) = &haptics.resonance {
                 ensure!(Path::new(file).is_absolute(), "[haptics] resonance: {file} is not an absolute path");
@@ -739,6 +803,14 @@ impl DeviceConfig {
                     Path::new(folder).is_absolute(),
                     "[haptics] timed: {folder} is not an absolute path"
                 );
+            }
+            if let Some(folder) = &haptics.timed_output {
+                ensure!(
+                    Path::new(folder).is_absolute(),
+                    "[haptics] timed_output: {folder} is not an absolute path"
+                );
+            }
+            if haptics.timed.is_some() || haptics.timed_output.is_some() {
                 ensure!(
                     haptics.drive > 0,
                     "[haptics] drive: a drive of no milliseconds is no click"
@@ -818,6 +890,93 @@ fn validate_firmware(file: &Firmware) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apex_loop_context_is_explicit_and_validated() {
+        let plain = "[device]\ncodename = 'test'\n";
+        assert!(DeviceConfig::parse(plain).unwrap().recovery.apex_loop_context.is_none());
+        let configured = format!("{plain}[recovery]\napex_loop_context = 'u:r:su:s0'\n");
+        assert_eq!(DeviceConfig::parse(&configured).unwrap().recovery.apex_loop_context.as_deref(), Some("u:r:su:s0"));
+        for context in ["", "su", "u:r:su:s0 bad", "u:r:su:s0;bad"] {
+            let text = format!("{plain}[recovery]\napex_loop_context = '{context}'\n");
+            assert!(DeviceConfig::parse(&text).is_err(), "{context}");
+        }
+    }
+
+    #[test]
+    fn ramdisk_compression_is_explicit_and_existing_devices_keep_stock() {
+        let with = |value: &str| DeviceConfig::parse(&format!(
+            "[device]\ncodename = 'test'\n[recovery]\nramdisk_compression = '{value}'\n"
+        ));
+        assert!(Recovery::default().ramdisk_compression.is_none());
+        for (name, format) in [("gzip", RamdiskCompression::Gzip), ("lz4", RamdiskCompression::Lz4), ("lzma", RamdiskCompression::Lzma)] {
+            assert_eq!(with(name).unwrap().recovery.ramdisk_compression, Some(format));
+        }
+        assert!(with("xz").is_err(), "XZ is not LZMA-alone and this kernel cannot unpack it");
+        assert!(with("").is_err());
+        let devices = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices");
+        for path in std::fs::read_dir(devices).unwrap() {
+            let path = path.unwrap().path();
+            if path.extension().is_some_and(|s| s == "toml") {
+                let cfg = DeviceConfig::load(&path).unwrap();
+                assert_eq!(cfg.recovery.ramdisk_compression,
+                    (path.file_stem().unwrap() == "jason-los23").then_some(RamdiskCompression::Lzma),
+                    "{}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn fastbootd_defaults_on_independently_of_slots_and_only_polaris_opts_out() {
+        assert!(Recovery::default().fastbootd);
+        for config in [
+            "[device]\ncodename = 'test'\n",
+            "[device]\ncodename = 'test'\nab = false\n",
+            "[device]\ncodename = 'test'\n[recovery]\ncapture_stdio = true\n",
+        ] {
+            assert!(DeviceConfig::parse(config).unwrap().recovery.fastbootd);
+        }
+        assert!(!DeviceConfig::parse("[device]\ncodename = 'test'\n[recovery]\nfastbootd = false\n").unwrap().recovery.fastbootd);
+        for path in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices")).unwrap() {
+            let path = path.unwrap().path();
+            if path.extension().is_some_and(|s| s == "toml") {
+                let cfg = DeviceConfig::load(&path).unwrap();
+                assert_eq!(cfg.recovery.fastbootd, cfg.device.codename != "polaris", "{}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn fbdev_startup_power_cycle_is_preserved_unless_explicitly_skipped() {
+        assert!(!Display::default().fbdev_skip_initial_power_cycle);
+        for text in [
+            "[device]\ncodename = 'test'\n",
+            "[device]\ncodename = 'test'\nab = false\n",
+            "[device]\ncodename = 'test'\n[display]\nwidth = 1080\n",
+        ] {
+            assert!(!DeviceConfig::parse(text).unwrap().display.fbdev_skip_initial_power_cycle);
+        }
+        let wayne = DeviceConfig::parse(include_str!("../../../devices/wayne.toml")).unwrap();
+        assert!(wayne.display.fbdev_skip_initial_power_cycle);
+        assert_eq!(wayne.haptics.unwrap().click, Some(0));
+        let polaris = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
+        assert!(!polaris.display.fbdev_skip_initial_power_cycle);
+    }
+
+    #[test]
+    fn legacy_fbe_can_be_selected_without_overriding_the_boot_version() {
+        let jason = DeviceConfig::parse(include_str!("../../../devices/jason.toml")).unwrap();
+        assert!(jason.recovery.uses_legacy_fbe());
+        assert!(jason.recovery.legacy_version.is_none());
+        assert!(jason.services.iter().any(|s| s.path == "/vendor/bin/hw/android.hardware.keymaster@3.0-service"));
+        let polaris = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
+        assert!(polaris.recovery.uses_legacy_fbe());
+        let diting = DeviceConfig::parse(include_str!("../../../devices/diting.toml")).unwrap();
+        assert!(!diting.recovery.uses_legacy_fbe());
+        let minimal = DeviceConfig::parse("[device]\ncodename = 'test'\n").unwrap();
+        assert!(!minimal.recovery.uses_legacy_fbe());
+        assert!(DeviceConfig::parse("[device]\ncodename = 'test'\n[recovery]\nlegacy_fbe = true\n").is_err());
+    }
 
     #[test]
     fn legacy_version_matches_the_reference_header_and_rejects_overflow() {
@@ -929,6 +1088,23 @@ mod tests {
             let s = format!("{resonance}\nstrength = {{ lightest = {lightest:?}, strongest = {strongest:?} }}");
             assert!(with(&s).is_err(), "{lightest} to {strongest} is refused");
         }
+    }
+
+    #[test]
+    fn timed_output_uses_one_backend_and_a_positive_drive() {
+        let with = |body: &str| DeviceConfig::parse(&format!(
+            "[device]\ncodename = \"x\"\n[haptics]\nstrength = {{ lightest = 0.5, strongest = 1.0 }}\n{body}\n"
+        ));
+        let driver = "timed_output = \"/sys/class/timed_output/vibrator\"";
+        let h = with(driver).unwrap().haptics.unwrap();
+        assert_eq!(h.timed_output.as_deref(), Some("/sys/class/timed_output/vibrator"));
+        assert_eq!(h.drive, 40);
+        for extra in ["click = 0", "resonance = \"/sys/frequency\"", "timed = \"/sys/class/leds/vibrator\"", "drive = 0"] {
+            assert!(with(&format!("{driver}\n{extra}")).is_err(), "{extra}");
+        }
+        assert!(with("timed_output = \"sys/vibrator\"").is_err());
+        assert!(with("timed_output = \"\"").is_err());
+        assert_eq!(with(&format!("{driver}\ndrive = 60")).unwrap().haptics.unwrap().drive, 60);
     }
 
     #[test]

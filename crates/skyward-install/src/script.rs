@@ -4,6 +4,67 @@
 
 use std::time::Duration;
 
+/// The persistent scratch folder older block-image updaters expect the
+/// recovery to prepare. The caller mounts the phone's real cache first:
+/// putting this only on rootfs cannot retain an interrupted update's stash.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn prepare_cache_dir(cache: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = cache.join("recovery");
+    std::fs::create_dir_all(&directory).with_context(|| format!("create {}", directory.display()))?;
+    // An existing directory on a read-only cache also passes create_dir_all.
+    // Refuse before the script can write firmware or boot partitions.
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
+    if unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("use {} for the install script's stash", directory.display()));
+    }
+    Ok(directory)
+}
+
+/// Recent statically linked Bionic updaters abort while initializing their
+/// random state if this kernel cannot clear a private mapping after fork.
+/// Detect the specific ELF diagnostic, not the ROM's Android version: old
+/// vendor kernels may backport the syscall behavior, while newer ones may not.
+#[cfg(any(target_os = "android", test))]
+fn needs_wipe_on_fork(binary: &[u8]) -> bool {
+    const DIAGNOSTIC: &[u8] = b"arc4random data MADV_WIPEONFORK failed";
+    binary.len() >= 64
+        && &binary[..7] == b"\x7fELF\x02\x01\x01"
+        && u16::from_le_bytes([binary[18], binary[19]]) == 183
+        && binary.windows(DIAGNOSTIC.len()).any(|window| window == DIAGNOSTIC)
+}
+
+/// Probe real behavior before installed services or partitions are released.
+/// Never fake success or patch out the updater's random-state protection.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn check_kernel(binary: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if !needs_wipe_on_fork(binary) {
+        return Ok(());
+    }
+    // The numeric Linux UAPI value is stable, including with older NDKs.
+    const MADV_WIPEONFORK: libc::c_int = 18;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    anyhow::ensure!(page > 0, "cannot determine page size for installer kernel check");
+    let page = page as usize;
+    let mapping = unsafe {
+        libc::mmap(std::ptr::null_mut(), page, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0)
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error()).context("allocate installer kernel-check mapping");
+    }
+    let result = unsafe { libc::madvise(mapping, page, MADV_WIPEONFORK) };
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    unsafe { libc::munmap(mapping, page); }
+    if let Some(error) = error {
+        anyhow::bail!("刷机包安装器需要 MADV_WIPEONFORK，但当前 recovery 内核无法提供（{error}）。需要支持该功能的兼容 recovery 内核，或由 ROM 维护者重编兼容安装器；本次尚未启动安装器。 / Installer requires MADV_WIPEONFORK; use a compatible recovery kernel or an updater rebuilt for this kernel. The installer has not been started.");
+    }
+    Ok(())
+}
+
 /// What a line the script wrote asks for.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Request {
@@ -103,6 +164,59 @@ impl Bar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn modern_bionic_updater() -> Vec<u8> {
+        let mut binary = vec![0; 64];
+        binary[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        binary[18..20].copy_from_slice(&183u16.to_le_bytes());
+        binary.extend_from_slice(b"arc4random data MADV_WIPEONFORK failed: %m\0");
+        binary
+    }
+
+    #[test]
+    fn kernel_preflight_only_matches_the_specific_arm64_bionic_elf() {
+        let binary = modern_bionic_updater();
+        assert!(needs_wipe_on_fork(&binary));
+        assert!(!needs_wipe_on_fork(b"#!/sbin/sh\n# arc4random data MADV_WIPEONFORK failed"));
+        assert!(!needs_wipe_on_fork(&binary[..63]));
+        let mut wrong_arch = binary.clone();
+        wrong_arch[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert!(!needs_wipe_on_fork(&wrong_arch));
+        let mut old_elf = binary;
+        old_elf.truncate(64);
+        assert!(!needs_wipe_on_fork(&old_elf));
+        assert!(check_kernel(&old_elf).is_ok());
+    }
+
+    #[test]
+    fn modern_bionic_kernel_probe_reports_the_actual_host_capability() {
+        // Either outcome is valid on a test host. Failure must explain the
+        // required recovery kernel rather than silently ignoring madvise.
+        if let Err(error) = check_kernel(&modern_bionic_updater()) {
+            assert!(error.to_string().contains("MADV_WIPEONFORK"));
+        }
+    }
+
+    #[test]
+    fn a_script_cache_is_prepared_without_removing_an_existing_stash() {
+        let cache = tempfile::tempdir().unwrap();
+        let recovery = prepare_cache_dir(cache.path()).unwrap();
+        assert!(recovery.is_dir());
+        let stash = recovery.join("interrupted-update");
+        std::fs::create_dir(&stash).unwrap();
+        std::fs::write(stash.join("0"), b"needed to resume").unwrap();
+        assert_eq!(prepare_cache_dir(cache.path()).unwrap(), recovery);
+        assert_eq!(std::fs::read(stash.join("0")).unwrap(), b"needed to resume");
+    }
+
+    #[test]
+    fn an_unusable_cache_directory_stops_preparation() {
+        let cache = tempfile::tempdir().unwrap();
+        let obstacle = cache.path().join("recovery");
+        std::fs::write(&obstacle, b"keep this").unwrap();
+        assert!(prepare_cache_dir(cache.path()).is_err());
+        assert_eq!(std::fs::read(&obstacle).unwrap(), b"keep this");
+    }
 
     #[test]
     fn requests_read_as_android_s_recovery_reads_them() {

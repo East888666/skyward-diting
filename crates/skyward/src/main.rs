@@ -9,8 +9,12 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "android")]
 mod backup;
+#[cfg(any(target_os = "android", test))]
+mod bundles;
 #[cfg(target_os = "android")]
 mod decrypt;
+#[cfg(any(target_os = "android", test))]
+mod directory;
 #[cfg(target_os = "android")]
 mod firmware;
 #[cfg(target_os = "android")]
@@ -128,6 +132,14 @@ enum Cmd {
     Services {
         #[arg(long, default_value = "/skyward/device.toml")]
         config: String,
+    },
+    /// Internal one-shot helper: only open the specified read-only loop.
+    #[cfg(target_os = "android")]
+    #[command(hide = true)]
+    ApexLoop {
+        file: PathBuf,
+        offset: u64,
+        length: u64,
     },
     /// Print what the installed system's partitions say to do to use the
     /// phone's keys, in order, and do none of it. A build of the hardware
@@ -275,6 +287,10 @@ fn main() -> Result<()> {
         Cmd::Recovery => recovery(),
         Cmd::Reboot { target } => {
             let p = Power::parse(&target).ok_or_else(|| anyhow!("unknown target {target:?}"))?;
+            if p == Power::Fastboot && skyward_config::ramdisk::in_recovery() {
+                let cfg = DeviceConfig::load(Path::new("/").join(ramdisk::CONFIG))?;
+                anyhow::ensure!(cfg.recovery.fastbootd, "userspace fastboot is disabled by this device configuration");
+            }
             skyward_sys::power(p)
         }
         Cmd::Bcb => {
@@ -433,6 +449,11 @@ fn main() -> Result<()> {
             Ok(())
         }
         #[cfg(target_os = "android")]
+        Cmd::ApexLoop { file, offset, length } => {
+            println!("{}", skyward_block::loopdev::attach(&file, offset, length)?.display());
+            Ok(())
+        }
+        #[cfg(target_os = "android")]
         Cmd::Data { close: true, .. } => {
             wipe::release_data()?;
             println!("the data partition is closed");
@@ -569,7 +590,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<k
     {
         skyward_sys::kmsg(&format!("logd not started: {e:#}"))?;
     }
-    if cfg.recovery.legacy_version.is_some() {
+    if cfg.recovery.uses_legacy_fbe() {
         // Establish the shared session ring before any service/decrypt
         // threads are created; old fscrypt searches the caller's keyrings.
         skyward_crypto::fscrypt::legacy_prepare_keyring()?;
@@ -629,6 +650,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<k
     hardware.extend(configured.iter().map(|s| s.name()).filter(|name| name.contains('@')));
     hardware.sort();
     hardware.dedup();
+    secure::prepare_bundles(programs())?;
     if !hardware.is_empty() {
         secure::prepare_hardware_directory(&hardware)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
@@ -849,6 +871,11 @@ fn recovery() -> Result<()> {
         let message = bcb::read(&misc)?;
         let mut request = message.request();
         if !request.work.lasts() {
+            bcb::clear(&misc)?;
+        }
+        if !cfg.recovery.fastbootd && request.work == bcb::Work::Fastboot {
+            skyward_sys::kmsg("ignored userspace fastboot request: disabled by device configuration")?;
+            request.work = bcb::Work::default();
             bcb::clear(&misc)?;
         }
         if !cfg.device.ab && matches!(request.work, bcb::Work::Fastboot | bcb::Work::WipeAb { .. } | bcb::Work::UnshareBlocks) {

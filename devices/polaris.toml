@@ -26,6 +26,9 @@ soc = { hans = "骁龙®845移动平台", hant = "Snapdragon® 845 行動平台"
 os_version_prop = "ro.build.version.incremental"
 
 [recovery]
+# No userspace fastboot on the supplied fixed-partition layout. Keep bootloader fastboot.
+# Requires the matching packer/runtime; omitted on other devices means enabled.
+fastbootd = false
 # Stock Android 10 otherwise loads Android 12's libc++ after /system_root
 # is mounted, breaking adb shell with missing _Unwind_RaiseException.
 ramdisk_libraries_first = true
@@ -176,6 +179,8 @@ filesystem = "ext4"
 options = "ro,barrier=1"
 extras = "wait,avb,formattable"
 
+# Legacy block-image ZIPs require skyward-install's script-cache preparation:
+# mount this partition AFTER detaching the installed system, then create /cache/recovery.
 [[fstab]]
 device = "/dev/block/bootdevice/by-name/cache"
 mount_point = "/cache"

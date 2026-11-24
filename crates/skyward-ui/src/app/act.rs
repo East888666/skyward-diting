@@ -82,6 +82,9 @@ impl App {
                 return vec![if row.mounted { Effect::Unmount(base) } else { Effect::Mount(base) }];
             }
             Action::RebootTarget(i) => {
+                if TARGETS.get(i).is_none_or(|t| *t == Target::Fastboot && !self.state.fastbootd) {
+                    return Vec::new();
+                }
                 self.state.reboot = i;
                 self.refresh();
             }
@@ -175,6 +178,7 @@ impl App {
                     self.refresh();
                 }
             }
+            Action::RebootTo(Target::Fastboot) if !self.state.fastbootd => return Vec::new(),
             Action::RebootTo(target) => return vec![Effect::Reboot(target)],
             Action::EnterRecovery => return vec![Effect::EnterRecovery],
             Action::Dismiss => {
@@ -881,7 +885,13 @@ impl App {
     pub(super) fn confirmed(&mut self, which: Confirm, now: u64) -> Vec<Effect> {
         let (l, mut fx) = (self.state.lang, Vec::new());
         match which {
-            Confirm::Reboot => fx.push(Effect::Reboot(TARGETS[self.state.reboot])),
+            Confirm::Reboot => {
+                if let Some(&target) = TARGETS.get(self.state.reboot) {
+                    if target != Target::Fastboot || self.state.fastbootd {
+                        fx.push(Effect::Reboot(target));
+                    }
+                }
+            }
             Confirm::Format => match self.state.format.is_empty() {
                 true => self.say(
                     l.pick(["请选择要格式化的分区", "請選擇要格式化的分割區", "Choose what to format"]),

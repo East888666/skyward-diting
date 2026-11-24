@@ -1063,9 +1063,9 @@ enum Incoming {
 /// the phone restarts into fastboot as from the reboot page; fastbootd asks
 /// for the recovery it runs in. A request that finds the recovery already
 /// where it asks to be, as when the keys left fastboot first, needs nothing.
-fn answer(request: Request, fastboot: bool) -> Vec<Effect> {
+fn answer(request: Request, fastboot: bool, enabled: bool) -> Vec<Effect> {
     match (request, fastboot) {
-        (Request::Fastboot, false) => vec![Effect::Reboot(Target::Fastboot)],
+        (Request::Fastboot, false) if enabled => vec![Effect::Reboot(Target::Fastboot)],
         (Request::Recovery, true) => vec![Effect::EnterRecovery],
         _ => Vec::new(),
     }
@@ -1597,7 +1597,11 @@ impl<'a> Pages<'a> {
         let info = skyward_info::collect_with(cfg, battery.unwrap_or_default())?;
         let fonts = Fonts::load(font, 0, mono)?;
         let mut surface =
-            Display::open(cfg.display.blocking_commits, cfg.display.pipelined_commits)?;
+            Display::open(
+                cfg.display.blocking_commits,
+                cfg.display.pipelined_commits,
+                cfg.display.fbdev_skip_initial_power_cycle,
+            )?;
         let (w, h) = surface.size();
         // A touch controller that follows the panel wakes as the panel goes
         // from rest to running, and at no other time. The recovery service
@@ -1640,6 +1644,7 @@ impl<'a> Pages<'a> {
         };
         let mut app = App::new(first, w, h, cfg.display.density as f32 / 160.0);
         app.set_screen_corners(cfg.display.corner_radius as f32);
+        app.set_fastbootd(cfg.recovery.fastbootd);
         // The settings kept from the starts before are back before the first
         // frame, and before file transfer starts with its switch and the time
         // zone. The pages speak the language chosen then, or else the one the
@@ -3233,7 +3238,7 @@ impl Pages<'_> {
                 Incoming::Drive(drive) => self.app.set_usb_drive(drive),
                 Incoming::Asked(asked) => {
                     skyward_sys::kmsg(&format!("asked on the recovery socket: {asked:?}"))?;
-                    answer(asked, self.fastboot)
+                    answer(asked, self.fastboot, self.cfg.recovery.fastbootd)
                 }
                 Incoming::Input(Event::Touch(t, at)) => self.app.touch(t, &self.fonts, at),
                 Incoming::Input(Event::Key(k, true)) => self.app.key(k, now),
@@ -3259,6 +3264,9 @@ impl Pages<'_> {
             // Leaving is the user's answer to whatever the request
             // still kept in misc asked.
             Effect::Reboot(target) => {
+                if target == Target::Fastboot && !self.cfg.recovery.fastbootd {
+                    return Ok(Vec::new());
+                }
                 self.done_with_request()?;
                 power(target)?
             }

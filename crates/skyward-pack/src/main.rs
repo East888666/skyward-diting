@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 mod avb;
 mod recovery;
+mod fastboot;
 mod described;
 
 use skyward_bootimg::{BootImage, Format, Ramdisk};
@@ -170,6 +171,12 @@ fn main() -> Result<()> {
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
             let cfg = skyward_config::DeviceConfig::load(&config)?;
+            let format = match cfg.recovery.ramdisk_compression {
+                None => format,
+                Some(skyward_config::RamdiskCompression::Gzip) => Format::Gzip,
+                Some(skyward_config::RamdiskCompression::Lz4) => Format::Lz4,
+                Some(skyward_config::RamdiskCompression::Lzma) => Format::Lzma,
+            };
             if let Some(version) = &cfg.recovery.legacy_version {
                 let abootimg_oxide::Header::V0(header) = &mut img.header else {
                     anyhow::bail!("legacy_version requires a v0-v2 recovery image");
@@ -222,12 +229,7 @@ fn main() -> Result<()> {
             let mtp_rc = if cfg.device.ab { paths::MTP_RC } else { "skyward-mtp.rc" };
             rd.add(mtp_rc, 0o644, MTP_RC.to_vec())?;
             if !cfg.device.ab {
-                let entry = rd.find("init.rc").context("legacy stock has no init.rc")?;
-                let mut init = String::from_utf8(entry.data.clone()).context("init.rc is not text")?;
-                if !init.contains(&format!("import /{mtp_rc}")) {
-                    init = format!("import /{mtp_rc}\n{init}");
-                    rd.replace("init.rc", init.into_bytes())?;
-                }
+                recovery::import_legacy_rc(&mut rd, mtp_rc)?;
                 // Older vendor rules bind their kernel MTP function before
                 // Skyward has supplied FunctionFS descriptors. Keep their
                 // plain ADB setup, but let Skyward own the combined port.
@@ -240,6 +242,7 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            fastboot::configure(&mut rd, cfg.recovery.fastbootd)?;
             // Remove stock assignments before setting recovery properties:
             // legacy init may publish read-only properties as it parses them.
             // Stock user-build adbd may still enforce authentication; adb_keys

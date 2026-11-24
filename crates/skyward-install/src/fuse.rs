@@ -81,6 +81,9 @@ const FILE_BLOCK: u32 = 64 * 1024;
 pub struct LocalFile {
     file: File,
     block_size: u64,
+    /// Capture what the source actually returned, without a separate
+    /// pre-read that could hide a first-read problem on a USB filesystem.
+    first_block_logged: bool,
 }
 
 impl LocalFile {
@@ -90,13 +93,25 @@ impl LocalFile {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let size = file.metadata().with_context(|| format!("look at {}", path.display()))?.len();
         let block_size = file_block(size);
-        Ok((LocalFile { file, block_size: u64::from(block_size) }, Offer { size, block_size }))
+        Ok((LocalFile { file, block_size: u64::from(block_size), first_block_logged: false }, Offer { size, block_size }))
     }
 }
 
 impl Source for LocalFile {
     fn read_block(&mut self, index: u64, out: &mut [u8]) -> Result<(), String> {
-        self.file.read_exact_at(out, index * self.block_size).map_err(|e| e.to_string())
+        self.file.read_exact_at(out, index * self.block_size).map_err(|e| e.to_string())?;
+        if index == 0 && !self.first_block_logged {
+            self.first_block_logged = true;
+            // identify already logs an unrecognised header after FUSE.
+            // Keeping the source's first successful read distinguishes
+            // zeros from the source from zeros introduced while serving it.
+            let _ = skyward_sys::kmsg(&format!(
+                "install: local source block 0, {} bytes: first bytes {:02x?}",
+                out.len(),
+                &out[..out.len().min(16)]
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -586,6 +601,35 @@ mod tests {
         let (_, body) = split(server.handle(&read_request(131_072, 65_536), &mut fetch).unwrap());
         assert_eq!(body[..18_928], content[131_072..]);
         assert!(body[18_928..].iter().all(|&b| b == 0), "zeros past the end");
+    }
+
+    #[test]
+    fn a_local_package_over_two_gib_keeps_its_header_and_high_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-package.zip");
+        let file = File::options().read(true).write(true).create_new(true).open(&path).unwrap();
+        let size = 2_230_129_483u64;
+        let boundary = 1u64 << 31;
+        file.set_len(size).unwrap();
+        file.write_all_at(b"PK\x03\x04polaris-test", 0).unwrap();
+        file.write_all_at(b"across-2gib-boundary", boundary - 8).unwrap();
+        file.write_all_at(b"zip-tail", size - 8).unwrap();
+
+        let (mut source, offer) = LocalFile::open(&path).unwrap();
+        assert_eq!(offer, Offer { size, block_size: FILE_BLOCK });
+        let mut server = Server::new(offer);
+        let mut fetch = |index, out: &mut [u8]| source.read_block(index, out);
+        // Exercise the first uncached read, reads across 2 GiB, EOF,
+        // and the header again after the one-block cache has moved on.
+        for (offset, count) in [(0, 4096), (boundary - 16, 64), (boundary, 4096), (size - 8, 32), (0, 4096)] {
+            let (header, body) = split(server.handle(&read_request(offset, count), &mut fetch).unwrap());
+            assert_eq!(header.error, 0);
+            let mut expected = vec![0; count as usize];
+            let present = (size - offset).min(u64::from(count)) as usize;
+            file.read_exact_at(&mut expected[..present], offset).unwrap();
+            assert_eq!(body, expected, "read at {offset}");
+        }
+        assert_eq!(server.fault(), None);
     }
 
     #[test]

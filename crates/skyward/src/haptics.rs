@@ -58,6 +58,8 @@ enum Motor {
     /// how long the drive lasts; the `brightness` file such a folder usually
     /// carries does nothing at all, its driver's own setter being empty.
     Timed { folder: PathBuf, drive: u32 },
+    /// Legacy Android timed_output: write milliseconds directly to enable.
+    TimedOutput { folder: PathBuf, drive: u32 },
 }
 
 /// What a click is, for a driver that plays waveforms or samples.
@@ -85,8 +87,8 @@ impl Haptics {
     /// force-feedback driver's queue with what it plays, so the click is
     /// loaded only as it is played.
     pub fn open(cfg: &skyward_config::Haptics) -> Result<Haptics> {
-        let motor = match (cfg.click, &cfg.resonance, &cfg.timed) {
-            (Some(id), file, _) => {
+        let motor = match (cfg.click, &cfg.resonance, &cfg.timed, &cfg.timed_output) {
+            (Some(id), file, _, _) => {
         let (path, dev) = events()?;
         let ticks = match file {
                     Some(file) => {
@@ -108,7 +110,7 @@ impl Haptics {
                     ticks,
                 }
             }
-            (None, Some(file), _) => {
+            (None, Some(file), _, _) => {
                 let (path, dev) = events()?;
                 let hz = resonance(file)?;
                 eprintln!("haptics {}: clicks and ticks made for a motor swinging at {hz} Hz", path.display());
@@ -119,7 +121,7 @@ impl Haptics {
                     }),
                 }
             }
-            (None, None, Some(folder)) => {
+            (None, None, Some(folder), None) => {
                 let folder = PathBuf::from(folder);
                 ensure!(
                     folder.is_dir(),
@@ -136,7 +138,20 @@ impl Haptics {
                     drive: cfg.drive,
                 }
             }
-            (None, None, None) => unreachable!("the configuration names a click of one kind"),
+            (None, None, None, Some(folder)) => {
+                let folder = PathBuf::from(folder);
+                ensure!(
+                    folder.join("enable").is_file(),
+                    "{} has no timed_output enable file",
+                    folder.display()
+                );
+                eprintln!(
+                    "haptics {}: timed_output clicks of at most {} ms",
+                    folder.display(), cfg.drive
+                );
+                Motor::TimedOutput { folder, drive: cfg.drive }
+            }
+            _ => unreachable!("the configuration names a click of one kind"),
         };
         Ok(Haptics {
             motor, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
@@ -214,6 +229,14 @@ impl Motor {
                 write_at(folder, "activate", "1").context("ask the driver to start the drive")?;
                 Ok((Taking::Drive, Duration::from_millis(u64::from(ms))))
             }
+            Motor::TimedOutput { folder, drive } => {
+                // Keep the driver's own voltage and waveform settings.
+                // The strength slider changes only the drive duration.
+                let ms = (*drive as f32 * share).round().max(1.0) as u32;
+                write_at(folder, "enable", &ms.to_string())
+                    .with_context(|| format!("start a timed_output drive of {ms} ms"))?;
+                Ok((Taking::Drive, Duration::from_millis(u64::from(ms))))
+            }
         }
     }
 
@@ -222,6 +245,7 @@ impl Motor {
         match (self, taking) {
             (Motor::Events { dev, .. }, Taking::Slot(slot)) => erase(dev, slot),
             (Motor::Timed { folder, .. }, Taking::Drive) => write_at(folder, "activate", "0"),
+            (Motor::TimedOutput { folder, .. }, Taking::Drive) => write_at(folder, "enable", "0"),
             // A click of one motor taken away from the other is no click at
             // all playing, and there is nothing to stop.
             _ => Ok(()),
@@ -237,6 +261,10 @@ impl Motor {
                 ticks: ticks.clone(),
             },
             Motor::Timed { folder, drive } => Motor::Timed {
+                folder: folder.clone(),
+                drive: *drive,
+            },
+            Motor::TimedOutput { folder, drive } => Motor::TimedOutput {
                 folder: folder.clone(),
                 drive: *drive,
             },

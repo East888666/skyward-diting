@@ -137,6 +137,8 @@ pub struct State {
     pub drive: Folder,
     /// The entry the file page describes.
     pub file: Option<FileRow>,
+    /// Whether userspace fastboot is available on this device.
+    pub fastbootd: bool,
     pub fastboot: Fastboot,
     pub erase: Erase,
     pub asked: Asked,
@@ -259,6 +261,7 @@ impl Default for State {
             usb_drive: None,
             drive: Folder::new(""),
             file: None,
+            fastbootd: true,
             fastboot: Fastboot {
                 running: false,
                 link: UsbLink::Unplugged,
