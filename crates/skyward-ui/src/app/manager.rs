@@ -8,8 +8,8 @@ pub const USB_DRIVE: &str = "/mnt/usb";
 
 /// What a USB drive plugged in that cannot be read is said to be, and what
 /// is asked for while none is plugged in.
-pub const USB_DRIVE_UNREADABLE: Text = ["无法读取该 U 盘", "無法讀取這個 USB 隨身碟", "This USB drive can't be read"];
-pub const USB_DRIVE_WANTED: Text = ["请通过 OTG 连接 U 盘", "請透過 OTG 連接 USB 隨身碟", "Connect a USB drive through OTG"];
+pub const USB_DRIVE_UNREADABLE: Text = texts::usb_drive::UNREADABLE;
+pub const USB_DRIVE_WANTED: Text = texts::usb_drive::WANTED;
 
 /// Where a file to install is chosen from, and where backups go and are
 /// found.
@@ -258,9 +258,9 @@ impl App {
         let job = self.state.job.as_mut().expect("only work under way ends");
         job.stopping = false;
         let done = match (&end, &job.task) {
-            (JobEnd::Done, FileTask::Copy { .. }) => Some(["已复制", "已複製", "Copied"]),
-            (JobEnd::Done, FileTask::Move { .. }) => Some(["已移动", "已移動", "Moved"]),
-            (JobEnd::Done, FileTask::Delete { .. }) => Some(["已删除", "已刪除", "Deleted"]),
+            (JobEnd::Done, FileTask::Copy { .. }) => Some(texts::toast::COPIED),
+            (JobEnd::Done, FileTask::Move { .. }) => Some(texts::toast::MOVED),
+            (JobEnd::Done, FileTask::Delete { .. }) => Some(texts::toast::DELETED),
             _ => None,
         };
         job.outcome = Some(end);
@@ -583,7 +583,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = in_sdcard(&f, &i);
         tap(&mut app, &f, &i, Action::OpenEntry(1));
-        app.install(Event::Image { kind: ImageKind::Dtbo, size: 1 << 20, partitions: vec!["dtbo"] }, 0);
+        app.install(Event::Image { kind: ImageKind::Dtbo, size: 1 << 20, partitions: slotted(&["dtbo"]) }, 0);
         assert_eq!(app.key(Key::Back, 1000), vec![Effect::Cancel]);
         assert_eq!(app.screen(), Screen::Files);
         assert!(tap_at(&mut app, &f, &i, Action::OpenEntry(1), 2000).is_empty());
@@ -654,7 +654,7 @@ mod tests {
     fn a_long_folder_scrolls_to_its_last_entry_in_one_list() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
-        let many: Vec<FileRow> = (0..5000).map(|k| entry(&format!("IMG_{k:05}.jpg"), FileKind::File)).collect();
+        let many = Vec::from_fn(5000, |k| entry(&format!("IMG_{k:05}.jpg"), FileKind::File));
         app.set_files("/sdcard/DCIM/Camera".into(), Ok(many), LISTED);
         let rows = app.frame(&f, &i).rows.as_ref().expect("the entries are listed").count();
         assert_eq!(rows, 5000, "every entry has its row");
@@ -675,7 +675,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Files));
-        let folders: Vec<FileRow> = (0..300).map(|k| entry(&format!("dir{k:03}"), folder(k))).collect();
+        let folders = Vec::from_fn(300, |k| entry(&format!("dir{k:03}"), folder(k)));
         app.set_files("/".into(), Ok(folders.clone()), LISTED);
         app.frame(&f, &i);
         scroll_to(&mut app, &f, 9000.0, 0);
@@ -694,7 +694,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Files));
-        let folders: Vec<FileRow> = (0..300).map(|k| entry(&format!("dir{k:03}"), folder(k))).collect();
+        let folders = Vec::from_fn(300, |k| entry(&format!("dir{k:03}"), folder(k)));
         app.set_files("/".into(), Ok(folders.clone()), LISTED);
         app.frame(&f, &i);
         scroll_to(&mut app, &f, 9000.0, 0);
@@ -721,7 +721,7 @@ mod tests {
     fn the_path_goes_up_from_its_capsules_even_held_under_the_bar() {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Files, W, H, PPD);
-        let many: Vec<FileRow> = (0..200).map(|k| entry(&format!("lib{k:03}.so"), FileKind::File)).collect();
+        let many = Vec::from_fn(200, |k| entry(&format!("lib{k:03}.so"), FileKind::File));
         app.set_files("/system/lib64".into(), Ok(many), LISTED);
         assert_eq!(tap(&mut app, &f, &i, Action::OpenAncestor(1)), vec![Effect::ReadDir("/system".into())]);
         scroll_to(&mut app, &f, 6000.0, 0);
@@ -746,7 +746,7 @@ mod tests {
         let (f, i) = (fonts(), info());
         let mut app = App::new(Screen::Advanced, W, H, PPD);
         tap(&mut app, &f, &i, Action::Open(Screen::Files));
-        let folders: Vec<FileRow> = (0..300).map(|k| entry(&format!("dir{k:03}"), folder(k))).collect();
+        let folders = Vec::from_fn(300, |k| entry(&format!("dir{k:03}"), folder(k)));
         app.set_files("/".into(), Ok(folders.clone()), LISTED);
         app.frame(&f, &i);
         press(&mut app, Key::VolumeDown, 0);

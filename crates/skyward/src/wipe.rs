@@ -131,8 +131,8 @@ pub enum Refusal {
     /// An update the system has still to finish.
     Update(Hold),
     /// The system does not make an emptied data partition afresh: the
-    /// phone's table does not have it encrypted whole, with its key in
-    /// /metadata, and formattable.
+    /// phone's table does not call it formattable, or has it encrypted
+    /// whole and does not say where its key is kept.
     NotRebuilt,
     /// The phone has no cache partition.
     NoCache,
@@ -196,7 +196,7 @@ pub fn factory_reset(reformat: Option<String>) -> Result<Plan, Stop> {
         let reformat = match reformat {
             Some(fs) => Some(fs),
             None if !formattable => return Ok(Err(Refusal::NotRebuilt)),
-            None if data.extra("keydirectory").is_some() => None,
+            None if data.extra("metadata_encryption").is_some() && data.extra("keydirectory").is_some() => None,
             None => Some(data.filesystem.clone()),
         };
         let _ = skyward_sys::kmsg(&format!(
@@ -332,13 +332,13 @@ impl Plan {
 
     /// Erase each part, telling `tell` of each as it begins. The programs
     /// holding the data partition end and the partition is closed; then it
-    /// is discarded whole, and the system makes it afresh under a new key
-    /// the next time it starts. Asked for another filesystem, every part is
-    /// made afresh as it here instead, as Android's own recovery makes them:
-    /// the data partition on the partition itself, which a system that
-    /// encrypts it whole encrypts again as it next starts. Unless
-    /// `keep_memtag_mode`, the memory tagging asked of the bootloader is
-    /// forgotten too.
+    /// is discarded whole, and the system makes it afresh the next time it
+    /// starts, under a new key where it encrypts it. Asked for another
+    /// filesystem, every part is made afresh as it here instead, as
+    /// Android's own recovery makes them: the data partition on the
+    /// partition itself, which a system that encrypts it whole encrypts
+    /// again as it next starts. Unless `keep_memtag_mode`, the memory
+    /// tagging asked of the bootloader is forgotten too.
     pub fn carry_out(self, keep_memtag_mode: bool, tell: &mut dyn FnMut(Event)) -> Result<(), Stop> {
         tell(Event::At(Step::Data));
         // The second system's boot set, and what keeps it, go with the data

@@ -577,7 +577,7 @@ impl App {
         if let Some((keys, top)) = &morph.keyboard {
             out.put(keys, (*top as f32 + (1.0 - q) * keys.h as f32).round() as i32);
         }
-        widgets::search_capsule(out, &t, f, bar, self.state.lang.pick(pages::SEARCH_HINT));
+        widgets::search_capsule(out, &t, f, bar, self.state.lang.pick(texts::search::HINT));
         // The cursor shows from the start, going up with the field.
         if let Some(caret) = frame.caret.as_ref().filter(|_| morph.into && caret_on) {
             out.lay(&caret.art, caret.x, caret.y + (bar.y - field.y).round() as i32, 1.0);
@@ -683,6 +683,7 @@ mod tests {
             Screen::Terminal,
             Screen::Language,
             Screen::TimeZone,
+            Screen::TimeZones(Region::Asia),
             Screen::Logs,
             Screen::Update,
             Screen::SkywardUpdate,

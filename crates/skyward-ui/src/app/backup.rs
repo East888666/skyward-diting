@@ -3,12 +3,19 @@
 use super::*;
 
 /// What a backup can take, in the order the backup page lists it.
-pub const BACKUP_PARTS: [Text; 4] = [
-    ["启动分区", "啟動分割區", "Boot partitions"],
-    ["系统分区", "系統分割區", "System partitions"],
-    ["data 分区", "data 分割區", "data partition"],
-    ["基带与 EFS", "基頻與 EFS", "Modem and EFS"],
+pub const BACKUP_PARTS: [Text; 5] = [
+    texts::backup::part::BOOT,
+    texts::backup::part::SYSTEM,
+    texts::backup::part::DATA,
+    texts::backup::part::MEDIA,
+    texts::backup::part::MODEM,
 ];
+
+/// Where the data partition's files and the users' own in internal storage
+/// are among [`BACKUP_PARTS`]: both are read and written only with every
+/// user's files open.
+pub const DATA_PART: usize = 2;
+pub const MEDIA_PART: usize = 3;
 
 /// A backup found in a place's Skyward/backups folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,9 +106,10 @@ pub enum BackupRefusal {
     /// This partition is not the size it was backed up at, as after an
     /// update.
     Resized(String),
-    /// The data partition has been made afresh since the backup, as a
-    /// factory reset makes it: the files backed up would not open in it.
-    DataReset,
+    /// The data partition was backed up on a newer Android than the phone
+    /// runs, which does not read its files: the release the backup was
+    /// made on, and the phone's.
+    OlderAndroid { was: String, now: String },
 }
 
 impl App {
@@ -166,11 +174,11 @@ impl App {
                     self.settle_page();
                 }
                 self.refresh();
-                self.say(self.state.lang.pick(["已删除", "已刪除", "Deleted"]), now);
+                self.say(self.state.lang.pick(texts::toast::DELETED), now);
                 vec![self.find_backups()]
             }
             Err(why) => {
-                self.report(&tr!(self.state.lang, "删除失败：{why}", "刪除失敗：{why}", "Couldn't delete it: {why}"), now);
+                self.report(&texts::files::job::delete_failed(self.state.lang, why), now);
                 Vec::new()
             }
         }
@@ -261,7 +269,7 @@ fn found(place: Place, made: i64, names: &[&str]) -> BackupEntry {
     };
     BackupEntry {
         place,
-        name: fmt::stamp(made, 0),
+        name: fmt::stamp(made, State::default().zone()),
         held: Ok(held),
     }
 }
@@ -322,7 +330,7 @@ fn a_backup_found_opens_to_choose_what_to_restore() {
     tap(&mut app, &f, &i, Action::RestorePart(1));
     let opened = app.state.restore.as_ref().expect("the page of a backup opened");
     assert_eq!(BackupChoice::chosen(&opened.1), ticked(&["boot", "modem"]));
-    let name = fmt::stamp(1_792_348_260, 0);
+    let name = fmt::stamp(1_792_348_260, State::default().zone());
     assert_eq!(
         swipe(&mut app, &f, &i, Confirm::Restore),
         vec![Effect::Restore {
@@ -574,8 +582,4 @@ impl App {
 /// What a backup is told where the phone has no shared storage to write
 /// into: the data partition made afresh has none until its own system has
 /// started once, and what `/sdcard` is meanwhile belongs to the recovery.
-pub const NO_SHARED_STORAGE: Text = [
-    "本机还没有内部存储：/sdcard 只是恢复模式内存盘里的一个目录。请先把系统开机一次，让它建立内部存储，或改用 U 盘备份。",
-    "本機還沒有內部儲存：/sdcard 只是復原模式記憶體碟裡的一個目錄。請先開機一次讓系統建立內部儲存，或改用 U 盤備份。",
-    "This phone has no shared storage yet: /sdcard is only a folder of the recovery's own ramdisk. Start its system once so it makes the shared storage, or back up to a USB drive.",
-];
+pub const NO_SHARED_STORAGE: Text = crate::lang::legacy("本机还没有内部存储：/sdcard 只是恢复模式内存盘里的一个目录。请先把系统开机一次，让它建立内部存储，或改用 U 盘备份。", "本機還沒有內部儲存：/sdcard 只是復原模式記憶體碟裡的一個目錄。請先開機一次讓系統建立內部儲存，或改用 U 盤備份。", "This phone has no shared storage yet: /sdcard is only a folder of the recovery's own ramdisk. Start its system once so it makes the shared storage, or back up to a USB drive.");

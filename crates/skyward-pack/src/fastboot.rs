@@ -116,26 +116,15 @@ fn without_fastboot(text: &str, services: &BTreeSet<String>) -> String {
         // The legacy gadget can advertise several FunctionFS aliases in
         // one command. Remove only fastboot and keep ADB's alias.
         if command == "write"
-            && fields
-                .get(1)
-                .is_some_and(|path| path.ends_with("/f_ffs/aliases"))
+            && fields.get(1).is_some_and(|path| path.ends_with("/f_ffs/aliases"))
+            && let Some(value) = fields.get(2).filter(|v| v.split(',').any(|v| v == "fastboot"))
         {
-            if let Some(value) = fields
-                .get(2)
-                .filter(|v| v.split(',').any(|v| v == "fastboot"))
-            {
-                let kept: Vec<_> = value.split(',').filter(|v| *v != "fastboot").collect();
-                if !kept.is_empty() {
-                    let indent = &line[..line.len() - line.trim_start().len()];
-                    out.push_str(&format!(
-                        "{indent}write {} {}
-",
-                        fields[1],
-                        kept.join(",")
-                    ));
-                }
-                continue;
+            let kept: Vec<_> = value.split(',').filter(|v| *v != "fastboot").collect();
+            if !kept.is_empty() {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(&format!("{indent}write {} {}\n", fields[1], kept.join(",")));
             }
+            continue;
         }
         if fields.iter().any(|word| {
             word.contains("/usb-ffs/fastboot") || word.contains("/functions/ffs.fastboot")

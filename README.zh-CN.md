@@ -32,13 +32,15 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 
 刷机包的安装脚本可以使用 `7za` 和 `zstd`，支持刷入 super 镜像使用 zstd 压缩的第三方 ROM；`unzip -p` 边解压边输出镜像。安装脚本还可以使用 `avbctl` 关闭验证启动的校验，使用 `resetprop` 读取和设置属性。
 
+分区镜像按内容识别：boot、init_boot、vendor_boot、recovery、dtbo、vbmeta 和整个 super 的镜像各自刷入对应的分区；包含 erofs、ext4 或 f2fs 文件系统的镜像可以刷入当前槽位在 super 中的任何一个逻辑分区，刷入前这个逻辑分区会调整为镜像的大小，和 fastbootd 的做法相同。内容无法识别的镜像按文件名刷入同名的分区，例如 `modem.img` 刷入 modem，这个分区必须在两个槽位各有一份，或者是 super 中的逻辑分区。sparse 格式的镜像在刷入时展开。系统更新尚未合并的时候，暂不刷入 super 和其中的逻辑分区。
+
 ### 在线更新
 
 ![系统和 Skyward 都能在线更新](slides/zh-CN/out/05-updates.png)
 
 ### 备份和恢复
 
-![系统、应用和 IMEI 都可以备份](slides/zh-CN/out/06-backup.png)
+![系统、应用、照片和 IMEI 都可以备份](slides/zh-CN/out/06-backup.png)
 
 ### 文件管理
 
@@ -75,7 +77,8 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 ### 其他功能
 
 - 重启到系统、recovery、fastboot、bootloader 和 EDL，切换启动槽位
-- 浅色和深色模式，简体中文、繁体中文和英文
+- 浅色和深色模式
+- 15 种语言：简体中文、繁體中文、English、Türkçe、Русский、Українська、Español、Português (Brasil)、Bahasa Indonesia、Tiếng Việt、Deutsch、Français、Italiano、Polski 和日本語。系统语言在这些语言之中时，Skyward 启动后使用系统语言，其他情况使用英文
 
 ### 没有系统时
 
@@ -87,6 +90,7 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 | --- | --- | --- |
 | 小米 17 Ultra | `nezha` | OS4.0.4.0.XPACNXM（Android 17） |
 | 小米 13 Ultra | `ishtar` | OS3.0.308.0.WMACNXM（Android 16） |
+| REDMI K60 Pro | `socrates` | OS4.0.0.24.XMKCNXM（Android 17） |
 
 ### 🚧 施工中
 
@@ -119,8 +123,8 @@ Skyward 是使用 Rust 编写的 recovery，从零开始编写。
 Skyward 需要已解锁的 bootloader。从 [Releases](https://github.com/kirklin/skyward/releases) 下载对应机型的 zip，每个文件都标有机型和代号，例如 Xiaomi 17 Ultra (nezha)。使用 `SHA256SUMS` 核对并解压之后，在手机处于 fastboot 模式的时候，把其中的镜像刷入当前运行槽位的 recovery 分区：
 
 ```sh
-unzip skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.zip
-fastboot flash recovery skyward-v0.3.1-nezha-OS4.0.4.0.XPACNXM.img
+unzip skyward-v0.5.1-nezha-OS4.0.4.0.XPACNXM.zip
+fastboot flash recovery skyward-v0.5.1-nezha-OS4.0.4.0.XPACNXM.img
 fastboot reboot recovery
 ```
 
@@ -205,7 +209,7 @@ cargo ndk -t arm64-v8a --platform 30 clippy --workspace --all-targets -- -D warn
 名称以 `on_the_phone` 开头的测试会创建文件系统、挂载分区、设置加密密钥，这些操作只有手机能够完成。把一台已经进入 Skyward、数据分区已经打开的手机通过 adb 连接到电脑，`cargo ndk` 会把每个测试程序推送到手机上运行，测试逐个执行：
 
 ```sh
-cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-mtp on_the_phone -- --test-threads=1
+cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward-files -p skyward-install -p skyward-mtp -p skyward-vab on_the_phone -- --test-threads=1
 ```
 
 `skyward-preview` 无需手机，在电脑上把页面绘制成 PNG 文件：每个页面完整绘制成长截图的样子，覆盖它可能处于的各种状态，另外还有触摸和动画过程中某些时刻的屏幕。`--lang` 按照地区代码选择语言，例如 `en` 或者 `zh-TW`：
@@ -213,6 +217,12 @@ cargo ndk -t arm64-v8a --platform 30 test -p skyward -p skyward-block -p skyward
 ```sh
 cargo run --release -p skyward-preview -- target/preview --lang en
 ```
+
+### 翻译
+
+每种语言的文字是 `crates/skyward-ui/locales` 里的一个文件，以地区代码命名，例如 `tr.toml`、`pt-BR.toml`。`en.toml` 是参照文件，每条文字上方的注释说明它显示在哪里。构建时会读取全部文件，缺少某条文字，或者花括号里的名称和英文不一致，构建就会停止。
+
+修正翻译时，直接修改对应语言文件里的文字。用 `skyward-preview --lang` 把页面按这种语言绘制出来检查效果：每绘制完一个页面，它会列出这个页面上显示不下的文字：`cut short in` 是以省略号结尾的文字，`set at 80% in` 是为了放进按键、按钮或滑动条而缩小了字号的文字，`past the edge in` 是超出屏幕的文字，`overlap in` 是互相重叠的两段文字。
 
 ## 许可证
 

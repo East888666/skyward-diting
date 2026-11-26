@@ -1,4 +1,4 @@
-use crate::waveform::{made, share, ticks, RATE, TICKS_RATE};
+use crate::waveform::{made, scaled, share, ticks, RATE, TICKS_RATE};
 use anyhow::{anyhow, ensure, Context, Result};
 use evdev::raw_stream::RawDevice;
 use skyward_config::Strength;
@@ -32,6 +32,7 @@ const TICKS_REST: Duration = Duration::from_millis(40);
 pub struct Haptics {
     motor: Motor,
     strength: Strength,
+    scale_samples: bool,
     /// The click playing, by what takes it away and its count, until it is
     /// taken away; a click taken away early by the next is not taken away
     /// again.
@@ -154,7 +155,7 @@ impl Haptics {
             _ => unreachable!("the configuration names a click of one kind"),
         };
         Ok(Haptics {
-            motor, strength: cfg.strength, playing: Arc::new(Mutex::new(None)), clicks: 0 })
+            motor, strength: cfg.strength, scale_samples: cfg.scale_samples, playing: Arc::new(Mutex::new(None)), clicks: 0 })
     }
 
     /// One short click at the strength the slider's `position` gives, after
@@ -176,7 +177,7 @@ impl Haptics {
         if let Some((taking, _)) = playing.take() {
             self.motor.stop(taking).context("take away the click still playing")?;
         }
-        let (taking, length) = self.motor.start(ticks, share)?;
+        let (taking, length) = self.motor.start(ticks, share, self.scale_samples)?;
         self.clicks += 1;
         let this = (taking, self.clicks);
         *playing = Some(this);
@@ -203,7 +204,7 @@ impl Motor {
     /// Play the click, or the ticks of the screen going off, once at
     /// `share` of its full strength, saying what takes it away and how
     /// long it plays.
-    fn start(&self, ticks: bool, share: f32) -> Result<(Taking, Duration)> {
+    fn start(&self, ticks: bool, share: f32, scale_samples: bool) -> Result<(Taking, Duration)> {
         match self {
             Motor::Events {
                 dev,
@@ -211,7 +212,7 @@ impl Motor {
                 ticks: tick,
             } => {
                 let effect = if ticks { tick.as_ref().unwrap_or(click) } else { click };
-        let loaded = upload(dev, effect, share).context("load the click")?;
+        let loaded = upload(dev, effect, share, scale_samples).context("load the click")?;
         play(dev, loaded.slot).context("play the click")?;
                 // The driver keeps the ticks playing after their samples
                 // run out; the motor comes to rest on its own first.
@@ -340,8 +341,16 @@ struct Samples {
 
 /// Load `click` at `share` of its full strength as a custom periodic
 /// effect in a slot of its own. The driver drives the motor at the click's
-/// highest voltage times the magnitude.
-fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
+/// highest voltage times the magnitude; where it is given the strength in
+/// the samples it plays, `scale_samples`, they are made that share of
+/// themselves and the magnitude is the full one.
+fn upload(dev: &File, click: &Click, share: f32, scale_samples: bool) -> Result<Loaded> {
+    let share = share.clamp(0.0, 1.0);
+    // Kept until the driver has copied what the effect points to.
+    let lighter = match click {
+        Click::Samples { data, .. } if scale_samples => Some(scaled(data, share)),
+        _ => None,
+    };
     // The driver tells the two kinds apart by the length in bytes of what
     // the effect points to, and loads nothing for any other length, though
     // the upload still succeeds. For a waveform it keeps it reads the
@@ -357,15 +366,14 @@ fn upload(dev: &File, click: &Click, share: f32) -> Result<Loaded> {
         Click::Samples { data, rate } => {
             samples.length = u32::try_from(data.len())?;
             samples.rate = *rate;
-            samples.data = data.as_ptr();
-            (std::mem::size_of::<Samples>(), (&mut samples as *mut Samples).cast::<i16>(),
-            )
+            samples.data = lighter.as_deref().unwrap_or(data).as_ptr();
+            (std::mem::size_of::<Samples>(), (&mut samples as *mut Samples).cast::<i16>())
         }
     };
     let periodic = libc::ff_periodic_effect {
         waveform: FF_CUSTOM,
         period: 0,
-        magnitude: (share.clamp(0.0, 1.0) * f32::from(i16::MAX)).round() as i16,
+        magnitude: if lighter.is_some() { i16::MAX } else { (share * f32::from(i16::MAX)).round() as i16 },
         offset: 0,
         phase: 0,
         envelope: libc::ff_envelope { attack_length: 0, attack_level: 0, fade_length: 0, fade_level: 0 },

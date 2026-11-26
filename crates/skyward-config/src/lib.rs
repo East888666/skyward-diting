@@ -283,6 +283,13 @@ pub struct Firmware {
     /// without child mounts, or mounting it read-only while the file is read.
     #[serde(default)]
     pub partition: Option<String>,
+    /// Whether the phone may be without the file, as it is without the
+    /// MAC address until its own system has written one into the folder
+    /// its init makes for it: the driver then starts without the file, as
+    /// it does in the phone's own system. Any other failure to read it
+    /// still ends bringing the WLAN up.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// The phone maker's update server, which the stock updater asks about the
@@ -399,6 +406,12 @@ pub struct Haptics {
     #[serde(default = "Haptics::shortest_drive")]
     pub drive: u32,
     pub strength: Strength,
+    /// Whether the strength goes into the samples made, each made that
+    /// share of itself and played at the driver's full magnitude, on
+    /// phones whose driver plays samples at only two strengths whatever
+    /// magnitude between none and the full one it is given.
+    #[serde(default)]
+    pub scale_samples: bool,
 }
 
 impl Haptics {
@@ -967,7 +980,9 @@ mod tests {
         }
         let wayne = DeviceConfig::parse(include_str!("../../../devices/wayne.toml")).unwrap();
         assert!(wayne.display.fbdev_skip_initial_power_cycle);
-        assert_eq!(wayne.haptics.unwrap().click, Some(0));
+        let haptics = wayne.haptics.unwrap();
+        assert_eq!(haptics.click, None);
+        assert_eq!(haptics.timed_output.as_deref(), Some("/sys/class/timed_output/vibrator"));
         let polaris = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
         assert!(!polaris.display.fbdev_skip_initial_power_cycle);
     }
@@ -1094,6 +1109,16 @@ mod tests {
         let haptics = cfg.haptics.expect("the 13 Ultra has a motor");
         assert_eq!((haptics.click, haptics.resonance.as_deref()), (Some(0), Some("/sys/class/qcom-haptics/lra_frequency_hz")));
         assert_eq!(haptics.strength, Strength { lightest: 0.5, strongest: 1.0 });
+        assert!(!haptics.scale_samples, "its strength is the magnitude its driver is given");
+    }
+
+    #[test]
+    fn socrates_clicks_with_samples_made_as_strong_as_the_slider_says() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/socrates.toml")).unwrap();
+        let haptics = cfg.haptics.expect("the K60 Pro has a motor");
+        assert_eq!((haptics.click, haptics.resonance.as_deref()), (None, Some("/sys/class/qcom-haptics/lra_frequency_hz")));
+        assert_eq!(haptics.strength, Strength { lightest: 0.15, strongest: 1.0 });
+        assert!(haptics.scale_samples, "its driver plays samples at two strengths alone");
     }
 
     #[test]
@@ -1289,6 +1314,7 @@ codename = "sample"
             (include_str!("../../../devices/diting.toml"), "OS3.0.3.0.VLFCNXM"),
             (include_str!("../../../devices/fuxi.toml"), "OS3.0.309.0.WMCCNXM"),
             (include_str!("../../../devices/nuwa.toml"), "OS3.0.312.0.WMBCNXM"),
+            (include_str!("../../../devices/socrates.toml"), "OS3.0.304.0.WMKCNXM"),
             (include_str!("../../../devices/houji.toml"), "OS3.0.307.0.WNCCNXM"),
             (include_str!("../../../devices/shennong.toml"), "OS3.0.309.0.WNBCNXM"),
             (include_str!("../../../devices/aurora.toml"), "OS3.0.308.0.WNACNXM"),
@@ -1440,6 +1466,22 @@ codename = "sample"
         assert!(with("{ name = \"a.ini\", path = \"vendor/etc/a.ini\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"persist\", path = \"/kiwi/mac.bin\" }").is_err());
         assert!(with("{ name = \"mac.bin\", partition = \"by-name/persist\", path = \"mac.bin\" }").is_err());
+        let file = |file: &str| with(file).unwrap().wlan.unwrap().firmware.remove(0);
+        assert!(!file("{ name = \"wlan/a.ini\", path = \"/vendor/etc/a.ini\" }").optional, "a phone has each file unless it is said it may not");
+        assert!(file("{ name = \"wlan/mac.bin\", partition = \"persist\", path = \"kiwi/mac.bin\", optional = true }").optional);
+    }
+
+    #[test]
+    fn socrates_brings_its_wlan_up_without_a_mac_address_in_persist() {
+        let cfg = DeviceConfig::parse(include_str!("../../../devices/socrates.toml")).unwrap();
+        let ishtar = DeviceConfig::parse(include_str!("../../../devices/ishtar.toml")).unwrap().wlan.unwrap();
+        let wlan = cfg.wlan.expect("the K60 Pro's WLAN is described");
+        let [settings, address] = &wlan.firmware[..] else { panic!("its settings and its MAC address") };
+        assert!(!settings.optional, "the driver does not start without its settings");
+        assert_eq!((address.partition.as_deref(), address.path.as_str(), address.optional), (Some("persist"), "kiwi_v2/wlan_mac.bin", true));
+        let required = Wlan { firmware: vec![settings.clone(), Firmware { optional: false, ..address.clone() }], ..wlan.clone() };
+        assert_eq!(required, ishtar, "the 13 Ultra's chip, driven the same");
+        assert_eq!(cfg.update.expect("its update server is known").server, "https://update.miui.com/updates/miotaV3.php");
     }
 
     #[test]

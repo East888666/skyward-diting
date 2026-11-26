@@ -13,18 +13,18 @@ use crate::focus::{self, Group, Spot, Stop};
 use crate::font::Fonts;
 use crate::geom::Rect;
 use crate::glow::{self, GlowClock};
-use crate::lang::{Lang, Text};
+use crate::lang::{same, Lang, Text};
 use crate::motion::{self, Spring};
 use crate::pages::{self, Band, Ctx};
 use crate::sprite::{Blurs, Sprite};
 use crate::search;
 use crate::settings::Settings;
 use crate::term::{self, Term, TermKey};
+use crate::texts;
 use crate::theme::Theme;
-use crate::tr;
 use crate::widgets::{self, Bar, Bolt, Cap, Layer, WlanMark};
 use skyward_info::DeviceInfo;
-use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
+use skyward_install::{Event, ImageKind, Outcome, Place as FlashPlace, Reflash, Refusal, Stage, Target as FlashTarget};
 use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
@@ -136,7 +136,11 @@ pub enum Screen {
     /// started.
     PartWork,
     Language,
+    /// Whether the clock keeps the installed system's time zone, and the
+    /// parts of the world to choose one from.
     TimeZone,
+    /// The time zones of one part of the world.
+    TimeZones(Region),
     /// Saving the logs, as a bug report asks for them.
     Logs,
     /// Where an update the system installed stands, and merging it into
@@ -448,12 +452,9 @@ pub enum Effect {
     /// Start installing the file at this full path, opened in the file
     /// manager, telling how it goes as [`Effect::Sideload`] does.
     InstallPath(String),
-    /// Write the image the installer holds to `partition` in the slots
-    /// `pick` means.
-    Flash {
-        partition: &'static str,
-        pick: Pick,
-    },
+    /// Write the image the installer holds to `partition`, which lies in
+    /// `place`, in the slots `pick` means there.
+    Flash { partition: String, place: FlashPlace, pick: Pick },
     /// Stop waiting for the computer, for where an image goes, or for an
     /// update to be agreed to.
     Cancel,

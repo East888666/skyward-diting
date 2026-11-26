@@ -11,8 +11,13 @@ pub fn place(file: &Firmware) -> Result<()> {
     let to = Path::new("/etc/firmware").join(&file.name);
     fs::create_dir_all(to.parent().expect("a firmware filename"))
         .with_context(|| format!("make folder for {}", to.display()))?;
+    let held = |path: &Path| match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if file.optional && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
     let bytes = match &file.partition {
-        None => fs::read(&file.path).with_context(|| format!("read {}", file.path))?,
+        None => held(Path::new(&file.path)).with_context(|| format!("read {}", file.path))?,
         Some(partition) => {
             let at = Path::new("/skyward/firmware").join(partition);
             fs::create_dir_all(&at).with_context(|| format!("make {}", at.display()))?;
@@ -31,7 +36,7 @@ pub fn place(file: &Firmware) -> Result<()> {
                     skyward_block::mount::mount_ro(&device, &at)?;
                 }
             }
-            let read = fs::read(at.join(&file.path))
+            let read = held(&at.join(&file.path))
                 .with_context(|| format!("read {} on {partition}", file.path));
             let unmounted = skyward_block::mount::umount(&at);
             let bytes = read?;
@@ -39,5 +44,8 @@ pub fn place(file: &Firmware) -> Result<()> {
             bytes
         }
     };
-    fs::write(&to, bytes).with_context(|| format!("write {}", to.display()))
+    match bytes {
+        Some(bytes) => fs::write(&to, bytes).with_context(|| format!("write {}", to.display())),
+        None => skyward_sys::kmsg(&format!("the phone has no optional firmware {}", file.path)),
+    }
 }

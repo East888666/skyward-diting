@@ -22,6 +22,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant, reason = "one command is parsed once; boxing paths adds no useful benefit")]
 enum Cmd {
     /// Print an image's header and the files in its ramdisk.
     List { image: PathBuf },
@@ -234,11 +235,11 @@ fn main() -> Result<()> {
                 // Skyward has supplied FunctionFS descriptors. Keep their
                 // plain ADB setup, but let Skyward own the combined port.
                 for entry in &mut rd.entries {
-                    if entry.name.ends_with(".rc") && !entry.is_dir() {
-                        if let Ok(text) = std::str::from_utf8(&entry.data) {
-                            let changed = legacy_rc(&entry.name, text);
-                            if changed != text { entry.data = changed.into_bytes(); }
-                        }
+                    if entry.name.ends_with(".rc") && !entry.is_dir()
+                        && let Ok(text) = std::str::from_utf8(&entry.data)
+                    {
+                        let changed = legacy_rc(&entry.name, text);
+                        if changed != text { entry.data = changed.into_bytes(); }
                     }
                 }
             }
