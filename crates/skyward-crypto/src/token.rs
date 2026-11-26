@@ -42,6 +42,20 @@ pub struct Token {
 }
 
 impl Token {
+    /// Keymaster 3 takes the original packed hw_auth_token_t in a byte
+    /// parameter: IDs are native endian, type and timestamp network endian.
+    pub fn packed(&self) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.mac.len() == MAC_BYTES, "authentication token MAC must be {MAC_BYTES} bytes");
+        let mut raw = vec![LATEST];
+        raw.extend_from_slice(&self.challenge.to_le_bytes());
+        raw.extend_from_slice(&self.user.to_le_bytes());
+        raw.extend_from_slice(&self.authenticator.to_le_bytes());
+        raw.extend_from_slice(&self.kind.to_be_bytes());
+        raw.extend_from_slice(&self.when.to_be_bytes());
+        raw.extend_from_slice(&self.mac);
+        Ok(raw)
+    }
+
     /// Read a note the secure world wrote. It chose this machine's own
     /// order for the numbers that are only passed along, and the order the
     /// network uses for the two it compares, which is how both ends of a
@@ -91,6 +105,15 @@ mod tests {
         assert_eq!(token.kind, 1);
         assert_eq!(token.when, 1_700_000_000, "the time, in the order the network uses");
         assert_eq!(token.mac, vec![0xAB; MAC_BYTES]);
+    }
+
+    #[test]
+    fn keymaster3_token_preserves_the_exact_gatekeeper_wire_format() {
+        let raw = note();
+        let mut token = Token::of(&raw).unwrap();
+        assert_eq!(token.packed().unwrap(), raw);
+        token.mac.pop();
+        assert!(token.packed().is_err());
     }
 
     #[test]

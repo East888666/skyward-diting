@@ -264,14 +264,27 @@ pub fn file_secret_without_credential(
     held: &[u8],
 ) -> Result<Vec<u8>> {
     ensure!(protector.lock.is_none(), "legacy FBE protector requires a screen-lock credential");
+    file_secret_with_stretched(protector, &stretched_without_credential(), |nonce, body| {
+        service.gcm_decrypt(held, &[], nonce, body)
+    })
+}
+
+/// Recover a v3 protector after its stretched credential has been checked.
+/// The caller supplies hardware decryption with the matching Gatekeeper
+/// token. No credential or token is persisted here.
+pub fn file_secret_with_stretched(
+    protector: &Protector,
+    stretched: &[u8],
+    decrypt: impl FnOnce(&[u8], &[u8]) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
     let Bound::Secdiscardable(secdiscardable) = &protector.bound else {
         bail!("legacy FBE protector requires unsupported Weaver authentication");
     };
     let content = content(&protector.blob)?;
     ensure!(content.len() >= NONCE_BYTES + 16, "the user's blob is too short to hold anything");
-    let mut secret = protector_secret(&stretched_without_credential(), secdiscardable);
+    let mut secret = protector_secret(stretched, secdiscardable);
     let (nonce, body) = content.split_at(NONCE_BYTES);
-    let opened = service.gcm_decrypt(held, &[], nonce, body);
+    let opened = decrypt(nonce, body);
     let recovered = match opened {
         Ok(mut inner) => {
             let result = open_inner(&secret, &inner);
@@ -401,6 +414,28 @@ mod tests {
         assert!(file_secret_without_credential(&protector, &TestHardware, b"hardware handle").is_err());
         protector = no_lock_protector();
         *protector.blob.last_mut().unwrap() ^= 1;
+        assert!(file_secret_without_credential(&protector, &TestHardware, b"hardware handle").is_err());
+    }
+
+    #[test]
+    fn credential_protector_requires_the_right_stretched_secret_and_hardware_layer() {
+        let lock = Lock { kind: Lock::PIN, cost: [4, 0, 0], salt: b"test salt".to_vec(), enrolled: b"handle".to_vec() };
+        let stretched = lock.stretched(b"1234").unwrap();
+        let secret = protector_secret(&stretched, b"binding bytes");
+        let key = personalized_hash(PROTECTOR_SECRET, &[&secret]);
+        let mut inner = vec![4; NONCE_BYTES];
+        inner.extend(Aes256Gcm::new_from_slice(&key[..32]).unwrap()
+            .encrypt(Nonce::from_slice(&[4; NONCE_BYTES]), &b"synthetic password"[..]).unwrap());
+        let mut blob = vec![3, 0];
+        blob.extend([5; NONCE_BYTES]);
+        blob.extend(Aes256Gcm::new_from_slice(&[9; 32]).unwrap()
+            .encrypt(Nonce::from_slice(&[5; NONCE_BYTES]), inner.as_slice()).unwrap());
+        let protector = Protector { id: "01".into(), blob, bound: Bound::Secdiscardable(b"binding bytes".to_vec()), lock: Some(lock) };
+        let open = |nonce: &[u8], body: &[u8]| crate::keystore::Decryptor::gcm_decrypt(&TestHardware, b"hardware handle", &[], nonce, body);
+        assert_eq!(file_secret_with_stretched(&protector, &stretched, open).unwrap(), file_secret(b"synthetic password"));
+        let wrong = protector.lock.as_ref().unwrap().stretched(b"4321").unwrap();
+        assert!(file_secret_with_stretched(&protector, &wrong, open).is_err());
+        assert!(file_secret_with_stretched(&protector, &stretched, |_, _| bail!("HAL refused token")).is_err());
         assert!(file_secret_without_credential(&protector, &TestHardware, b"hardware handle").is_err());
     }
 

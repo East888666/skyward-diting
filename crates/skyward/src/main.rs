@@ -476,7 +476,7 @@ fn main() -> Result<()> {
             let mut closed = opening.closed;
             let asked = closed.iter().find(|c| !c.made_up).map(|c| c.user);
             if let (Some(credential), Some(user)) = (&credential, asked) {
-                closed = decrypt::with_key_service(|service| data::unlock(service, &closed, user, credential.as_bytes())).map_err(anyhow::Error::msg)?;
+                closed = decrypt::unlock_data(&closed, user, credential.as_bytes()).map_err(anyhow::Error::msg)?;
             }
             for c in &closed {
                 match &c.why {

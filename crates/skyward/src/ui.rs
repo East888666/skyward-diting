@@ -3248,7 +3248,11 @@ impl Pages<'_> {
             // after it.
             let mut queue = VecDeque::from(effects);
             while let Some(fx) = queue.pop_front() {
-                eprintln!("effect {fx:?}");
+                if let Effect::Unlock { user, .. } = &fx {
+                    eprintln!("effect Unlock {{ user: {user}, code: <redacted> }}");
+                } else {
+                    eprintln!("effect {fx:?}");
+                }
                 queue.extend(self.effect(fx, now)?);
             }
         }

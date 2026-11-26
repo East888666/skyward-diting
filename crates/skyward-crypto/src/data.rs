@@ -134,14 +134,23 @@ pub fn shared_storage() -> PathBuf {
     if owner.is_dir() { owner } else { PathBuf::from(SHARED_STORAGE) }
 }
 
-/// Open old v1 FBE with Keymaster 3 and the inherited fscrypt keyring.
+/// Open direct-mounted FBE with Keymaster 3. The installed mode selects
+/// the v1 session keyring or the v2 filesystem keyring independently of
+/// the vendor HAL version.
 /// Hardware-bound nopassword CE and v3 secdiscardable synthetic-password
-/// protectors without screen locks are supported. Credential/Weaver layouts
-/// fail rather than being reported as decrypted. Replay the journal before inspecting
-/// keys, with ordinary directory writes still disabled.
+/// protectors are supported. Locked users remain closed until Gatekeeper
+/// verifies their credential. Replay the journal before inspecting keys,
+/// with ordinary directory writes still disabled.
 pub fn open_legacy_without_credential() -> Result<Opening> {
+    open_legacy_with_mount_selection(false)
+}
+
+/// Opt-in selection for kernels supporting both legacy PFK and software FBE.
+/// Authenticate DE key storage on a read-only mount before loading user
+/// keys; never change options after files have become writable.
+pub fn open_legacy_with_mount_selection(automatic: bool) -> Result<Opening> {
     use crate::{fscrypt, keymaster3::Keymaster3};
-    let entries = skyward_block::fstab::read(MOUNT)?;
+    let mut entries = skyward_block::fstab::read(MOUNT)?;
     anyhow::ensure!(entries.iter().all(|e| e.extra("metadata_encryption").is_none()), "legacy FBE does not support metadata encryption");
     let newly_mounted = !mount::is_mount_point(Path::new(MOUNT))?;
     let mounted = if newly_mounted {
@@ -157,69 +166,215 @@ pub fn open_legacy_without_credential() -> Result<Opening> {
         }
         Some(opened.context("legacy data has no directly mountable filesystem")?)
     } else { None };
-    let opened = (|| -> Result<()> {
+    let opened = (|| -> Result<(fscrypt::FileEncryptionMode, Vec<Closed>)> {
         let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read legacy encryption mode {FILE_MODE}"))?;
-        anyhow::ensure!(matches!(mode.trim(), "ice:aes-256-cts:v1" | "aes-256-xts:aes-256-cts:v1"), "unsupported legacy file encryption mode");
+        let encryption = fscrypt::file_encryption_mode(&mode)?;
         let reference = std::fs::read(SHARED_NAME)?;
-        let expected: [u8; 8] = reference.try_into().map_err(|_| anyhow::anyhow!("legacy common key needs an 8-byte descriptor"))?;
+        encryption.validate_reference(&reference)?;
         let binder = Binder::hardware()?;
         let service = Keymaster3::open(&binder)?;
-        let install = |dir: &Path, expected: Option<&[u8; 8]>| -> Result<()> {
+        if automatic {
+            if let Some(opened) = &mounted {
+                let entry = entries.iter_mut().find(|e| e.filesystem == opened.filesystem)
+                    .context("legacy data filesystem entry disappeared")?;
+                let initial_inline = entry.options.iter().any(|o| o == "inlinecrypt");
+                // Unwrap and authenticate the common key once. A hardware
+                // failure here is unrelated to inlinecrypt, so do not retry.
+                let mut raw = StoredKey::load(Path::new(SHARED_KEY))?
+                    .unwrap(Unwrap::Hardware(&service)).context("unwrap common key before legacy mount probe")?;
+                let mut current_inline = initial_inline;
+                let selected = crate::legacy_mount::probe(initial_inline,
+                    mode.trim() == "ice:aes-256-cts:v1",
+                    |inline| {
+                        if inline != current_inline {
+                            // No media bind, user keys, or ordinary writes
+                            // exist yet. Never force or lazily unmount.
+                            mount::umount(Path::new(MOUNT))?;
+                            let selected = crate::legacy_mount::options(&entry.options, inline);
+                            mount::mount(&opened.mapped, Path::new(MOUNT), &opened.filesystem,
+                                &crate::plain::mount_options(&selected, false))?;
+                            current_inline = inline;
+                        }
+                        Ok(())
+                    },
+                    || {
+                        use crate::legacy_mount::ProbeError;
+                        encryption.install(Path::new(MOUNT), &raw, Some(&reference))
+                            .map_err(ProbeError::Service)?;
+                        let dir = Path::new(USER_KEYS).join("de").join(OWNER.to_string());
+                        let stored = StoredKey::load(&dir).map_err(ProbeError::contents)?;
+                        // Layout byte '1' alone is not evidence of successful
+                        // decryption. Require the hardware-backed GCM tag too.
+                        let mut key = stored.unwrap(Unwrap::Hardware(&service)).map_err(ProbeError::Service)?;
+                        let valid = key.len() == 64;
+                        key.fill(0);
+                        if !valid {
+                            return Err(ProbeError::Service(anyhow::anyhow!("legacy DE key has an unexpected size")));
+                        }
+                        Ok(())
+                    });
+                raw.fill(0);
+                let inline = selected?;
+                entry.options = crate::legacy_mount::options(&entry.options, inline);
+                eprintln!("legacy FBE auto: authenticated DE key with inlinecrypt={inline}; packed version properties retained");
+            } else {
+                // Other processes may use this mount. Verify normally below,
+                // but never switch encryption under a live UI/MTP session.
+                eprintln!("legacy FBE auto: keeping existing data mount; close data before changing mount options");
+            }
+        }
+        let mode = encryption;
+        let install = |dir: &Path, expected: Option<&[u8]>| -> Result<()> {
             let mut raw = StoredKey::load(dir)?.unwrap(Unwrap::Hardware(&service)).with_context(|| format!("unwrap legacy key in {}", dir.display()))?;
-            let result = fscrypt::legacy_add_key(&raw, expected);
+            let result = mode.install(Path::new(MOUNT), &raw, expected);
             raw.fill(0);
             result.map(|_| ())
         };
-        install(Path::new(SHARED_KEY), Some(&expected))?;
+        install(Path::new(SHARED_KEY), Some(&reference))?;
         let users = users()?;
         anyhow::ensure!(users.contains(&OWNER), "legacy DE key for owner is absent");
         for user in &users {
             install(&Path::new(USER_KEYS).join("de").join(user.to_string()), None)?;
             for prefix in ["user_de", "system_de"] {
                 let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
-                if dir.is_dir() { anyhow::ensure!(fscrypt::legacy_unlocked(&dir)?, "legacy DE key does not open {}", dir.display()); }
+                if dir.is_dir() { anyhow::ensure!(mode.unlocked(&dir)?, "DE key does not open {}", dir.display()); }
             }
         }
+        let mut closed = Vec::new();
         for user in users {
             let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
             let stored = StoredKey::load(&dir)?;
             if stored.hardware_bound() {
                 install(&dir, None).context("unwrap legacy hardware-bound CE key")?;
+                verify_legacy_user(mode, user)?;
             } else {
                 let protector = protector(user)?;
-                anyhow::ensure!(!made_up(user, &protector.id), "legacy FBE does not support a credential tied to another user");
-                let held = crate::keystore2::key_blob(Path::new(crate::keystore2::DATABASE), &protector.key_alias())?;
-                let mut secret = crate::user::file_secret_without_credential(&protector, &service, &held)
-                    .context("recover legacy CE synthetic-password secret")?;
-                let unwrapped = stored.unwrap(Unwrap::<Keymaster3>::Secret(&secret));
-                secret.fill(0);
-                let mut raw = unwrapped.with_context(|| format!("unwrap legacy CE key in {}", dir.display()))?;
-                let installed = fscrypt::legacy_add_key(&raw, None);
-                raw.fill(0);
-                installed?;
-            }
-            for prefix in ["user", "system_ce", "media"] {
-                let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
-                if dir.is_dir() { anyhow::ensure!(fscrypt::legacy_unlocked(&dir)?, "legacy CE key does not open {}", dir.display()); }
+                if let Some(lock) = &protector.lock {
+                    closed.push(Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id),
+                        why: made_up(user, &protector.id).then(|| "legacy FBE does not yet support credentials tied to another user".into()) });
+                } else {
+                    open_legacy_user_files(&service, mode, user, None)?;
+                }
             }
         }
-        anyhow::ensure!(shared_storage().is_dir(), "legacy data has no existing shared storage");
-        Ok(())
+        Ok((mode, closed))
     })();
-    if let Err(error) = opened {
-        if newly_mounted { mount::umount(Path::new(MOUNT)).context("unmount legacy data after failed unlock")?; }
-        return Err(error);
-    }
+    let (mode, closed) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            if newly_mounted {
+                let cleanup = mount::is_mount_point(Path::new(MOUNT)).and_then(|mounted| {
+                    if mounted { mount::umount(Path::new(MOUNT)) } else { Ok(()) }
+                });
+                if let Err(cleanup) = cleanup {
+                    return Err(error.context(format!("unmount legacy data after failed unlock: {cleanup:#}")));
+                }
+            }
+            return Err(error);
+        }
+    };
     if let Some(opened) = &mounted {
-        // Do not remount an inspection view writable: on older kernels a
-        // noload mount can keep norecovery through remount. Use the table's
-        // ordinary writable options, as in the plain-data path below.
+        // v1 keys survive a fresh mount via the session keyring. v2 keys
+        // belong to this filesystem instance and must survive the switch
+        // to writable operation without a full unmount.
         let entry = entries.iter().find(|e| e.filesystem == opened.filesystem).context("legacy data filesystem entry disappeared")?;
-        mount::umount(Path::new(MOUNT))?;
-        mount::mount(&opened.mapped, Path::new(MOUNT), &opened.filesystem, &crate::plain::mount_options(&entry.options, true))?;
+        match mode {
+            fscrypt::FileEncryptionMode::V1 => {
+                mount::umount(Path::new(MOUNT))?;
+                mount::mount(&opened.mapped, Path::new(MOUNT), &opened.filesystem, &crate::plain::mount_options(&entry.options, true))?;
+            }
+            fscrypt::FileEncryptionMode::V2 => {
+                // v2 keys belong to this superblock. A full unmount would
+                // evict them, unlike the inherited v1 session keyring.
+                // The initial mount replayed the journal and stripped
+                // noload/norecovery, so this remount keeps journaling live.
+                mount::remount_writable(Path::new(MOUNT), true)?;
+            }
+        }
     }
-    show_owner_storage()?;
-    Ok(Opening { mounted, closed: Vec::new() })
+    if !closed.iter().any(|c| c.user == OWNER) {
+        anyhow::ensure!(shared_storage().is_dir(), "legacy data has no existing shared storage");
+        show_owner_storage()?;
+    }
+    Ok(Opening { mounted, closed })
+}
+
+fn verify_legacy_user(mode: crate::fscrypt::FileEncryptionMode, user: u32) -> Result<()> {
+    for prefix in ["user", "system_ce", "media"] {
+        let dir = Path::new(MOUNT).join(prefix).join(user.to_string());
+        if dir.is_dir() { anyhow::ensure!(mode.unlocked(&dir)?, "CE key does not open {}", dir.display()); }
+    }
+    Ok(())
+}
+
+/// The old and new stores coexist on upgraded systems. An existing
+/// keystore2 database is authoritative; do not hide its errors by falling
+/// back to possibly stale file-backed keys.
+fn legacy_protector_key(alias: &str) -> Result<Vec<u8>> {
+    let database = Path::new(crate::keystore2::DATABASE);
+    match std::fs::metadata(database) {
+        Ok(_) => crate::keystore2::key_blob(database, alias),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+            crate::keystore1::key_blob(Path::new("/data/misc/keystore"), alias),
+        Err(e) => Err(e).context("inspect the phone's keystore database"),
+    }
+}
+
+fn open_legacy_user_files(service: &crate::keymaster3::Keymaster3, mode: crate::fscrypt::FileEncryptionMode,
+    user: u32, credential: Option<&[u8]>) -> Result<()> {
+    let protector = protector(user)?;
+    anyhow::ensure!(!made_up(user, &protector.id), "legacy FBE does not yet support a credential tied to another user");
+    anyhow::ensure!(matches!(&protector.bound, Bound::Secdiscardable(_)), "legacy FBE requires unsupported Weaver authentication");
+    // Validate the supported format and fetch the key before attempting
+    // authentication. One submitted credential causes one Gatekeeper try.
+    crate::user::content(&protector.blob)?;
+    let held = legacy_protector_key(&protector.key_alias())?;
+    let mut stretched = match &protector.lock {
+        Some(lock) => lock.stretched(credential.context("legacy FBE requires the screen-lock credential")?)?,
+        None => crate::user::stretched_without_credential(),
+    };
+    let recovered = (|| -> Result<Vec<u8>> {
+        let token = match &protector.lock {
+            Some(lock) => {
+                let (binder, hardware) = (Binder::open()?, Binder::hardware()?);
+                let mut password = crate::user::gatekeeper_password(&stretched);
+                let verified = Gatekeeper::open(&binder, &hardware)?.verify(
+                    TYPED_SLOT.checked_add(user).context("Gatekeeper user slot overflow")?, &lock.enrolled, &password);
+                password.fill(0);
+                Some(verified?)
+            }
+            None => None,
+        };
+        crate::user::file_secret_with_stretched(&protector, &stretched, |nonce, body| {
+            service.gcm_decrypt_authenticated(&held, &[], nonce, body, token.as_ref())
+        }).context("recover legacy CE synthetic-password secret")
+    })();
+    stretched.fill(0);
+    let mut secret = recovered?;
+    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    let unwrapped = StoredKey::load(&dir).and_then(|stored| stored.unwrap(Unwrap::<crate::keymaster3::Keymaster3>::Secret(&secret)));
+    secret.fill(0);
+    let mut raw = unwrapped.with_context(|| format!("unwrap legacy CE key in {}", dir.display()))?;
+    let installed = mode.install(Path::new(MOUNT), &raw, None);
+    raw.fill(0);
+    installed?;
+    verify_legacy_user(mode, user)
+}
+
+/// Unlock a user on the opt-in Keymaster 3 path. Keep other users closed
+/// and publish owner storage only after its CE policy really opens.
+pub fn unlock_legacy(closed: &[Closed], user: u32, credential: &[u8]) -> Result<Vec<Closed>> {
+    anyhow::ensure!(closed.iter().any(|c| c.user == user && !c.made_up), "user is not awaiting a legacy credential");
+    anyhow::ensure!(mount::is_mount_point(Path::new(MOUNT))?, "legacy data is not mounted");
+    let mode = crate::fscrypt::file_encryption_mode(&std::fs::read_to_string(FILE_MODE)?)?;
+    let binder = Binder::hardware()?;
+    let service = crate::keymaster3::Keymaster3::open(&binder)?;
+    open_legacy_user_files(&service, mode, user, Some(credential))?;
+    if user == OWNER {
+        anyhow::ensure!(shared_storage().is_dir(), "legacy data has no existing shared storage");
+        show_owner_storage()?;
+    }
+    Ok(closed.iter().filter(|c| c.user != user).cloned().collect())
 }
 
 /// Open only demonstrably plain data without contacting KeyMint. Legacy

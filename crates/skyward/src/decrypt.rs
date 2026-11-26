@@ -36,7 +36,10 @@ impl Decryptor {
             tell.tell(match job {
                 Job::Open => Ended::Opened(open_data()),
                 Job::Unlock { closed, user, credential } => {
-                    Ended::Unlocked(with_key_service(|service| data::unlock(service, &closed, user, &credential)))
+                    let result = unlock_data(&closed, user, &credential);
+                    let mut credential = credential;
+                    credential.fill(0);
+                    Ended::Unlocked(result)
                 }
             });
         })?;
@@ -65,6 +68,16 @@ pub fn with_key_service<T>(work: impl FnOnce(&KeyMint) -> Result<T>) -> Result<T
     done.map_err(|e| format!("{e:#}"))
 }
 
+/// Dispatch credential unlock through the same configured HAL as opening.
+/// Modern devices retain their existing KeyMint and profile-unlock path.
+pub fn unlock_data(closed: &[Closed], user: u32, credential: &[u8]) -> Result<Vec<Closed>, String> {
+    let config = skyward_config::DeviceConfig::load("/skyward/device.toml").map_err(|e| format!("{e:#}"))?;
+    if config.recovery.uses_legacy_fbe() {
+        return data::unlock_legacy(closed, user, credential).map_err(|e| format!("{e:#}"));
+    }
+    with_key_service(|service| data::unlock(service, closed, user, credential))
+}
+
 /// Plain legacy data needs no AIDL service. Preserve both failure reasons
 /// when the configured encryption requires hardware this recovery lacks.
 pub fn open_data() -> Result<Opening, String> {
@@ -78,11 +91,16 @@ pub fn open_data() -> Result<Opening, String> {
                 .is_some_and(|io| matches!(io.raw_os_error(), Some(libc::EUCLEAN | libc::EIO)))) {
                 return Err(format!("data filesystem could not be read; check its filesystem before retrying: {plain:#}"));
             }
-            let legacy = skyward_config::DeviceConfig::load("/skyward/device.toml")
-                .is_ok_and(|cfg| cfg.recovery.uses_legacy_fbe());
-            if legacy {
-                return data::open_legacy_without_credential()
-                    .map_err(|error| format!("plain data: {plain:#}; legacy FBE: {error:#}"));
+            let config = skyward_config::DeviceConfig::load("/skyward/device.toml");
+            if let Ok(cfg) = config
+                && cfg.recovery.uses_legacy_fbe()
+            {
+                let opening = if cfg.recovery.legacy_fbe_auto {
+                    data::open_legacy_with_mount_selection(true)
+                } else {
+                    data::open_legacy_without_credential()
+                };
+                return opening.map_err(|error| format!("plain data: {plain:#}; legacy FBE: {error:#}"));
             }
             with_key_service(data::open_without_credential)
                 .map_err(|hardware| format!("plain data: {plain:#}; encrypted data: {hardware}"))

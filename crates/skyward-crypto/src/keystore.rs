@@ -71,12 +71,14 @@ impl StoredKey {
         }
         if dir.join(FN_STRETCHING).exists() {
             let stretching = fs::read_to_string(dir.join(FN_STRETCHING)).context("read legacy key stretching")?;
-            // AOSP KeyStorage: nopassword appends an empty stretched secret.
-            // Other old layouts need their own stretching/authentication path.
-            if stretching != "nopassword" {
-                bail!("{} uses unsupported legacy key stretching {stretching:?}", dir.display());
+            // AOSP KeyStorage: nopassword has an empty secret and a HAL
+            // blob; none uses the synthetic-password-derived secret as-is.
+            match stretching.as_str() {
+                "nopassword" => anyhow::ensure!(dir.join(FN_KEY_BLOB).is_file() && dir.join(FN_SECDISCARDABLE).is_file(), "nopassword key lacks hardware binding"),
+                "none" => anyhow::ensure!(!dir.join(FN_KEY_BLOB).exists() && dir.join(FN_SECDISCARDABLE).is_file(),
+                    "legacy none key requires software wrapping with a secdiscardable"),
+                _ => bail!("{} uses unsupported legacy key stretching {stretching:?}", dir.display()),
             }
-            anyhow::ensure!(dir.join(FN_KEY_BLOB).is_file() && dir.join(FN_SECDISCARDABLE).is_file(), "nopassword key lacks hardware binding");
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
@@ -267,6 +269,27 @@ mod tests {
         fs::write(dir.join(FN_SECDISCARDABLE), b"discardable").unwrap();
         let key = StoredKey::load(&dir).unwrap();
         assert_eq!(key.app_id(&[]), hash_with_prefix(SECDISCARDABLE_PREFIX, b"discardable"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_none_uses_the_supplied_secret_without_extra_stretching() {
+        let dir = tempdir("none");
+        let secret = [0x51; 32];
+        let mut pre_key = hash_with_prefix(SECDISCARDABLE_PREFIX, b"discardable");
+        pre_key.extend_from_slice(&secret);
+        fs::write(dir.join(FN_VERSION), "1").unwrap();
+        fs::write(dir.join(FN_STRETCHING), "none").unwrap();
+        fs::write(dir.join(FN_SECDISCARDABLE), b"discardable").unwrap();
+        fs::write(dir.join(FN_ENCRYPTED_KEY), wrap(&pre_key, &[5; NONCE_BYTES], &[0xAB; 64])).unwrap();
+        let stored = StoredKey::load(&dir).unwrap();
+        assert!(!stored.hardware_bound());
+        assert_eq!(stored.unwrap(Unwrap::<NoService>::Secret(&secret)).unwrap(), [0xAB; 64]);
+        assert!(stored.unwrap(Unwrap::<NoService>::Secret(&[])).is_err());
+        assert!(stored.unwrap(Unwrap::<NoService>::Secret(b"wrong")).is_err());
+        assert!(stored.unwrap(Unwrap::Hardware(&NoService)).is_err());
+        fs::write(dir.join(FN_KEY_BLOB), b"unsupported authenticated hardware layout").unwrap();
+        assert!(StoredKey::load(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

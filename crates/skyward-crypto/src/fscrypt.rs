@@ -8,6 +8,51 @@ use std::path::Path;
 /// How long the name the kernel gives a key is.
 pub const NAME_BYTES: usize = 16;
 
+/// The fscrypt policy API, independently of the Keymaster HAL version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileEncryptionMode { V1, V2 }
+
+pub fn file_encryption_mode(mode: &str) -> Result<FileEncryptionMode> {
+    // Wrapped keys require an ephemeral-key operation absent in Keymaster 3.
+    anyhow::ensure!(!hardware_wrapped(mode), "Keymaster 3 cannot unwrap hardware-wrapped fscrypt keys");
+    match mode.trim() {
+        "ice:aes-256-cts:v1" | "aes-256-xts:aes-256-cts:v1" => Ok(FileEncryptionMode::V1),
+        "aes-256-xts:aes-256-cts:v2" => Ok(FileEncryptionMode::V2),
+        _ => bail!("unsupported Keymaster 3 file encryption mode {mode:?}"),
+    }
+}
+
+impl FileEncryptionMode {
+    pub fn reference_bytes(self) -> usize {
+        match self { Self::V1 => 8, Self::V2 => NAME_BYTES }
+    }
+
+    pub fn validate_reference(self, reference: &[u8]) -> Result<()> {
+        anyhow::ensure!(reference.len() == self.reference_bytes(),
+            "{self:?} common key needs a {}-byte reference, found {}", self.reference_bytes(), reference.len());
+        Ok(())
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn install(self, mount: &Path, raw: &[u8], expected: Option<&[u8]>) -> Result<()> {
+        if let Some(expected) = expected { self.validate_reference(expected)?; }
+        match self {
+            Self::V1 => legacy_add_key(raw, expected.map(|r| r.try_into().expect("validated descriptor"))).map(|_| ()),
+            Self::V2 => {
+                anyhow::ensure!(raw.len() == 64, "AES-256-XTS key must be 64 bytes");
+                let identifier = add_key(mount, raw, false)?;
+                anyhow::ensure!(expected.is_none_or(|expected| expected == identifier), "fscrypt v2 key differs from its recorded identifier");
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn unlocked(self, dir: &Path) -> Result<bool> {
+        match self { Self::V1 => legacy_unlocked(dir), Self::V2 => unlocked(dir) }
+    }
+}
+
 /// Let `raw` into the filesystem mounted at `mount`, and give the name the
 /// kernel knows it by. Every file whose directory names that key can be
 /// read from then on.
@@ -30,10 +75,15 @@ pub fn add_key(mount: &Path, raw: &[u8], wrapped: bool) -> Result<[u8; NAME_BYTE
         arg[76..80].copy_from_slice(&HARDWARE_WRAPPED.to_ne_bytes());
     }
     arg[HEADER_BYTES..].copy_from_slice(raw);
-    let dir = std::fs::File::open(mount).with_context(|| format!("open {}", mount.display()))?;
-    if unsafe { libc::ioctl(dir.as_raw_fd(), ADD_KEY as libc::Ioctl, arg.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("let a key into {}", mount.display()));
-    }
+    let installed = (|| -> Result<()> {
+        let dir = std::fs::File::open(mount).with_context(|| format!("open {}", mount.display()))?;
+        if unsafe { libc::ioctl(dir.as_raw_fd(), ADD_KEY as libc::Ioctl, arg.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| format!("let a key into {}", mount.display()));
+        }
+        Ok(())
+    })();
+    arg[HEADER_BYTES..].fill(0);
+    installed?;
     let mut name = [0u8; NAME_BYTES];
     name.copy_from_slice(&arg[8..8 + NAME_BYTES]);
     Ok(name)
@@ -189,6 +239,20 @@ pub fn legacy_unlocked(dir: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keymaster_version_does_not_determine_the_fscrypt_policy_version() {
+        assert_eq!(file_encryption_mode("ice:aes-256-cts:v1").unwrap(), FileEncryptionMode::V1);
+        assert_eq!(file_encryption_mode("aes-256-xts:aes-256-cts:v1").unwrap(), FileEncryptionMode::V1);
+        let v2 = file_encryption_mode("aes-256-xts:aes-256-cts:v2").unwrap();
+        assert_eq!(v2, FileEncryptionMode::V2);
+        assert!(v2.validate_reference(&[0; 16]).is_ok());
+        assert!(v2.validate_reference(&[0; 8]).is_err());
+        assert!(FileEncryptionMode::V1.validate_reference(&[0; 16]).is_err());
+        assert!(file_encryption_mode("ice:aes-256-cts:v2").is_err());
+        assert!(file_encryption_mode("aes-256-xts:aes-256-cts:v3").is_err());
+        assert!(file_encryption_mode("aes-256-xts:aes-256-cts:v2+wrappedkey_v0").is_err());
+    }
 
     #[test]
     fn legacy_descriptor_matches_an_independent_double_sha512_vector() {

@@ -33,6 +33,10 @@ fn hardware_blob(blob: &[u8]) -> Result<&[u8]> {
 }
 
 fn parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Option<&[u8]>) -> Result<()> {
+    authenticated_parameters(call, app_id, nonce, None)
+}
+
+fn authenticated_parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Option<&[u8]>, token: Option<&[u8]>) -> Result<()> {
     let mut values: Vec<(u32, u64, &[u8])> = Vec::new();
     if let Some(app_id) = app_id {
         values.extend([(0x20000004, 32, &[][..]), (0x20000006, 1, &[][..]), (0x300003eb, 128, &[][..])]);
@@ -41,6 +45,7 @@ fn parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Option<&[u8]>) -
         if !app_id.is_empty() { values.push((0x90000259, 0, app_id)); }
     }
     if let Some(nonce) = nonce { values.push((0x900003e9, 0, nonce)); }
+    if let Some(token) = token { values.push((0x900003ea, 0, token)); }
     let mut raw = vec![0; values.len() * PARAM_BYTES];
     for (i, (tag, value, _)) in values.iter().enumerate() {
         raw[i * PARAM_BYTES..i * PARAM_BYTES + 4].copy_from_slice(&tag.to_le_bytes());
@@ -89,12 +94,12 @@ impl<'a> Keymaster3<'a> {
         Ok(Self { device })
     }
 
-    fn begin(&self, blob: &[u8], app_id: &[u8], nonce: &[u8]) -> Result<u64> {
+    fn begin(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], token: Option<&[u8]>) -> Result<u64> {
         ensure!(nonce.len() == 12, "AES-GCM nonce is not 12 bytes");
         let mut call = Message::call(INTERFACE);
         call.u32(1); // KeyPurpose::DECRYPT
         call.bytes(blob);
-        parameters(&mut call, Some(app_id), Some(nonce))?;
+        authenticated_parameters(&mut call, Some(app_id), Some(nonce), token)?;
         let reply = self.device.transact(BEGIN, &call).context("Keymaster 3 begin AES-GCM")?;
         let mut read = Answer::new(reply.bytes());
         status(&mut read)?;
@@ -136,10 +141,11 @@ impl<'a> Keymaster3<'a> {
 }
 
 #[cfg(target_os = "android")]
-impl crate::keystore::Decryptor for Keymaster3<'_> {
-    fn gcm_decrypt(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+impl Keymaster3<'_> {
+    pub fn gcm_decrypt_authenticated(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8], token: Option<&crate::token::Token>) -> Result<Vec<u8>> {
+        let token = token.map(crate::token::Token::packed).transpose()?;
         let blob = hardware_blob(blob)?;
-        let handle = match self.begin(blob, app_id, nonce) {
+        let handle = match self.begin(blob, app_id, nonce, token.as_deref()) {
             Ok(handle) => handle,
             Err(error) if skyward_binder::status::refused_with(&error) == Some(-62) => {
                 // Upgrade only the in-memory copy. The key Android keeps on
@@ -150,7 +156,7 @@ impl crate::keystore::Decryptor for Keymaster3<'_> {
                 let reply = self.device.transact(8, &call).context("Keymaster 3 in-memory key upgrade")?;
                 let mut read = Answer::new(reply.bytes());
                 status(&mut read).context("Keymaster 3 in-memory key upgrade")?;
-                self.begin(read.bytes()?, app_id, nonce)?
+                self.begin(read.bytes()?, app_id, nonce, token.as_deref())?
             }
             Err(error) => return Err(error),
         };
@@ -161,6 +167,13 @@ impl crate::keystore::Decryptor for Keymaster3<'_> {
             let _ = self.device.transact(ABORT, &call);
         }
         result
+    }
+}
+
+#[cfg(target_os = "android")]
+impl crate::keystore::Decryptor for Keymaster3<'_> {
+    fn gcm_decrypt(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], body: &[u8]) -> Result<Vec<u8>> {
+        self.gcm_decrypt_authenticated(blob, app_id, nonce, body, None)
     }
 }
 
@@ -210,6 +223,22 @@ mod tests {
             .all(|p| u32::from_le_bytes(p[..4].try_into().unwrap()) != 0x90000259));
         let mut upgrade = Message::default();
         upgrade_parameters(&mut upgrade, &[]).unwrap();
+    }
+
+    #[test]
+    fn credential_token_is_a_real_embedded_auth_token_parameter() {
+        let token = [7u8; 69];
+        let mut call = Message::default();
+        authenticated_parameters(&mut call, Some(&[]), Some(&[1; 12]), Some(&token)).unwrap();
+        let raw = &call.values()[call.addresses()[1] as usize..];
+        let at = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        let entry = &bytes[4 * PARAM_BYTES..5 * PARAM_BYTES];
+        assert_eq!(u32::from_le_bytes(entry[..4].try_into().unwrap()), 0x900003ea);
+        let at = u64::from_le_bytes(entry[16..24].try_into().unwrap());
+        let size = u32::from_le_bytes(entry[24..28].try_into().unwrap()) as usize;
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, size) }, token);
     }
 
     #[test]

@@ -130,10 +130,16 @@ pub struct Recovery {
     /// Applies only to non-A/B, v0-v2 recovery images.
     #[serde(default)]
     pub legacy_version: Option<LegacyRecoveryVersion>,
-    /// Use Keymaster 3 and the session keyring for v1 FBE, independently
-    /// of any boot-header version override. Only non-A/B layouts support it.
+    /// Use Keymaster 3 for direct-mounted v1/v2 FBE, independently of any
+    /// boot-header override. The on-disk mode chooses the keyring API.
+    /// Only non-A/B layouts support it.
     #[serde(default)]
     pub legacy_fbe: bool,
+    /// Authenticate legacy DE key storage read-only to select inlinecrypt
+    /// before opening user data. Requires a kernel supporting both paths.
+    /// Off by default; never applied to A/B metadata-encrypted data.
+    #[serde(default)]
+    pub legacy_fbe_auto: bool,
     /// Optional SELinux domain for the short-lived APEX loop helper.
     /// Some legacy policies deny kernel threads access to recovery-owned
     /// file descriptors even when the recovery domain is permissive.
@@ -153,6 +159,7 @@ impl Default for Recovery {
             capture_stdio: false,
             legacy_version: None,
             legacy_fbe: false,
+            legacy_fbe_auto: false,
             apex_loop_context: None,
         }
     }
@@ -724,6 +731,8 @@ impl DeviceConfig {
             version.encoded()?;
         }
         ensure!(!cfg.recovery.legacy_fbe || !cfg.device.ab, "legacy_fbe is only for non-A/B recovery");
+        ensure!(!cfg.recovery.legacy_fbe_auto || (!cfg.device.ab && cfg.recovery.uses_legacy_fbe()),
+            "legacy_fbe_auto requires non-A/B legacy FBE");
         if let Some(context) = &cfg.recovery.apex_loop_context {
             ensure!(!context.is_empty() && context.split(':').count() >= 4
                 && context.bytes().all(|c| c.is_ascii_alphanumeric() || b"_:-,.".contains(&c)),
@@ -979,6 +988,30 @@ mod tests {
     }
 
     #[test]
+    fn automatic_legacy_mount_selection_is_opt_in_and_requires_legacy_non_ab() {
+        assert!(!Recovery::default().legacy_fbe_auto);
+        for text in [
+            include_str!("../../../devices/diting.toml"),
+            include_str!("../../../devices/wayne.toml"),
+            include_str!("../../../devices/jason.toml"),
+            include_str!("../../../devices/ishtar.toml"),
+            "[device]\ncodename = 'test'\n",
+        ] {
+            assert!(!DeviceConfig::parse(text).unwrap().recovery.legacy_fbe_auto);
+        }
+        let polaris = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
+        assert!(polaris.recovery.legacy_fbe_auto);
+        for text in [
+            "[device]\ncodename='test'\n[recovery]\nlegacy_fbe_auto=true\n",
+            "[device]\ncodename='test'\nab=false\n[recovery]\nlegacy_fbe_auto=true\n",
+        ] {
+            assert!(DeviceConfig::parse(text).is_err());
+        }
+        let opt_in = DeviceConfig::parse("[device]\ncodename='test'\nab=false\n[recovery]\nlegacy_fbe=true\nlegacy_fbe_auto=true\n").unwrap();
+        assert!(opt_in.recovery.legacy_fbe_auto);
+    }
+
+    #[test]
     fn legacy_version_matches_the_reference_header_and_rejects_overflow() {
         let version = |release: &str, patch: &str| LegacyRecoveryVersion { release: release.into(), security_patch: patch.into() };
         assert_eq!(version("99.87.36", "2099-12-31").encoded().unwrap(), 0xc75d263c);
@@ -997,9 +1030,12 @@ mod tests {
         assert!(config.display.blocking_commits);
         assert!(config.display.pipelined_commits);
         assert!(!config.device.ab);
-        assert_eq!(config.fstab.len(), 9);
+        assert_eq!(config.fstab.len(), 10);
         assert_eq!(config.firmware.as_ref().unwrap().partition, "modem");
-        assert_eq!(config.recovery.legacy_version.as_ref().unwrap().release, "12.0.0");
+        assert_eq!(config.recovery.legacy_version.as_ref().unwrap().release, "16.0.0");
+        assert_eq!(config.recovery.apex_loop_context.as_deref(), Some("u:r:su:s0"));
+        assert_eq!(config.partitions.mounted, ["cust"]);
+        assert!(config.fstab.iter().any(|e| e.mount_point == "/cust" && e.filesystem == "erofs"));
         assert!(config.services.iter().any(|service| service.ready_hardware_service.as_deref()
             == Some("android.hardware.keymaster@3.0::IKeymasterDevice/default")));
         let vendor = config.fstab.iter().find(|e| e.mount_point == "/vendor").unwrap();

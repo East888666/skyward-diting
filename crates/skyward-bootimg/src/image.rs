@@ -86,9 +86,14 @@ impl BootImage {
         let (kernel_len, ramdisk_len) = sizes(&header);
         let end = ramdisk_at.checked_add(ramdisk_len as usize).context("ramdisk size overflow")?;
         let after = end.div_ceil(pg).checked_mul(pg).context("image size overflow")?;
-        if matches!(&header,
-            Header::V0(_)) && after < bytes.len() {
-            let tail = &bytes[after..];
+        if matches!(&header, Header::V0(_)) {
+            // Header versions and verified-boot versions are independent:
+            // newer legacy recoveries can carry AVB2 hash metadata. Only
+            // remove a structurally recognised envelope; the rebuilt image
+            // needs new metadata, which the packer writes separately.
+            let image_end = avb_image_size(bytes).unwrap_or(bytes.len());
+            ensure!(image_end >= end, "AVB original image size truncates the legacy ramdisk");
+            let tail = bytes.get(after..image_end).unwrap_or_default();
             // A changed image cannot retain its old AVB1 BootSignature.
             // Accept only its known ASN.1 layout; arbitrary appended data
             // may be a section this representation cannot safely relocate.
@@ -141,6 +146,56 @@ impl BootImage {
 
 fn pad(out: &mut Vec<u8>, page: usize) {
     out.resize(out.len().div_ceil(page) * page, 0);
+}
+
+/// Recognise an AVB2 footer and the complete vbmeta envelope it points to.
+/// This validates layout, not the signing key or image digest. No original
+/// signature can authenticate a changed ramdisk. Gaps must be zero so an
+/// unmodelled image section cannot be discarded along with the envelope.
+fn avb_image_size(bytes: &[u8]) -> Option<usize> {
+    let footer_at = bytes.len().checked_sub(64)?;
+    let footer = &bytes[footer_at..];
+    if &footer[..4] != b"AVBf" || footer[4..12] != [0, 0, 0, 1, 0, 0, 0, 0]
+        || footer[36..].iter().any(|&b| b != 0)
+    {
+        return None;
+    }
+    let size = |data: &[u8], at| -> Option<usize> {
+        usize::try_from(u64::from_be_bytes(data.get(at..at + 8)?.try_into().ok()?)).ok()
+    };
+    let original = size(footer, 12)?;
+    let offset = size(footer, 20)?;
+    let length = size(footer, 28)?;
+    let end = offset.checked_add(length)?;
+    if original > offset || length < 256 || end > footer_at {
+        return None;
+    }
+    let meta = bytes.get(offset..end)?;
+    if &meta[..4] != b"AVB0" || meta[4..8] != [0, 0, 0, 1]
+        || meta[176..256].iter().any(|&b| b != 0)
+    {
+        return None;
+    }
+    let auth = size(meta, 12)?;
+    let aux = size(meta, 20)?;
+    if auth % 64 != 0 || aux % 64 != 0
+        || 256usize.checked_add(auth)?.checked_add(aux)? != length
+    {
+        return None;
+    }
+    // Hash/signature ranges are relative to auth, key/descriptor ranges
+    // to aux. Even an unsigned envelope must have consistent bounds.
+    for (at, limit) in [(32, auth), (48, auth), (64, aux), (80, aux), (96, aux)] {
+        if size(meta, at)?.checked_add(size(meta, at + 8)?)? > limit {
+            return None;
+        }
+    }
+    if bytes.get(original..offset)?.iter().any(|&b| b != 0)
+        || bytes.get(end..footer_at)?.iter().any(|&b| b != 0)
+    {
+        return None;
+    }
+    Some(original)
 }
 
 /// Read one definite-length DER element, leaving the following elements.
@@ -270,6 +325,82 @@ mod tests {
         let mut unknown = raw;
         unknown.extend(b"unknown extra section");
         assert!(BootImage::parse(&unknown).is_err());
+    }
+
+    fn with_avb(raw: &[u8]) -> Vec<u8> {
+        let offset = raw.len().next_multiple_of(4096);
+        let mut out = raw.to_vec();
+        out.resize(offset, 0);
+        // An unsigned AVB2 header with one padded auxiliary block.
+        let mut meta = vec![0u8; 320];
+        meta[..4].copy_from_slice(b"AVB0");
+        meta[4..8].copy_from_slice(&1u32.to_be_bytes());
+        meta[20..28].copy_from_slice(&64u64.to_be_bytes());
+        out.extend(&meta);
+        out.resize(offset + 8192 - 64, 0);
+        out.extend(b"AVBf");
+        out.extend(1u32.to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        for n in [raw.len(), offset, meta.len()] {
+            out.extend((n as u64).to_be_bytes());
+        }
+        out.extend([0; 28]);
+        out
+    }
+
+    #[test]
+    fn legacy_avb2_preserves_payload_and_repacking_discards_stale_metadata() {
+        for version in [0, 1, 2] {
+            let raw = legacy(version, 4096);
+            let footed = with_avb(&raw);
+            assert_eq!(avb_image_size(&footed), Some(raw.len()));
+            let image = BootImage::parse(&footed).unwrap();
+            assert_eq!(image.kernel, b"kernel");
+            assert_eq!(image.ramdisk, b"ramdisk");
+            assert_eq!(image.to_bytes().unwrap(), BootImage::parse(&raw).unwrap().to_bytes().unwrap());
+        }
+        // avbtool also permits an unpadded original image.
+        let raw = legacy(1, 4096);
+        assert!(BootImage::parse(&with_avb(&raw[..8199])).is_ok());
+        let mut signed = raw.clone();
+        signed.extend(signature(raw.len() as u32));
+        assert!(BootImage::parse(&with_avb(&signed)).is_ok());
+    }
+
+    #[test]
+    fn legacy_avb2_rejects_unknown_sections_and_malformed_envelopes() {
+        let raw = legacy(1, 4096);
+        let footed = with_avb(&raw);
+        let footer = footed.len() - 64;
+        let offset = raw.len();
+        for (at, value) in [
+            (footer + 4, 2),                 // unsupported footer version
+            (footer + 36, 1),                // reserved footer byte
+            (offset, b'X'),                  // missing vbmeta magic
+            (offset + 176, 1),               // reserved header byte
+            (offset + 19, 1),                // unaligned authentication block
+            (offset + 27, 1),                // inconsistent auxiliary length
+            (offset + 47, 1),                // hash outside empty auth block
+            (offset + 111, 65),              // descriptors outside aux block
+            (offset + 320, 1),               // data after vbmeta
+        ] {
+            let mut bad = footed.clone();
+            bad[at] = value;
+            assert!(BootImage::parse(&bad).is_err(), "accepted bad byte at {at}");
+        }
+        for (field, value) in [(12, 8198u64), (12, u64::MAX), (20, u64::MAX), (28, u64::MAX)] {
+            let mut bad = footed.clone();
+            bad[footer + field..footer + field + 8].copy_from_slice(&value.to_be_bytes());
+            assert!(BootImage::parse(&bad).is_err(), "accepted bad footer field {field}");
+        }
+        let mut unknown = raw;
+        unknown.extend(b"do not silently discard another image section");
+        assert!(BootImage::parse(&with_avb(&unknown)).is_err());
+        let mut padded = with_avb(&unknown[..unknown.len() - 1]);
+        let footer = padded.len() - 64;
+        padded[footer + 12..footer + 20].copy_from_slice(&12288u64.to_be_bytes());
+        assert!(BootImage::parse(&padded).is_err(), "nonzero gap before vbmeta");
+        assert!(BootImage::parse(&footed[..footed.len() - 1]).is_err());
     }
 
     #[test]

@@ -18,6 +18,8 @@ pub mod data;
 pub mod keymint;
 #[cfg(any(target_os = "android", test))]
 pub mod keystore2;
+#[cfg(any(target_os = "android", test))]
+pub mod keystore1;
 
 #[cfg(target_os = "android")]
 impl keystore::Decryptor for keymint::KeyMint<'_> {
@@ -27,3 +29,6 @@ impl keystore::Decryptor for keymint::KeyMint<'_> {
         keymint::KeyMint::gcm_decrypt(self, key_blob, app_id, nonce, body, None)
     }
 }
+
+#[cfg(any(target_os = "android", test))]
+mod legacy_mount;
