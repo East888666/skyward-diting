@@ -1,0 +1,147 @@
+--- a/drivers/soc/qcom/Kconfig
++++ b/drivers/soc/qcom/Kconfig
+@@ -935,6 +935,18 @@
+ 	 programmed and managed through SCM calls to TZ where ICE driver
+ 	 will configure keys.
+ 
++config QTI_CRYPTO_TZ_LEGACY_ICE
++	bool "Use legacy UFS ICE Trustzone calls for polaris recovery"
++	depends on QTI_CRYPTO_TZ && SCSI_UFS_CRYPTO_QTI
++	select ENABLE_LEGACY_PFK if FS_ENCRYPTION
++	default n
++	help
++	  Opt in only for recovery builds using old SDM845 firmware and
++	  PRIVATE-mode filesystems created by the 4.9 PFK implementation.
++	  Use the five-argument ICE programming call, reserve hardware slots
++	  zero and one, and disable hardware-wrapped keys. The normal modern
++	  Trustzone interface remains unchanged when this option is disabled.
++
+ config MSM_BAM_DMUX
+ 	bool "BAM Data Mux Driver"
+ 	depends on SPS
+--- a/drivers/soc/qcom/crypto-qti-tz.h
++++ b/drivers/soc/qcom/crypto-qti-tz.h
+@@ -11,6 +11,19 @@
+ #define TZ_ES_CONFIG_SET_ICE_KEY_CE_TYPE 0x5
+ #define TZ_ES_INVALIDATE_ICE_KEY_CE_TYPE 0x6
+ #define TZ_ES_RETRIEVE_RAW_SECRET_CE_TYPE 0x7
++
++/* SDM845 firmware used by the legacy 4.9 PFK implementation. */
++#define TZ_ES_CONFIG_SET_ICE_KEY_LEGACY_ID \
++	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, 0x4)
++#define TZ_ES_INVALIDATE_ICE_KEY_LEGACY_ID \
++	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, 0x3)
++#define TZ_ES_CONFIG_SET_ICE_KEY_LEGACY_PARAM_ID \
++	TZ_SYSCALL_CREATE_PARAM_ID_5( \
++	TZ_SYSCALL_PARAM_TYPE_VAL, TZ_SYSCALL_PARAM_TYPE_BUF_RW, \
++	TZ_SYSCALL_PARAM_TYPE_VAL, TZ_SYSCALL_PARAM_TYPE_VAL, \
++	TZ_SYSCALL_PARAM_TYPE_VAL)
++#define TZ_ES_INVALIDATE_ICE_KEY_LEGACY_PARAM_ID \
++	TZ_SYSCALL_CREATE_PARAM_ID_1(TZ_SYSCALL_PARAM_TYPE_VAL)
+ 
+ #define TZ_ES_CONFIG_SET_ICE_KEY_CE_TYPE_ID \
+ 	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, \
+--- a/drivers/soc/qcom/crypto-qti-tz.c
++++ b/drivers/soc/qcom/crypto-qti-tz.c
+@@ -39,6 +39,11 @@
+ 		u32 words[BLK_CRYPTO_MAX_WRAPPED_KEY_SIZE / sizeof(u32)];
+ 	} key_new;
+ 
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE) &&
++	    (key->is_hw_wrapped || key->size != 64 ||
++	     storage_type != UFS_CE || slot < 2 || slot > 31))
++		return -EOPNOTSUPP;
++
+ 	err = qtee_shmbridge_allocate_shm(key->size, &shm);
+ 	if (err)
+ 		return -ENOMEM;
+@@ -63,6 +68,11 @@
+ 	desc.args[4] = data_unit_mask;
+ 	desc.args[5] = storage_type;
+ 
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE)) {
++		smc_id = TZ_ES_CONFIG_SET_ICE_KEY_LEGACY_ID;
++		desc.arginfo = TZ_ES_CONFIG_SET_ICE_KEY_LEGACY_PARAM_ID;
++		desc.args[5] = 0;
++	}
+ 
+ 	err = scm_call2_noretry(smc_id, &desc);
+ 	if (err)
+@@ -86,6 +96,14 @@
+ 	desc.arginfo = TZ_ES_INVALIDATE_ICE_KEY_CE_TYPE_PARAM_ID;
+ 	desc.args[0] = slot;
+ 	desc.args[1] = storage_type;
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE)) {
++		if (storage_type != UFS_CE || slot < 2 || slot > 31)
++			return -EOPNOTSUPP;
++		smc_id = TZ_ES_INVALIDATE_ICE_KEY_LEGACY_ID;
++		desc.arginfo = TZ_ES_INVALIDATE_ICE_KEY_LEGACY_PARAM_ID;
++		desc.args[1] = 0;
++	}
+ 
+ 	err = scm_call2_noretry(smc_id, &desc);
+ 	if (err)
+--- a/drivers/scsi/ufs/ufshcd-crypto-qti.c
++++ b/drivers/scsi/ufs/ufshcd-crypto-qti.c
+@@ -27,6 +27,10 @@
+ 
+ #define NUM_KEYSLOTS(hba) (hba->crypto_capabilities.config_count + 1)
+ 
++/* Old PFK firmware reserves hardware slots 0 and 1 for full-disk keys. */
++#define LEGACY_ICE_SLOT_OFFSET \
++	(IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE) ? 2 : 0)
++
+ static struct ufs_hba_crypto_variant_ops ufshcd_crypto_qti_variant_ops = {
+ 	.hba_init_crypto = ufshcd_crypto_qti_init_crypto,
+ 	.enable = ufshcd_crypto_qti_enable,
+@@ -107,7 +111,8 @@
+ 		goto out;
+ 	}
+ 
+-	err = crypto_qti_keyslot_program(hba->crypto_vops->priv, key, slot,
++	err = crypto_qti_keyslot_program(hba->crypto_vops->priv, key,
++					slot + LEGACY_ICE_SLOT_OFFSET,
+ 					data_unit_mask, crypto_alg_id);
+ 	if (err)
+ 		pr_err("%s: failed with error %d\n", __func__, err);
+@@ -138,7 +143,8 @@
+ 		return err;
+ 	}
+ 
+-	err = crypto_qti_keyslot_evict(hba->crypto_vops->priv, slot);
++	err = crypto_qti_keyslot_evict(hba->crypto_vops->priv,
++				     slot + LEGACY_ICE_SLOT_OFFSET);
+ 	if (err) {
+ 		pr_err("%s: failed with error %d\n",
+ 			__func__, err);
+@@ -238,10 +244,18 @@
+ 			hba->crypto_cap_array[cap_idx].sdus_mask * 512;
+ 	}
+ 
+-	hba->ksm = keyslot_manager_create(hba->dev, ufshcd_num_keyslots(hba),
++	if (ufshcd_num_keyslots(hba) <= LEGACY_ICE_SLOT_OFFSET) {
++		err = -EINVAL;
++		goto out;
++	}
++	hba->ksm = keyslot_manager_create(hba->dev,
++					  (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE) ?
++					   min_t(unsigned int, ufshcd_num_keyslots(hba), 32) :
++					   ufshcd_num_keyslots(hba)) - LEGACY_ICE_SLOT_OFFSET,
+ 					  ksm_ops,
+ 					  BLK_CRYPTO_FEATURE_STANDARD_KEYS |
+-					  BLK_CRYPTO_FEATURE_WRAPPED_KEYS,
++					  (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE) ? 0 :
++					   BLK_CRYPTO_FEATURE_WRAPPED_KEYS),
+ 					  crypto_modes_supported, hba);
+ 
+ 	if (!hba->ksm) {
+@@ -341,7 +355,7 @@
+ 		return -EINVAL;
+ 
+ 	lrbp->crypto_enable = true;
+-	lrbp->crypto_key_slot = bc->bc_keyslot;
++	lrbp->crypto_key_slot = bc->bc_keyslot + LEGACY_ICE_SLOT_OFFSET;
+ 	if (bc->is_ext4) {
+ 		lrbp->data_unit_num = (u64)cmd->request->bio->bi_iter.bi_sector;
+ 		lrbp->data_unit_num >>= 3;

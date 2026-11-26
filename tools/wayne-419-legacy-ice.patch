@@ -1,0 +1,303 @@
+diff --git a/drivers/soc/qcom/Kconfig b/drivers/soc/qcom/Kconfig
+--- a/drivers/soc/qcom/Kconfig
++++ b/drivers/soc/qcom/Kconfig
+@@ -921,6 +921,20 @@
+ 	 programmed and managed through SCM calls to TZ where ICE driver
+ 	 will configure keys.
+ 
++config QTI_CRYPTO_TZ_SDM660_LEGACY_ICE
++	bool "Use legacy SDM660 eMMC ICE calls for recovery"
++	depends on ARCH_SDM660 && QTI_CRYPTO_TZ
++	depends on MMC_CQHCI_CRYPTO_QTI && FS_ENCRYPTION_INLINE_CRYPT
++	depends on !SCSI_UFS_CRYPTO_QTI
++	select ENABLE_LEGACY_PFK
++	default n
++	help
++	  Opt in only for SDM660 recovery builds reading legacy PRIVATE-mode
++	  filesystems created by the 4.4 PFK driver. Use the separate key/salt
++	  Trustzone call, reserve slots zero and one, and disable wrapped keys.
++	  This is not the SDM845/UFS legacy interface. Leave disabled for normal
++	  kernels and devices using the modern ICE interface.
++
+ config MSM_BAM_DMUX
+ 	bool "BAM Data Mux Driver"
+ 	depends on SPS
+diff --git a/drivers/soc/qcom/crypto-qti-tz.h b/drivers/soc/qcom/crypto-qti-tz.h
+--- a/drivers/soc/qcom/crypto-qti-tz.h
++++ b/drivers/soc/qcom/crypto-qti-tz.h
+@@ -11,6 +11,19 @@
+ #define TZ_ES_CONFIG_SET_ICE_KEY_CE_TYPE 0x5
+ #define TZ_ES_INVALIDATE_ICE_KEY_CE_TYPE 0x6
+ #define TZ_ES_RETRIEVE_RAW_SECRET_CE_TYPE 0x7
++
++/* SDM660 4.4 PFK takes separate 32-byte key and salt buffers. */
++#define TZ_ES_SET_ICE_KEY_SDM660_LEGACY_ID \
++	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, 0x2)
++#define TZ_ES_INVALIDATE_ICE_KEY_SDM660_LEGACY_ID \
++	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, 0x3)
++#define TZ_ES_SET_ICE_KEY_SDM660_LEGACY_PARAM_ID \
++	TZ_SYSCALL_CREATE_PARAM_ID_5( \
++	TZ_SYSCALL_PARAM_TYPE_VAL, TZ_SYSCALL_PARAM_TYPE_BUF_RW, \
++	TZ_SYSCALL_PARAM_TYPE_VAL, TZ_SYSCALL_PARAM_TYPE_BUF_RW, \
++	TZ_SYSCALL_PARAM_TYPE_VAL)
++#define TZ_ES_INVALIDATE_ICE_KEY_SDM660_LEGACY_PARAM_ID \
++	TZ_SYSCALL_CREATE_PARAM_ID_1(TZ_SYSCALL_PARAM_TYPE_VAL)
+ 
+ #define TZ_ES_CONFIG_SET_ICE_KEY_CE_TYPE_ID \
+ 	TZ_SYSCALL_CREATE_SMC_ID(TZ_OWNER_SIP, TZ_SVC_ES, \
+diff --git a/drivers/soc/qcom/crypto-qti-tz.c b/drivers/soc/qcom/crypto-qti-tz.c
+--- a/drivers/soc/qcom/crypto-qti-tz.c
++++ b/drivers/soc/qcom/crypto-qti-tz.c
+@@ -39,6 +39,12 @@
+ 		u32 words[BLK_CRYPTO_MAX_WRAPPED_KEY_SIZE / sizeof(u32)];
+ 	} key_new;
+ 
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE) &&
++	    (storage_type != SDCC_CE || slot < 2 || slot > 31 ||
++	     key->is_hw_wrapped || key->size != 64 ||
++	     key->crypto_mode != BLK_ENCRYPTION_MODE_AES_256_XTS))
++		return -EOPNOTSUPP;
++
+ 	err = qtee_shmbridge_allocate_shm(key->size, &shm);
+ 	if (err)
+ 		return -ENOMEM;
+@@ -46,7 +52,9 @@
+ 	tzbuf = shm.vaddr;
+ 
+ 	memcpy(key_new.bytes, key->raw, key->size);
+-	if (!key->is_hw_wrapped) {
++	/* The SDM660 PFK ABI consumes the original derived key bytes. */
++	if (!key->is_hw_wrapped &&
++	    !IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
+ 		for (i = 0; i < ARRAY_SIZE(key_new.words); i++)
+ 			__cpu_to_be32s(&key_new.words[i]);
+ 	}
+@@ -63,12 +71,28 @@
+ 	desc.args[4] = data_unit_mask;
+ 	desc.args[5] = storage_type;
+ 
+-
+-	err = scm_call2_noretry(smc_id, &desc);
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
++		smc_id = TZ_ES_SET_ICE_KEY_SDM660_LEGACY_ID;
++		desc.arginfo = TZ_ES_SET_ICE_KEY_SDM660_LEGACY_PARAM_ID;
++		desc.args[2] = 32;
++		desc.args[3] = shm.paddr + 32;
++		desc.args[4] = 32;
++		desc.args[5] = 0;
++	}
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE))
++		err = scm_call2(smc_id, &desc);
++	else
++		err = scm_call2_noretry(smc_id, &desc);
+ 	if (err)
+ 		pr_err("%s:SCM call Error: 0x%x slot %d\n",
+ 				__func__, err, slot);
+ 
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
++		memzero_explicit(&key_new, sizeof(key_new));
++		memzero_explicit(tzbuf, key->size);
++		dmac_flush_range(tzbuf, tzbuf + key->size);
++	}
+ 	qtee_shmbridge_free_shm(&shm);
+ 
+ 	return err;
+@@ -81,13 +105,26 @@
+ 	uint32_t smc_id = 0;
+ 	struct scm_desc desc = {0};
+ 
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE) &&
++	    (storage_type != SDCC_CE || slot < 2 || slot > 31))
++		return -EOPNOTSUPP;
++
+ 	smc_id = TZ_ES_INVALIDATE_ICE_KEY_CE_TYPE_ID;
+ 
+ 	desc.arginfo = TZ_ES_INVALIDATE_ICE_KEY_CE_TYPE_PARAM_ID;
+ 	desc.args[0] = slot;
+ 	desc.args[1] = storage_type;
+ 
+-	err = scm_call2_noretry(smc_id, &desc);
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
++		smc_id = TZ_ES_INVALIDATE_ICE_KEY_SDM660_LEGACY_ID;
++		desc.arginfo = TZ_ES_INVALIDATE_ICE_KEY_SDM660_LEGACY_PARAM_ID;
++		desc.args[1] = 0;
++	}
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE))
++		err = scm_call2(smc_id, &desc);
++	else
++		err = scm_call2_noretry(smc_id, &desc);
+ 	if (err)
+ 		pr_err("%s:SCM call Error: 0x%x\n", __func__, err);
+ 	return err;
+@@ -103,6 +140,9 @@
+ 
+ 	struct scm_desc desc = {0};
+ 	char *tzbuf_key;
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE))
++		return -EOPNOTSUPP;
+ 
+ 	err = qtee_shmbridge_allocate_shm(wrapped_key_size, &shm_key);
+ 	if (err)
+diff --git a/drivers/mmc/host/cqhci-crypto-qti.c b/drivers/mmc/host/cqhci-crypto-qti.c
+--- a/drivers/mmc/host/cqhci-crypto-qti.c
++++ b/drivers/mmc/host/cqhci-crypto-qti.c
+@@ -31,6 +31,29 @@
+ #define MINIMUM_DUN_SIZE 512
+ #define MAXIMUM_DUN_SIZE 65536
+ 
++/* SDM660 PFK firmware reserves slots 0 and 1 for full-disk encryption. */
++#define SDM660_LEGACY_ICE_SLOT_OFFSET \
++	(IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE) ? 2 : 0)
++
++static unsigned int cqhci_qti_num_keyslots(struct cqhci_host *host)
++{
++	unsigned int slots = cqhci_num_keyslots(host);
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
++		slots = min_t(unsigned int, slots, 32);
++		if (slots <= SDM660_LEGACY_ICE_SLOT_OFFSET)
++			return 0;
++		slots -= SDM660_LEGACY_ICE_SLOT_OFFSET;
++	}
++	return slots;
++}
++
++static bool cqhci_qti_keyslot_valid(struct cqhci_host *host,
++				    unsigned int slot)
++{
++	return slot < cqhci_qti_num_keyslots(host);
++}
++
+ static struct cqhci_host_crypto_variant_ops cqhci_crypto_qti_variant_ops = {
+ 	.host_init_crypto = cqhci_crypto_qti_init_crypto,
+ 	.enable = cqhci_crypto_qti_enable,
+@@ -113,7 +136,7 @@
+ 	pm_runtime_get_sync(&host->mmc->card->dev);
+ 
+ 	if (!cqhci_is_crypto_enabled(host) ||
+-	    !cqhci_keyslot_valid(host, slot) ||
++	    !cqhci_qti_keyslot_valid(host, slot) ||
+ 	    !ice_cap_idx_valid(host, crypto_alg_id)) {
+ 		pm_runtime_put_sync(&host->mmc->card->dev);
+ 		return -EINVAL;
+@@ -128,7 +151,8 @@
+ 	}
+ 
+ 	err = crypto_qti_keyslot_program(host->crypto_vops->priv, key,
+-					 slot, data_unit_mask, crypto_alg_id);
++					 slot + SDM660_LEGACY_ICE_SLOT_OFFSET,
++					 data_unit_mask, crypto_alg_id);
+ 	if (err)
+ 		pr_err("%s: failed with error %d\n", __func__, err);
+ 
+@@ -146,12 +170,13 @@
+ 	pm_runtime_get_sync(&host->mmc->card->dev);
+ 
+ 	if (!cqhci_is_crypto_enabled(host) ||
+-	    !cqhci_keyslot_valid(host, slot)) {
++	    !cqhci_qti_keyslot_valid(host, slot)) {
+ 		pm_runtime_put_sync(&host->mmc->card->dev);
+ 		return -EINVAL;
+ 	}
+ 
+-	err = crypto_qti_keyslot_evict(host->crypto_vops->priv, slot);
++	err = crypto_qti_keyslot_evict(host->crypto_vops->priv,
++				       slot + SDM660_LEGACY_ICE_SLOT_OFFSET);
+ 	if (err)
+ 		pr_err("%s: failed with error %d\n", __func__, err);
+ 
+@@ -199,6 +224,8 @@
+ 	int cap_idx = 0;
+ 	int err = 0;
+ 	unsigned int crypto_modes_supported[BLK_ENCRYPTION_MODE_MAX];
++	unsigned int features = BLK_CRYPTO_FEATURE_STANDARD_KEYS |
++				BLK_CRYPTO_FEATURE_WRAPPED_KEYS;
+ 	enum blk_crypto_mode_num blk_mode_num;
+ 
+ 	/* Default to disabling crypto */
+@@ -249,11 +276,18 @@
+ 				host->crypto_cap_array[cap_idx].sdus_mask * 512;
+ 	}
+ 
++	if (!cqhci_qti_num_keyslots(host)) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE))
++		features &= ~BLK_CRYPTO_FEATURE_WRAPPED_KEYS;
++
+ 	host->ksm = keyslot_manager_create(host->mmc->parent,
+-					   cqhci_num_keyslots(host), ksm_ops,
+-					   BLK_CRYPTO_FEATURE_STANDARD_KEYS |
+-					   BLK_CRYPTO_FEATURE_WRAPPED_KEYS,
+-					   crypto_modes_supported, host);
++					 cqhci_qti_num_keyslots(host), ksm_ops,
++					 features,
++					 crypto_modes_supported, host);
+ 
+ 	if (!host->ksm) {
+ 		err = -ENOMEM;
+@@ -366,7 +400,7 @@
+ 
+ 	bc = req->bio->bi_crypt_context;
+ 
+-	if (!cqhci_keyslot_valid(host, bc->bc_keyslot))
++	if (!cqhci_qti_keyslot_valid(host, bc->bc_keyslot))
+ 		return -EINVAL;
+ 
+ 	if (!(atomic_read(&keycache) & (1 << bc->bc_keyslot))) {
+@@ -391,7 +425,9 @@
+ 		else
+ 			*ice_ctx = DATA_UNIT_NUM(bc->bc_dun[0]);
+ 
+-		*ice_ctx = *ice_ctx | CRYPTO_CONFIG_INDEX(bc->bc_keyslot) |
++		*ice_ctx = *ice_ctx |
++			CRYPTO_CONFIG_INDEX(bc->bc_keyslot +
++					    SDM660_LEGACY_ICE_SLOT_OFFSET) |
+ 			    CRYPTO_ENABLE(true);
+ 	}
+ 	return 0;
+diff --git a/fs/crypto/keysetup_v1.c b/fs/crypto/keysetup_v1.c
+--- a/fs/crypto/keysetup_v1.c
++++ b/fs/crypto/keysetup_v1.c
+@@ -349,10 +349,15 @@
+ 		memcpy(key_new.bytes, raw_master_key, ci->ci_mode->keysize);
+ #endif
+ 
+-		for (i = 0; i < ARRAY_SIZE(key_new.words); i++)
+-			__cpu_to_be32s(&key_new.words[i]);
++		/* Match the raw key/salt bytes consumed by the 4.4 PFK ABI. */
++		if (!IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE)) {
++			for (i = 0; i < ARRAY_SIZE(key_new.words); i++)
++				__cpu_to_be32s(&key_new.words[i]);
++		}
+ 
+ 		err = setup_v1_file_key_direct(ci, key_new.bytes);
++		if (IS_ENABLED(CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE))
++			memzero_explicit(&key_new, sizeof(key_new));
+ 
+ 		if (derived_key)
+ 			kzfree(derived_key);
+diff --git a/arch/arm64/configs/wayne_skyward_legacyice.config b/arch/arm64/configs/wayne_skyward_legacyice.config
+new file mode 100644
+--- /dev/null
++++ b/arch/arm64/configs/wayne_skyward_legacyice.config
+@@ -0,0 +1,14 @@
++# Experimental recovery-only compatibility for LOS 18.1 PRIVATE-mode FBE.
++# Merge into the config extracted from the matching Wayne Melon recovery.
++# This does not enable the separate userspace RPMB ioctl compatibility shim.
++CONFIG_ARCH_SDM660=y
++CONFIG_BLK_INLINE_ENCRYPTION=y
++CONFIG_FS_ENCRYPTION=y
++CONFIG_FS_ENCRYPTION_INLINE_CRYPT=y
++CONFIG_MMC_CQHCI_CRYPTO=y
++CONFIG_MMC_CQHCI_CRYPTO_QTI=y
++CONFIG_QTI_CRYPTO_COMMON=y
++CONFIG_QTI_CRYPTO_TZ=y
++# CONFIG_SCSI_UFS_CRYPTO_QTI is not set
++CONFIG_ENABLE_LEGACY_PFK=y
++CONFIG_QTI_CRYPTO_TZ_SDM660_LEGACY_ICE=y

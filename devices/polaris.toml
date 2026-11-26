@@ -1,5 +1,5 @@
-# Xiaomi MIX 2S / polaris, based on the supplied MIUI 12.5 recovery and
-# the Polaris device trees appended to boot.img.
+# Xiaomi MIX 2S / polaris. The active profile uses the patched 4.19.325
+# recovery kernel and its original appended Polaris device trees.
 # Reference: https://github.com/juezhi6668/skyward/blob/main/devices/chiron.toml
 #
 # Requires this tree's non-A/B implementation (not just a TOML copy into
@@ -11,6 +11,16 @@
 # Both plain and legacy FBE data paths also require the journal fix:
 # replay before inspecting directories, then mount with normal fstab
 # options. Writing through rw,norecovery was observed after legacy unlock.
+# SmartisanOS 8.5.3 / Android 11 was verified with the patched 4.19 kernel.
+# Current profile targets AviumUI 16.2.1 / Android 16.
+# Requires tools/polaris-419-legacy-ice.patch in the kernel and
+# CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE=y; TOML alone does not fix the stock kernel.
+# Use target/stock/polaris/recovery-419-legacyice-base.img as --stock.
+# Automatic legacy mount selection authenticates DE key files read-only.
+# PRIVATE/ICE can probe both inlinecrypt paths before exposing user data.
+# Both ROMs still require validation with this single packed version header;
+# see polaris-notes.md for tested combinations and remaining limits.
+# See polaris-notes.md for reproduction steps and tested limitations.
 # Script installs require this tree's stop-before-unmount path: installed
 # hardware services use system/vendor files and runtime APEX loop mounts.
 # It retires their supervisors, releases those bundles, then normally
@@ -44,25 +54,45 @@ ramdisk_libraries_only = true
 # subcommands and would start a second service instead. On those images,
 # use adb pull /skyward/run/recovery.log and adb shell dmesg directly.
 capture_stdio = true
-# Match the installed boot header and system build, not the older stock
-# recovery: Android 12 / 2022-09. The packer sets BOTH the legacy header
-# and properties. A RAM-only update cannot change the booted header.
-# Cold-boot logs now show the configured hardware services start. Encrypted
-# CE/DE unlock remains unverified; opening formatted plain data is separate.
-legacy_version = { release = "12.0.0", security_patch = "2022-09-05" }
+# The legacy stock policy denies the loop worker use of a descriptor
+# opened by recovery. Open APEX backing files in the existing su domain;
+# keep the UI and other services in their original domains.
+apex_loop_context = "u:r:su:s0"
+# Match the inspected AviumUI 16.2.1 boot header: Android 16 / 2026-04.
+# The packer sets BOTH the legacy header and properties; changing a RAM
+# config cannot repair a session booted with the old Android 12 header.
+# Previously tested Smartisan-only header: 12.0.0 / 2022-09-05.
+# Axion's different 16.0.0 / 2026-07-01 header remains unverified here.
+# Keep header/properties consistent. Old blobs may use Keymaster's existing
+# in-memory upgrade; no key or version marker is rewritten on disk.
+# One-header Smartisan compatibility is not yet device-verified.
+legacy_fbe_auto = true
+legacy_version = { release = "16.0.0", security_patch = "2026-04-01" }
 
 [firmware]
 partition = "modem"
 
+[partitions]
+# Axion 2.8 reuses cust for its EROFS system_ext image. Keep the physical
+# partition mounted at /cust, with the ext4 layout retained as a fallback.
+mounted = ["cust"]
+
+# Axion's /system/bin/hwservicemanager is an absolute symlink into
+# /system/system_ext. Recreate only that alias in the writable ramdisk.
+# Installed partitions remain read-only; repeat startup is idempotent.
+[[service]]
+when = { property = "ro.build.version.sdk", value = "36" }
+path = "/system/bin/sh"
+args = ["-c", "test -x /cust/bin/hwservicemanager && { test -e /system/system_ext || ln -s /cust /system/system_ext; }"]
+oneshot = true
+
 # Run installed services with their own runtime rather than stock's linker.
-# These paths were checked against the installed MIUI 12.5 vendor image.
-# They have not been validated against crDroid 10.1 / Android 14. The latest
-# interrupted flash left system ext4 errors; do not guess library paths or
-# change the legacy boot version from files on that incomplete system.
+# MIUI 12.5 and Axion 2.8 both carry these vendor HALs. Axion's service
+# directory resolves through the ramdisk alias above into cust/system_ext.
 [[service]]
 path = "/system_root/system/bin/hwservicemanager"
 loader = "/apex/com.android.runtime/bin/linker64"
-libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64", "/cust/lib64"]
 user = "system"
 groups = ["system", "readproc"]
 ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
@@ -103,7 +133,7 @@ user = "system"
 group = "system"
 mode = 0o664
 
-# The supplied 4.9 kernel exposes KMS. This tree's display-event reader
+# Both tested kernels expose KMS. This tree's display-event reader
 # accepts legacy flip events with crtc_id=0, avoiding the drm crate panic.
 [display]
 width = 1080
@@ -192,8 +222,17 @@ extras = "wait,check,formattable"
 device = "/dev/block/bootdevice/by-name/userdata"
 mount_point = "/data"
 filesystem = "ext4"
+# Safe initial inspection without inlinecrypt. legacy_fbe_auto selects the
+# authenticated DE storage before user keys, retaining it for writable mounts.
 options = "noatime,nosuid,nodev,barrier=1,data=ordered,noauto_da_alloc"
 extras = "wait,check,encryptable=footer,formattable"
+
+[[fstab]]
+device = "/dev/block/bootdevice/by-name/cust"
+mount_point = "/cust"
+filesystem = "erofs"
+options = "ro"
+extras = "wait"
 
 [[fstab]]
 device = "/dev/block/bootdevice/by-name/cust"
@@ -238,9 +277,10 @@ extras = "wait"
 # MTP requires this tree's FunctionFS init/packer fixes. A temporary USB
 # switching test still rebooted the phone; full-image validation is pending.
 #
-# Wi-Fi remains disabled in the small build. The legacy Keymaster path
-# still needs end-to-end data unlock validation; haptics above uses the
-# verified LED-class driver rather than a force-feedback input device.
+# Wi-Fi remains disabled in the small build. Legacy data unlock was
+# verified with SmartisanOS 8.5.3 / Android 11 without a screen credential;
+# Axion fscrypt v2 and credential unlock need their own validation. Haptics
+# above uses the verified LED-class driver.
 #
 # Stock properties identify V12.5.1.0.QDGCNXM / Android 10 (SDK 29).
 # There is no [stock] block until the matching full OTA URL and full

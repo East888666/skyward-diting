@@ -2,8 +2,14 @@
 # Checked against wayne/{boot,recovery,vendor}.img, MIUI V12.0.2.0.PDCCNXM.
 # See wayne-notes.md for evidence, build requirements and remaining blockers.
 # The packer detects the supplied /sbin/recovery layout automatically.
-# Build static API 28 programs; shell tools and stock FDE remain separate
-# runtime limitations documented in wayne-notes.md.
+# Use the matching current source for legacy FBE password unlock.
+# LOS 18.1/API30 services below were read from the connected device.
+# Original MIUI FDE remains a separate unsupported encryption layout.
+# LOS 18.1 password unlock was verified with its own 4.4 boot kernel.
+# Combine that kernel with the recovery ramdisk before packing; see notes.
+# Stock Melon 4.19 still needs separate RPMB and kernel ICE compatibility.
+# The experimental source patch is tools/wayne-419-legacy-ice.patch; it has
+# not been compiled or verified for full unlock. See tools/wayne-melon419/.
 
 # Recovery capacity verified with blockdev: 64 MiB (67,108,864 bytes).
 # Pass --partition-size 67108864 to skyward-pack recovery; this is a build-time
@@ -25,8 +31,15 @@ os_version_prop = "ro.build.version.incremental"
 capture_stdio = true
 # Stock executables are static; there is no system/etc/ld.config.txt.
 # Polaris's ramdisk library flags do not apply to this recovery.
-# No legacy_version override: supplied boot and recovery both report
-# Android 9 / 2020-11, matching prop.default's 2020-11-05 patch level.
+# Direct-mounted LOS FBE uses vendor Keymaster 3, not AIDL KeyMint.
+# Requires the credential and file-backed keystore fixes in this tree.
+legacy_fbe = true
+# Match the installed LOS 18.1 boot header and security properties.
+# The supplied recovery header is Android 13 / 2023-02; Keymaster returned
+# configure -38 when launched with the installed Android 11 properties.
+# Align the packed header and runtime properties. Full password unlock
+# was verified with the installed LOS 18.1 kernel, not the Melon kernel.
+legacy_version = { release = "11.0.0", security_patch = "2022-10-05" }
 
 [display]
 width = 1080
@@ -56,11 +69,12 @@ load = []
 # CONFIG_TOUCHSCREEN_NT36xxx=y and CONFIG_TOUCHSCREEN_NVT_D2S=y;
 # no external touch module or unverified touch sysfs writes are needed.
 
-# Live Melon kernel: qti-haptics on event2 advertises FF_PERIODIC.
-# DT waveform 0 plays for 15 ms; CLI test succeeded and the owner felt it.
-# This replaces the old MIUI timed-output assumption for this recovery.
+# Verified LOS 18.1's 4.4 kernel exposes the legacy timed_output driver.
+# The Melon 4.19 kernel instead needs click=0 (FF_PERIODIC), but failed
+# to open these LOS keys even after its RPMB node alias was supplied.
 [haptics]
-click = 0
+timed_output = "/sys/class/timed_output/vibrator"
+drive = 40
 strength = { lightest = 0.5, strongest = 1.0 }
 
 [backup]
@@ -96,8 +110,9 @@ options = "noatime,nosuid,nodev,barrier=1,data=ordered"
 extras = "wait,check,formattable"
 
 # Stock recovery: encryptable=footer; stock vendor: forceencrypt=footer.
-# This is FDE. Skyward's current FBE implementation cannot unlock it.
-# Keep the flag truthful; removing it does not decrypt existing data.
+# MIUI uses FDE, which this FBE path cannot unlock. LOS 18.1 instead
+# stores direct-mounted FBE with mode ice:aes-256-cts:v1. The runtime
+# inspects actual policies/keys and never treats encrypted data as plain.
 [[fstab]]
 device = "/dev/block/bootdevice/by-name/userdata"
 mount_point = "/data"
@@ -166,5 +181,69 @@ extras = "wait,check"
 
 # Do not copy the stock mmcblk1p1 /sdcard placeholder: /sdcard is used for
 # shared internal storage. This image alone does not prove a card exists.
-# No [wlan] or Keymaster service set: those need separate runtime support
-# and testing. No [stock] until a matching OTA URL/hash is verified.
+# No [wlan] or [stock] until matching files/URL/hash are verified.
+
+# LOS 18.1/API30: installed service paths, accounts and readiness read
+# from its init scripts. Keep these gated to that inspected system layout.
+# The matching runtime mounts flattened APEX read-only automatically.
+[[service]]
+when = { property = "ro.build.version.sdk", value = "30" }
+path = "/system_root/system/bin/hwservicemanager"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/apex/com.android.runtime/lib64/bionic", "/system_root/system/lib64"]
+user = "system"
+groups = ["system", "readproc"]
+ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
+
+# The Melon 4.19 kernel exposes RPMB as /dev/mmcblk0rpmb (character
+# device), while this LOS 18.1 vendor opens the old /dev/block path.
+# Create the alias before qseecomd's first initialization. The matching
+# 4.4 kernel already has the old block device and needs no alias.
+[[service]]
+when = { property = "ro.build.version.sdk", value = "30" }
+path = "/system/bin/sh"
+args = ["-c", "if [ -c /dev/mmcblk0rpmb ] && [ ! -e /dev/block/mmcblk0rpmb ]; then ln -s /dev/mmcblk0rpmb /dev/block/mmcblk0rpmb; fi"]
+user = "root"
+groups = ["root"]
+oneshot = true
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "30" }
+path = "/vendor/bin/qseecomd"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "root"
+groups = ["root"]
+ready_property = "vendor.sys.listeners.registered"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "30" }
+path = "/vendor/bin/hw/android.hardware.keymaster@3.0-service-qti"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "system"
+groups = ["system", "drmrpc"]
+ready_hardware_service = "android.hardware.keymaster@3.0::IKeymasterDevice/default"
+
+[[service]]
+when = { property = "ro.build.version.sdk", value = "30" }
+path = "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service-qti"
+loader = "/apex/com.android.runtime/bin/linker64"
+libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
+user = "system"
+groups = ["system"]
+ready_hardware_service = "android.hardware.gatekeeper@1.0::IGatekeeper/default"
+
+# These nodes were root:root 0600 in recovery. Installed ueventd hands
+# them to the HAL accounts; keep that ownership in this recovery too.
+[[owners]]
+paths = ["/dev/qseecom"]
+user = "system"
+group = "drmrpc"
+mode = 0o660
+
+[[owners]]
+paths = ["/dev/ion"]
+user = "system"
+group = "system"
+mode = 0o664
