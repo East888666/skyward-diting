@@ -109,6 +109,14 @@ pub struct Recovery {
     /// independent of A/B slots and defaults to enabled for existing devices.
     #[serde(default = "default_true")]
     pub fastbootd: bool,
+    /// Include the packer's bundled static ARM64 AWK for ROM install scripts.
+    /// Disabled by default to preserve other devices' ramdisk contents and size.
+    #[serde(default)]
+    pub awk: bool,
+    /// Bundle the ARM64 legacy RPMB ioctl adapter. Only services explicitly
+    /// preloading it are affected; disabled for all other configurations.
+    #[serde(default)]
+    pub legacy_rpmb_compat: bool,
     /// Keep the device's explicitly configured key services and loader/library
     /// overrides instead of discovering a second set from installed partitions.
     #[serde(default)]
@@ -140,6 +148,10 @@ pub struct Recovery {
     /// Off by default; never applied to A/B metadata-encrypted data.
     #[serde(default)]
     pub legacy_fbe_auto: bool,
+    /// Opt in to Qualcomm eMMC cryptfs 1.3 / KDF5 FDE using this kernel's
+    /// whole-userdata ICE path. Requires verified matching security services.
+    #[serde(default)]
+    pub legacy_fde: bool,
     /// Optional SELinux domain for the short-lived APEX loop helper.
     /// Some legacy policies deny kernel threads access to recovery-owned
     /// file descriptors even when the recovery domain is permissive.
@@ -153,6 +165,8 @@ impl Default for Recovery {
         Self {
             ramdisk_compression: None,
             fastbootd: true,
+            awk: false,
+            legacy_rpmb_compat: false,
             manual_key_services: false,
             ramdisk_libraries_first: false,
             ramdisk_libraries_only: false,
@@ -160,6 +174,7 @@ impl Default for Recovery {
             legacy_version: None,
             legacy_fbe: false,
             legacy_fbe_auto: false,
+            legacy_fde: false,
             apex_loop_context: None,
         }
     }
@@ -512,6 +527,11 @@ pub struct Display {
     /// wake after screen-off retains the full power and mapping recovery path.
     #[serde(default)]
     pub fbdev_skip_initial_power_cycle: bool,
+    /// Opt in to Qualcomm WALT's per-thread TASK_BOOST_ON_MAX hint for the
+    /// UI thread. Requires the matching /proc/<tid>/sched_boost ABI.
+    /// Does not restrict CPU affinity or change thermal/frequency limits.
+    #[serde(default)]
+    pub qcom_ui_boost: bool,
     /// How round the screen's corners are, as a radius in pixels; a page
     /// sliding over another rounds its leading corners to it.
     #[serde(default)]
@@ -573,6 +593,13 @@ pub struct Service {
     /// the recovery loader belongs to an older Android release.
     #[serde(default)]
     pub loader: Option<String>,
+    /// Pre-APEX linkers do not accept an executable argument. Stage a RAM
+    /// copy with this ELF interpreter instead; never change installed files.
+    #[serde(default)]
+    pub interpreter: Option<String>,
+    /// Explicit, per-service preload libraries (for the legacy RPMB ABI).
+    #[serde(default)]
+    pub preload: Vec<String>,
     /// Extra installed VINTF description needed before this program starts.
     #[serde(default)]
     pub description: Option<String>,
@@ -691,7 +718,9 @@ impl Service {
     /// Whether the program, or a directory it loads libraries from, is
     /// under `dir`: without what is mounted there it cannot start again.
     pub fn uses(&self, dir: &Path) -> bool {
-        Path::new(&self.path).starts_with(dir) || self.libraries.iter().any(|l| Path::new(l).starts_with(dir))
+        Path::new(&self.path).starts_with(dir)
+            || self.loader.iter().chain(&self.interpreter).chain(&self.preload).chain(&self.libraries)
+                .any(|l| Path::new(l).starts_with(dir))
     }
 
     /// Whether the program is this phone's to run, by the installed
@@ -744,6 +773,10 @@ impl DeviceConfig {
             version.encoded()?;
         }
         ensure!(!cfg.recovery.legacy_fbe || !cfg.device.ab, "legacy_fbe is only for non-A/B recovery");
+        ensure!(!cfg.recovery.legacy_fde || !cfg.device.ab, "legacy_fde is only for non-A/B recovery");
+        for service in &cfg.services {
+            ensure!(service.loader.is_none() || service.interpreter.is_none(), "service cannot set both loader and interpreter");
+        }
         ensure!(!cfg.recovery.legacy_fbe_auto || (!cfg.device.ab && cfg.recovery.uses_legacy_fbe()),
             "legacy_fbe_auto requires non-A/B legacy FBE");
         if let Some(context) = &cfg.recovery.apex_loop_context {
@@ -949,6 +982,27 @@ mod tests {
     }
 
     #[test]
+    fn bundled_awk_is_opt_in_and_enabled_for_polaris() {
+        assert!(!Recovery::default().awk);
+        for text in [
+            "[device]\ncodename = 'test'\n",
+            "[device]\ncodename = 'test'\n[recovery]\ncapture_stdio = true\n",
+            "[device]\ncodename = 'test'\n[recovery]\nawk = false\n",
+        ] {
+            assert!(!DeviceConfig::parse(text).unwrap().recovery.awk);
+        }
+        assert!(DeviceConfig::parse("[device]\ncodename = 'test'\n[recovery]\nawk = true\n").unwrap().recovery.awk);
+        for (text, enabled) in [
+            (include_str!("../../../devices/polaris.toml"), true),
+            (include_str!("../../../devices/diting.toml"), false),
+            (include_str!("../../../devices/wayne.toml"), false),
+            (include_str!("../../../devices/jason.toml"), false),
+        ] {
+            assert_eq!(DeviceConfig::parse(text).unwrap().recovery.awk, enabled);
+        }
+    }
+
+    #[test]
     fn fastbootd_defaults_on_independently_of_slots_and_only_polaris_opts_out() {
         assert!(Recovery::default().fastbootd);
         for config in [
@@ -964,6 +1018,24 @@ mod tests {
             if path.extension().is_some_and(|s| s == "toml") {
                 let cfg = DeviceConfig::load(&path).unwrap();
                 assert_eq!(cfg.recovery.fastbootd, cfg.device.codename != "polaris", "{}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    fn qualcomm_ui_boost_is_opt_in_and_only_wayne_enables_it() {
+        assert!(!Display::default().qcom_ui_boost);
+        for text in [
+            "[device]\ncodename = 'test'\n",
+            "[device]\ncodename = 'test'\n[display]\nwidth = 1080\n",
+        ] {
+            assert!(!DeviceConfig::parse(text).unwrap().display.qcom_ui_boost);
+        }
+        for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../devices")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|s| s == "toml") {
+                let cfg = DeviceConfig::load(&path).unwrap();
+                assert_eq!(cfg.display.qcom_ui_boost, cfg.device.codename == "wayne", "{}", path.display());
             }
         }
     }
@@ -988,6 +1060,43 @@ mod tests {
     }
 
     #[test]
+    fn jason_starts_the_installed_android_13_and_14_key_service_chains() {
+        let config = DeviceConfig::parse(include_str!("../../../devices/jason.toml")).unwrap();
+        let selected = |sdk: &str| {
+            let props = HashMap::from([("ro.build.version.sdk".into(), sdk.into())]);
+            config.services.iter().filter(|s| s.runs_on(&props)).collect::<Vec<_>>()
+        };
+        assert!(config.recovery.legacy_rpmb_compat);
+        assert_eq!(config.partitions.mounted, ["persist"]);
+        for (sdk, directory) in [
+            ("33", "/system_root/system/bin/hwservicemanager"),
+            ("34", "/system_root/system/system_ext/bin/hwservicemanager"),
+        ] {
+            let services = selected(sdk);
+            assert_eq!(services.len(), 6, "SDK{sdk}");
+            assert_eq!(services[0].path, "/system/bin/sh");
+            assert!(services[0].oneshot);
+            assert!(services[0].args[1].contains("/dev/mmcblk0rpmb"));
+            assert!(services[0].args[1].contains("ln -s /dev/mmcblk0rpmb /dev/block/mmcblk0rpmb"));
+            assert_eq!(services[1].path, "/system_root/system/bin/logd");
+            assert_eq!(services[2].path, directory);
+            assert_eq!(services[2].loader.as_deref(), Some("/apex/com.android.runtime/bin/linker64"));
+            assert_eq!(services[3].path, "/system/bin/sh");
+            assert!(services[3].args[1].contains("LD_PRELOAD=/skyward/liblegacy-rpmb-compat.so"));
+            if sdk == "33" {
+                assert!(services[3].args[1].contains("/apex/com.android.vndk.current/lib64"));
+            }
+            assert_eq!(services[3].ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+            assert_eq!(services[4].path, "/vendor/bin/hw/android.hardware.keymaster@3.0-service");
+            assert_eq!(services[4].user.as_deref(), Some("nobody"));
+            assert_eq!(services[4].groups, ["drmrpc"]);
+            assert_eq!(services[5].path, "/vendor/bin/hw/android.hardware.gatekeeper@1.0-service");
+        }
+        assert_eq!(selected("35").len(), 4);
+        assert!(selected("29").is_empty());
+    }
+
+    #[test]
     fn legacy_fbe_can_be_selected_without_overriding_the_boot_version() {
         let jason = DeviceConfig::parse(include_str!("../../../devices/jason.toml")).unwrap();
         assert!(jason.recovery.uses_legacy_fbe());
@@ -1007,8 +1116,6 @@ mod tests {
         assert!(!Recovery::default().legacy_fbe_auto);
         for text in [
             include_str!("../../../devices/diting.toml"),
-            include_str!("../../../devices/wayne.toml"),
-            include_str!("../../../devices/jason.toml"),
             include_str!("../../../devices/ishtar.toml"),
             "[device]\ncodename = 'test'\n",
         ] {
@@ -1016,6 +1123,13 @@ mod tests {
         }
         let polaris = DeviceConfig::parse(include_str!("../../../devices/polaris.toml")).unwrap();
         assert!(polaris.recovery.legacy_fbe_auto);
+        let jason = DeviceConfig::parse(include_str!("../../../devices/jason.toml")).unwrap();
+        assert!(jason.recovery.legacy_fbe_auto);
+        let wayne = DeviceConfig::parse(include_str!("../../../devices/wayne.toml")).unwrap();
+        assert!(wayne.recovery.legacy_fbe_auto);
+        assert!(wayne.recovery.manual_key_services && wayne.recovery.legacy_rpmb_compat);
+        assert!(!Recovery::default().legacy_rpmb_compat);
+        assert!(!polaris.recovery.legacy_rpmb_compat);
         for text in [
             "[device]\ncodename='test'\n[recovery]\nlegacy_fbe_auto=true\n",
             "[device]\ncodename='test'\nab=false\n[recovery]\nlegacy_fbe_auto=true\n",
@@ -1024,6 +1138,26 @@ mod tests {
         }
         let opt_in = DeviceConfig::parse("[device]\ncodename='test'\nab=false\n[recovery]\nlegacy_fbe=true\nlegacy_fbe_auto=true\n").unwrap();
         assert!(opt_in.recovery.legacy_fbe_auto);
+    }
+
+    #[test]
+    fn cryptfs_fde_is_opt_in_and_api28_listeners_precede_keymaster() {
+        assert!(!Recovery::default().legacy_fde);
+        assert!(DeviceConfig::parse("[device]\ncodename='test'\n[recovery]\nlegacy_fde=true\n").is_err());
+        for text in [include_str!("../../../devices/polaris.toml"), include_str!("../../../devices/wayne.toml"), include_str!("../../../devices/diting.toml")] {
+            assert!(!DeviceConfig::parse(text).unwrap().recovery.legacy_fde);
+        }
+        let jason = DeviceConfig::parse(include_str!("../../../devices/jason.toml")).unwrap();
+        assert!(jason.recovery.legacy_fde);
+        let props = HashMap::from([("ro.build.version.sdk".into(), "28".into())]);
+        let selected: Vec<_> = jason.services.iter().filter(|s| s.runs_on(&props)).collect();
+        assert_eq!(selected.len(), 3);
+        assert!(selected[0].path.ends_with("/qseecomd"));
+        assert_eq!(selected[0].ready_property.as_deref(), Some("vendor.sys.listeners.registered"));
+        assert_eq!(selected[0].preload, ["/skyward/liblegacy-rpmb-compat.so"]);
+        assert!(selected[2].path.contains("keymaster"));
+        assert!(selected.iter().all(|s| s.loader.is_none() && s.interpreter.as_deref() == Some("/system_root/bin/linker64")));
+        assert!(selected.iter().all(|s| s.uses(Path::new("/system_root"))));
     }
 
     #[test]
@@ -1051,6 +1185,10 @@ mod tests {
         assert_eq!(config.recovery.apex_loop_context.as_deref(), Some("u:r:su:s0"));
         assert_eq!(config.partitions.mounted, ["cust"]);
         assert!(config.fstab.iter().any(|e| e.mount_point == "/cust" && e.filesystem == "erofs"));
+        let cust_ext4 = config.fstab.iter().find(|e| e.mount_point == "/cust" && e.filesystem == "ext4").unwrap();
+        assert!(cust_ext4.options.split(',').any(|option| option == "ro"));
+        assert!(!cust_ext4.options.split(',').any(|option| option.starts_with("data=")),
+            "HydrogenOS cust has no journal; a forced journal mode prevents all key services from starting");
         assert!(config.services.iter().any(|service| service.ready_hardware_service.as_deref()
             == Some("android.hardware.keymaster@3.0::IKeymasterDevice/default")));
         let vendor = config.fstab.iter().find(|e| e.mount_point == "/vendor").unwrap();

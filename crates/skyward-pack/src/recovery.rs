@@ -138,7 +138,13 @@ pub fn install_adbd(rd: &mut Ramdisk, binary: Vec<u8>) -> Result<String> {
 }
 
 fn validate_static_adbd(data: &[u8]) -> Result<()> {
-    let invalid = || anyhow::anyhow!("--adbd ELF is truncated or overflows");
+    validate_static_program(data, "--adbd")
+}
+
+/// Shared structural check for imported tools that must survive unmounting
+/// system and vendor. It validates ELF layout, not program semantics.
+pub(crate) fn validate_static_program(data: &[u8], option: &str) -> Result<()> {
+    let invalid = || anyhow::anyhow!("{option} ELF is truncated or overflows");
     let u16_at = |at: usize| -> Result<u16> {
         Ok(u16::from_le_bytes(data.get(at..at + 2).ok_or_else(invalid)?.try_into()?))
     };
@@ -148,45 +154,45 @@ fn validate_static_adbd(data: &[u8]) -> Result<()> {
     let u64_at = |at: usize| -> Result<u64> {
         Ok(u64::from_le_bytes(data.get(at..at + 8).ok_or_else(invalid)?.try_into()?))
     };
-    anyhow::ensure!(data.len() >= 64 && &data[..4] == b"\x7fELF", "--adbd requires an ELF64 executable");
+    anyhow::ensure!(data.len() >= 64 && &data[..4] == b"\x7fELF", "{option} requires an ELF64 executable");
     anyhow::ensure!(data[4] == ELFCLASS64 && data[5] == ELFDATA2LSB && data[6] == 1 && u32_at(20)? == 1,
-        "--adbd requires a little-endian ELF64 version 1");
+        "{option} requires a little-endian ELF64 version 1");
     anyhow::ensure!(matches!(u16_at(16)?, ET_EXEC | ET_DYN) && u16_at(18)? == EM_AARCH64 && u16_at(52)? == 64,
-        "--adbd requires an AArch64 ET_EXEC or static PIE executable");
+        "{option} requires an AArch64 ET_EXEC or static PIE executable");
     let phoff = usize::try_from(u64_at(32)?)?;
     let size = usize::from(u16_at(54)?);
     let count = usize::from(u16_at(56)?);
-    anyhow::ensure!(phoff >= 64 && size == 56 && count > 0 && count < 0xffff, "--adbd invalid program-header table");
+    anyhow::ensure!(phoff >= 64 && size == 56 && count > 0 && count < 0xffff, "{option} invalid program-header table");
     let end = phoff.checked_add(size.checked_mul(count).ok_or_else(invalid)?).ok_or_else(invalid)?;
-    anyhow::ensure!(end <= data.len(), "--adbd program headers are outside the file");
+    anyhow::ensure!(end <= data.len(), "{option} program headers are outside the file");
     let entry = u64_at(24)?;
     let mut executable_entry = false;
     for at in (phoff..end).step_by(size) {
         let kind = u32_at(at)?;
-        anyhow::ensure!(kind != PT_INTERP, "--adbd has PT_INTERP; a static executable is required");
+        anyhow::ensure!(kind != PT_INTERP, "{option} has PT_INTERP; a static executable is required");
         let offset = usize::try_from(u64_at(at + 8)?)?;
         let filesz = usize::try_from(u64_at(at + 32)?)?;
         let file_end = offset.checked_add(filesz).ok_or_else(invalid)?;
-        anyhow::ensure!(file_end <= data.len(), "--adbd segment is outside the file");
+        anyhow::ensure!(file_end <= data.len(), "{option} segment is outside the file");
         if kind == 1 {
             let start = u64_at(at + 16)?;
             let limit = start.checked_add(filesz as u64).ok_or_else(invalid)?;
-            anyhow::ensure!(u64_at(at + 40)? >= filesz as u64, "--adbd PT_LOAD memory size is too small");
+            anyhow::ensure!(u64_at(at + 40)? >= filesz as u64, "{option} PT_LOAD memory size is too small");
             executable_entry |= u32_at(at + 4)? & 1 != 0 && entry >= start && entry < limit;
         }
         if kind == 2 {
-            anyhow::ensure!(filesz >= 16 && filesz % 16 == 0, "--adbd invalid PT_DYNAMIC size");
+            anyhow::ensure!(filesz >= 16 && filesz % 16 == 0, "{option} invalid PT_DYNAMIC size");
             let mut terminated = false;
             for item in (offset..file_end).step_by(16) {
                 let tag = u64_at(item)?;
                 if tag == 0 { terminated = true; break; }
                 anyhow::ensure!(!matches!(tag, 1 | 0x7fff_fffd | 0x7fff_ffff),
-                    "--adbd has DT_NEEDED/DT_AUXILIARY/DT_FILTER shared-library dependencies");
+                    "{option} has DT_NEEDED/DT_AUXILIARY/DT_FILTER shared-library dependencies");
             }
-            anyhow::ensure!(terminated, "--adbd unterminated PT_DYNAMIC");
+            anyhow::ensure!(terminated, "{option} unterminated PT_DYNAMIC");
         }
     }
-    anyhow::ensure!(entry != 0 && executable_entry, "--adbd entry point is not in a file-backed executable PT_LOAD");
+    anyhow::ensure!(entry != 0 && executable_entry, "{option} entry point is not in a file-backed executable PT_LOAD");
     Ok(())
 }
 

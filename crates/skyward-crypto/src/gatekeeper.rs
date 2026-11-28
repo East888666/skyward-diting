@@ -144,9 +144,23 @@ impl<'a> Gatekeeper<'a> {
     pub fn open(binder: &'a skyward_binder::driver::Binder, hardware: &'a skyward_binder::driver::Binder) -> Result<Gatekeeper<'a>> {
         use skyward_binder::{hidl, service};
         let not_running = |name: &str| format!("{name} is not running; the phone's credential service has to be started first");
-        if service::declared(binder, SERVICE)? {
-            let device = service::find(binder, SERVICE)?.with_context(|| not_running(SERVICE))?;
-            return Ok(Gatekeeper::Newer(device));
+        match service::declared(binder, SERVICE) {
+            Ok(true) => {
+                let device = service::find(binder, SERVICE)?.with_context(|| not_running(SERVICE))?;
+                return Ok(Gatekeeper::Newer(device));
+            }
+            Ok(false) => {}
+            // Some legacy service directories return an error for this
+            // optional AIDL query even though the phone's HIDL service is
+            // running. A failed declaration probe says nothing about the
+            // credential; try the independently registered HIDL service.
+            Err(aidl_error) => {
+                return match hidl::find(hardware, HARDWARE_SERVICE, INSTANCE) {
+                    Ok(Some(device)) => Ok(Gatekeeper::Older(device)),
+                    Ok(None) => Err(aidl_error.context(format!("{HARDWARE_SERVICE} is not running either"))),
+                    Err(hidl_error) => Err(aidl_error.context(format!("could not check the HIDL service either: {hidl_error:#}"))),
+                };
+            }
         }
         let device = hidl::find(hardware, HARDWARE_SERVICE, INSTANCE)?.with_context(|| not_running(HARDWARE_SERVICE))?;
         Ok(Gatekeeper::Older(device))

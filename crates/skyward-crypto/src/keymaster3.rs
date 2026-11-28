@@ -1,5 +1,5 @@
 //! Android Keymaster 3.0 HIDL, for vendor images predating AIDL KeyMint.
-//! Only authenticated AES-GCM decryption is exposed. No key generation,
+//! Authenticated AES-GCM and legacy cryptfs RSA derivation. No key generation,
 //! deletion, disk upgrade, credential enrolment or property override occurs.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
@@ -55,6 +55,15 @@ fn authenticated_parameters(call: &mut Message, app_id: Option<&[u8]>, nonce: Op
     call.structures(&raw, PARAM_BYTES, &children)
 }
 
+fn cryptfs_parameters(call: &mut Message) -> Result<()> {
+    let mut raw = [0u8; 2 * PARAM_BYTES];
+    raw[..4].copy_from_slice(&0x20000005u32.to_le_bytes()); // DIGEST
+    // Digest::NONE = 0
+    raw[PARAM_BYTES..PARAM_BYTES + 4].copy_from_slice(&0x20000006u32.to_le_bytes());
+    raw[PARAM_BYTES + 8..PARAM_BYTES + 16].copy_from_slice(&1u64.to_le_bytes()); // PaddingMode::NONE
+    call.structures(&raw, PARAM_BYTES, &[(16, &[]), (PARAM_BYTES + 16, &[])])
+}
+
 fn upgrade_parameters(call: &mut Message, app_id: &[u8]) -> Result<()> {
     if app_id.is_empty() { return call.structures(&[], PARAM_BYTES, &[]); }
     let mut raw = [0u8; PARAM_BYTES];
@@ -92,6 +101,73 @@ impl<'a> Keymaster3<'a> {
     pub fn open(binder: &'a skyward_binder::driver::Binder) -> Result<Self> {
         let device = skyward_binder::hidl::find(binder, INTERFACE, "default")?.context("Keymaster 3 is not registered")?;
         Ok(Self { device })
+    }
+
+    /// Deterministic RSA-2048 operation used by Android cryptfs KDF 5.
+    /// The footer and any upgraded blob stay in memory; no enrolment occurs.
+    pub fn cryptfs_sign(&self, blob: &[u8], input: &[u8; 256]) -> Result<Vec<u8>> {
+        let begin = |blob: &[u8]| -> Result<u64> {
+            let mut call = Message::call(INTERFACE);
+            call.u32(2); // KeyPurpose::SIGN
+            call.bytes(blob);
+            cryptfs_parameters(&mut call)?;
+            let reply = self.device.transact(BEGIN, &call).context("Keymaster 3 begin cryptfs RSA")?;
+            let mut read = Answer::new(reply.bytes());
+            status(&mut read).context("cryptfs RSA begin")?;
+            output_parameters(&mut read)?;
+            read.u64()
+        };
+        let handle = match begin(blob) {
+            Ok(handle) => handle,
+            Err(error) if skyward_binder::status::refused_with(&error) == Some(-62) => {
+                let mut call = Message::call(INTERFACE);
+                call.bytes(blob);
+                upgrade_parameters(&mut call, &[])?;
+                let reply = self.device.transact(8, &call).context("Keymaster 3 in-memory cryptfs key upgrade")?;
+                let mut read = Answer::new(reply.bytes());
+                status(&mut read).context("cryptfs RSA later operation")?;
+                begin(read.bytes()?)?
+            }
+            Err(error) => return Err(error),
+        };
+        let result = (|| {
+            // Match cryptfs' update + finish sequence, including KM1-backed
+            // vendor HALs whose finish cannot consume additional input.
+            let mut consumed = 0usize;
+            let mut signature = Vec::new();
+            while consumed < input.len() {
+                let mut call = Message::call(INTERFACE);
+                call.u64(handle);
+                parameters(&mut call, None, None)?;
+                call.bytes(&input[consumed..]);
+                let reply = self.device.transact(UPDATE, &call).context("Keymaster 3 update cryptfs RSA")?;
+                let mut read = Answer::new(reply.bytes());
+                status(&mut read).context("cryptfs RSA update")?;
+                let count = u32::try_from(read.i32()?).context("negative RSA consumed byte count")? as usize;
+                ensure!(count > 0 && count <= input.len() - consumed, "invalid RSA consumed byte count");
+                output_parameters(&mut read)?;
+                signature.extend_from_slice(read.bytes()?);
+                consumed += count;
+            }
+            let mut call = Message::call(INTERFACE);
+            call.u64(handle);
+            parameters(&mut call, None, None)?;
+            call.bytes(&[]);
+            call.bytes(&[]);
+            let reply = self.device.transact(FINISH, &call).context("Keymaster 3 finish cryptfs RSA")?;
+            let mut read = Answer::new(reply.bytes());
+            status(&mut read).context("cryptfs RSA finish")?;
+            output_parameters(&mut read)?;
+            signature.extend_from_slice(read.bytes()?);
+            ensure!(signature.len() == 256, "cryptfs RSA signature is not 2048 bits");
+            Ok(signature)
+        })();
+        if result.is_err() {
+            let mut call = Message::call(INTERFACE);
+            call.u64(handle);
+            let _ = self.device.transact(ABORT, &call);
+        }
+        result
     }
 
     fn begin(&self, blob: &[u8], app_id: &[u8], nonce: &[u8], token: Option<&[u8]>) -> Result<u64> {
@@ -207,6 +283,21 @@ mod tests {
         assert_eq!(u64::from_le_bytes(bytes[72..80].try_into().unwrap()), 128);
         assert_eq!(u32::from_le_bytes(bytes[120..124].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(bytes[152..156].try_into().unwrap()), 12);
+    }
+
+    #[test]
+    fn cryptfs_rsa_parameters_are_separate_from_aes_gcm() {
+        let mut call = Message::default();
+        cryptfs_parameters(&mut call).unwrap();
+        let raw = &call.values()[call.addresses()[1] as usize..];
+        let at = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        let len = u64::from_le_bytes(raw[16..24].try_into().unwrap()) as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, len) };
+        assert_eq!(len, 2 * PARAM_BYTES);
+        assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 0x20000005);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 0x20000006);
+        assert_eq!(u64::from_le_bytes(bytes[40..48].try_into().unwrap()), 1);
     }
 
     #[test]

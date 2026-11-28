@@ -176,6 +176,55 @@ pub fn shared_storage() -> PathBuf {
     if owner.is_dir() { owner } else { PathBuf::from(SHARED_STORAGE) }
 }
 
+/// Opt-in Qualcomm cryptfs FDE. Authenticate before enabling ICE; the
+/// bounded linear view never exposes the footer to a filesystem or fsck.
+pub fn open_legacy_fde(operation: &crate::fde::Operation) -> Result<Option<Opening>> {
+    use crate::{fde, keymaster3::Keymaster3};
+    use std::os::unix::fs::MetadataExt;
+    if fde::active() {
+        if mount::is_mount_point(Path::new(MOUNT))? {
+            anyhow::ensure!(dm::status(MAPPED)?.is_some(), "active cryptfs mount has lost its bounded device");
+            show_owner_storage()?;
+            return Ok(Some(Opening { mounted: None, closed: Vec::new() }));
+        }
+        close_locked(operation)?;
+    }
+    let entries = table()?;
+    let entry = entries.iter().find(|e| e.filesystem == "ext4").context("cryptfs needs an ext4 data entry")?;
+    let device = PathBuf::from(skyward_block::fstab::device(entry)?);
+    let Some(footer) = fde::read_footer(&device)? else { return Ok(None); };
+    anyhow::ensure!(!mount::is_mount_point(Path::new(MOUNT))? && dm::status(MAPPED)?.is_none(), "data is already open");
+    let binder = Binder::hardware()?;
+    let service = Keymaster3::open(&binder)?;
+    let derived = footer.derive_default(|blob, input| service.cryptfs_sign(blob, input))?;
+    anyhow::ensure!(footer.verify(&derived)?, "cryptfs intermediate-key verification failed");
+    let activation = fde::activate(&device, &derived, operation)?;
+    let dev = std::fs::metadata(&device)?.rdev();
+    let target = dm::Target::Linear { sectors: footer.sectors, device: (libc::major(dev) as u32, libc::minor(dev) as u32), offset: 0 };
+    let mapped = dm::create(MAPPED, &[target], false)?;
+    let result = (|| -> Result<Opening> {
+        mount::prepare(Path::new(MOUNT))?;
+        // Confirm ordinary directories while replay and writes are off.
+        mount::mount(&mapped, Path::new(MOUNT), "ext4", &["ro".into(), "noload".into(), "nosuid".into(), "nodev".into()])?;
+        let media = std::fs::read_dir(SHARED_STORAGE).context("read cryptfs media directory")?;
+        for item in media { item.context("read cryptfs media entry")?; }
+        mount::umount(Path::new(MOUNT))?;
+        // Ordinary ext4 I/O is now encrypted in both directions. A full
+        // mount, not a noload remount, lets ext4 replay its own journal.
+        let options: Vec<_> = entry.options.iter().filter(|o| !matches!(o.as_str(), "inlinecrypt" | "ro" | "noload")).cloned().collect();
+        mount::mount(&mapped, Path::new(MOUNT), "ext4", &options)?;
+        show_owner_storage()?;
+        Ok(Opening { mounted: Some(Opened { mapped: mapped.clone(), filesystem: "ext4".into(), checked: None }), closed: Vec::new() })
+    })();
+    match result {
+        Ok(opening) => { activation.commit(); Ok(Some(opening)) },
+        Err(error) => {
+            close_locked(operation).with_context(|| format!("close cryptfs after failed opening: {error:#}"))?;
+            Err(error)
+        },
+    }
+}
+
 /// Open direct-mounted FBE with Keymaster 3. The installed mode selects
 /// the v1 session keyring or the v2 filesystem keyring independently of
 /// the vendor HAL version.
@@ -517,6 +566,11 @@ fn ensure_plain(_dir: &Path) -> Result<()> {
 /// Close what opening the partition opened, where the recovery opened it:
 /// /sdcard, the partition's mount, and the device it is read through.
 pub fn close() -> Result<()> {
+    let operation = crate::fde::lock()?;
+    close_locked(&operation)
+}
+
+fn close_locked(operation: &crate::fde::Operation) -> Result<()> {
     for at in [SDCARD, MOUNT] {
         if mount::is_mount_point(Path::new(at))? {
             mount::umount(Path::new(at))?;
@@ -525,6 +579,7 @@ pub fn close() -> Result<()> {
     if dm::status(MAPPED)?.is_some() {
         dm::remove(MAPPED)?;
     }
+    crate::fde::deactivate(operation)?;
     Ok(())
 }
 

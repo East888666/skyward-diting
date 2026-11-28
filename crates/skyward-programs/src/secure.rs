@@ -404,7 +404,7 @@ fn started(phone: &Phone, program: &Program, ready: Ready, registers: Vec<String
         Ready::Service(name) => (None, Some(name), None),
         Ready::HardwareService(name) => (None, None, Some(name)),
     };
-    let service = Service { loader: None, description: None,
+    let service = Service { loader: None, interpreter: None, preload: Vec::new(), description: None,
         path: phone.started_from(&program.path),
         args: program.args.clone(),
         libraries: libraries_of(&program.path, phone.bundle.as_deref()),

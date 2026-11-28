@@ -4,6 +4,8 @@
 #
 # Requires this tree's non-A/B implementation (not just a TOML copy into
 # an unmodified upstream checkout). See polaris-notes.md for validation.
+# HydrogenOS preflight needs awk, absent from this stock Toybox. The matching
+# packer embeds it; recovery.awk below includes it without a separate build.
 # For the 64 MiB recovery partition, use --no-default-features and the
 # subset font described there; the full-font image exceeds this capacity.
 # Freshly formatted data also requires the plain-filesystem initialization
@@ -12,7 +14,8 @@
 # replay before inspecting directories, then mount with normal fstab
 # options. Writing through rw,norecovery was observed after legacy unlock.
 # SmartisanOS 8.5.3 / Android 11 was verified with the patched 4.19 kernel.
-# Current profile targets AviumUI 16.2.1 / Android 16.
+# Current profile retains Axion 2.8's Android 16 / 2026-07 boot header.
+# HydrogenOS A11 was also unlocked with this header after fixing cust mount.
 # Requires tools/polaris-419-legacy-ice.patch in the kernel and
 # CONFIG_QTI_CRYPTO_TZ_LEGACY_ICE=y; TOML alone does not fix the stock kernel.
 # Use target/stock/polaris/recovery-419-legacyice-base.img as --stock.
@@ -36,6 +39,8 @@ soc = { hans = "骁龙®845移动平台", hant = "Snapdragon® 845 行動平台"
 os_version_prop = "ro.build.version.incremental"
 
 [recovery]
+# Include the crate's bundled static AWK for ROM install scripts.
+awk = true
 # No userspace fastboot on the supplied fixed-partition layout. Keep bootloader fastboot.
 # Requires the matching packer/runtime; omitted on other devices means enabled.
 fastbootd = false
@@ -58,23 +63,24 @@ capture_stdio = true
 # opened by recovery. Open APEX backing files in the existing su domain;
 # keep the UI and other services in their original domains.
 apex_loop_context = "u:r:su:s0"
-# Match the inspected AviumUI 16.2.1 boot header: Android 16 / 2026-04.
+# Match the inspected Axion 2.8 boot header: Android 16 / 2026-07.
 # The packer sets BOTH the legacy header and properties; changing a RAM
 # config cannot repair a session booted with the old Android 12 header.
 # Previously tested Smartisan-only header: 12.0.0 / 2022-09-05.
-# Axion's different 16.0.0 / 2026-07-01 header remains unverified here.
+# AviumUI 16.2.1 was verified separately with 16.0.0 / 2026-04-01.
+# Changing ROMs does not automatically update this packed header; see notes.
 # Keep header/properties consistent. Old blobs may use Keymaster's existing
 # in-memory upgrade; no key or version marker is rewritten on disk.
 # One-header Smartisan compatibility is not yet device-verified.
 legacy_fbe_auto = true
-legacy_version = { release = "16.0.0", security_patch = "2026-04-01" }
+legacy_version = { release = "16.0.0", security_patch = "2026-07-01" }
 
 [firmware]
 partition = "modem"
 
 [partitions]
 # Axion 2.8 reuses cust for its EROFS system_ext image. Keep the physical
-# partition mounted at /cust, with the ext4 layout retained as a fallback.
+# partition mounted at /cust, with journal-less HydrogenOS ext4 as a fallback.
 mounted = ["cust"]
 
 # Axion's /system/bin/hwservicemanager is an absolute symlink into
@@ -238,7 +244,10 @@ extras = "wait"
 device = "/dev/block/bootdevice/by-name/cust"
 mount_point = "/cust"
 filesystem = "ext4"
-options = "ro,nosuid,nodev,barrier=1,data=ordered"
+# HydrogenOS carries ext4 without a journal here. Forcing data=ordered
+# rejects that filesystem and aborts bring_up before any key service starts.
+# Let ext4 select its own journal mode; keep Axion's EROFS fallback above.
+options = "ro,nosuid,nodev,barrier=1"
 extras = "wait,check"
 
 [[fstab]]

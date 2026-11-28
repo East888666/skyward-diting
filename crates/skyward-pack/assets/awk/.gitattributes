@@ -1,0 +1,4 @@
+awk-aarch64-linux-android binary
+LICENSE text eol=lf
+VERSION text eol=lf
+README.md text eol=lf

@@ -1433,6 +1433,13 @@ pub fn run(
     start: Screen,
     dump: Option<&Path>,
 ) -> Result<()> {
+    if cfg.display.qcom_ui_boost {
+        match skyward_sys::cpu::prefer_big_for_ui() {
+            Ok(true) => skyward_sys::kmsg("UI scheduler prefers high-capacity cores; CPU affinity and thermal limits unchanged")?,
+            Ok(false) => skyward_sys::kmsg("UI scheduler preference unchanged: interface absent or already configured")?,
+            Err(e) => skyward_sys::kmsg(&format!("UI scheduler preference unavailable: {e:#}"))?,
+        }
+    }
     let mut pages = Pages::open(cfg, programs, font, mono, request, start, dump)?;
     pages.begin()?;
     // The phone sleeps while its screen is off and nothing needs it awake.

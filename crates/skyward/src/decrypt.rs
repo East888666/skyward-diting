@@ -81,9 +81,24 @@ pub fn unlock_data(closed: &[Closed], user: u32, credential: &[u8]) -> Result<Ve
 /// Plain legacy data needs no AIDL service. Preserve both failure reasons
 /// when the configured encryption requires hardware this recovery lacks.
 pub fn open_data() -> Result<Opening, String> {
+    let config = skyward_config::DeviceConfig::load("/skyward/device.toml");
+    let operation = if config.as_ref().is_ok_and(|cfg| cfg.recovery.legacy_fde) {
+        Some(skyward_crypto::fde::lock().map_err(|e| format!("{e:#}"))?)
+    } else { None };
+    if let Some(operation) = &operation && skyward_crypto::fde::active() {
+        return data::open_legacy_fde(operation).and_then(|opening| opening.ok_or_else(|| anyhow::anyhow!("active cryptfs has no footer")))
+            .map_err(|e| format!("{e:#}"));
+    }
     match data::open_without_keys() {
         Ok(opening) => Ok(opening),
         Err(plain) => {
+            if let Some(operation) = &operation {
+                match data::open_legacy_fde(operation) {
+                    Ok(Some(opening)) => return Ok(opening),
+                    Ok(None) => {},
+                    Err(error) => return Err(format!("legacy FDE: {error:#}")),
+                }
+            }
             // A damaged/unreplayed filesystem is not evidence that a key
             // service should be tried. Its later missing-key error would
             // obscure the directory I/O failure that actually needs fixing.

@@ -10,6 +10,8 @@ mod avb;
 mod recovery;
 mod fastboot;
 mod described;
+mod awk;
+mod rpmb;
 
 use skyward_bootimg::{BootImage, Format, Ramdisk};
 
@@ -71,6 +73,10 @@ enum Cmd {
         /// without an NTFS driver; includes its licence and source.
         #[arg(long)]
         ntfs3g: Option<PathBuf>,
+        /// Override the bundled AWK with a static arm64 bundle (awk, LICENSE,
+        /// VERSION). Without this option, recovery.awk selects the bundled tool.
+        #[arg(long)]
+        awk: Option<PathBuf>,
         /// A local static AArch64 shell to install as /system/bin/sh when
         /// stock recovery has no usable shell. No binary is downloaded.
         #[arg(long)]
@@ -153,7 +159,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, ntfs3g, shell, adbd, adb_key, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, partition_size: capacity, binary, system_init, ntfs3g, awk, shell, adbd, adb_key, config, font, mono, mono_license, out } => {
             let mut img = BootImage::read(&stock)?;
             let size = match partition_size(&stock) {
                 Ok(size) => Some(size),
@@ -197,6 +203,8 @@ fn main() -> Result<()> {
             }
             recovery::install(&mut rd, read(&binary)?)?;
             recovery::install_shell(&mut rd, shell.map(|path| read(&path)).transpose()?)?;
+            awk::install_selected(&mut rd, cfg.recovery.awk, awk.as_deref())?;
+            rpmb::install_selected(&mut rd, cfg.recovery.legacy_rpmb_compat)?;
             if let Some(path) = adbd {
                 let data = read(&path)?;
                 let digest = Sha256::digest(&data);

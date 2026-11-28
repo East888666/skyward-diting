@@ -1,3 +1,4 @@
+pub mod fde;
 pub mod encryption;
 pub mod fscrypt;
 pub mod gatekeeper;

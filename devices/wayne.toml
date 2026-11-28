@@ -1,21 +1,11 @@
-# Xiaomi MI 6X / wayne. Reference layout: devices/polaris.toml.
-# Checked against wayne/{boot,recovery,vendor}.img, MIUI V12.0.2.0.PDCCNXM.
-# See wayne-notes.md for evidence, build requirements and remaining blockers.
-# The packer detects the supplied /sbin/recovery layout automatically.
-# Use the matching current source for legacy FBE password unlock.
-# LOS 18.1/API30 services below were read from the connected device.
-# Original MIUI FDE remains a separate unsupported encryption layout.
-# LOS 18.1 password unlock was verified with its own 4.4 boot kernel.
-# Combine that kernel with the recovery ramdisk before packing; see notes.
-# Stock Melon 4.19 still needs separate RPMB and kernel ICE compatibility.
-# The experimental source patch is tools/wayne-419-legacy-ice.patch; it has
-# not been compiled or verified for full unlock. See tools/wayne-melon419/.
-
-# Recovery capacity verified with blockdev: 64 MiB (67,108,864 bytes).
-# Pass --partition-size 67108864 to skyward-pack recovery; this is a build-time
-# capacity check, not a TOML key or a requirement to pad the output image.
-# The current local recovery.img has a newer /system/etc/init/hw/init.rc layout;
-# the MIUI image observations below describe the original baseline only.
+# Xiaomi MI 6X / wayne. Unified patched Lineage 4.19 recovery profile.
+# LOS 18.1 password unlock, original files and touch verified on 2026-11-28.
+# Requires the Wayne 4.19.325 kernel with legacy SDM660 eMMC ICE/PFK support.
+# A configuration change alone does not fix the original Melon 4.19 kernel.
+# Keep the device's own recovery ramdisk; do not use Jason's kernel or DTB.
+# Haptics and sleep/wake have not been separately revalidated.
+# Recovery capacity: 64 MiB; pass --partition-size 67108864 when packing.
+# See devices/wayne-notes.md for build inputs and the earlier 4.4 baseline.
 
 [device]
 codename = "wayne"
@@ -29,6 +19,12 @@ os_version_prop = "ro.build.version.incremental"
 # No logd in the supplied ramdisk. Keep process output in RAM:
 # /skyward/run/recovery.log; export it before rebooting.
 capture_stdio = true
+# Keep the inspected LOS 18.1 service accounts, loaders and startup order.
+manual_key_services = true
+# Authenticate the DE key layout before selecting legacy inlinecrypt.
+legacy_fbe_auto = true
+# Bundle the RPMB adapter; only qseecomd explicitly preloads it below.
+legacy_rpmb_compat = true
 # Stock executables are static; there is no system/etc/ld.config.txt.
 # Polaris's ramdisk library flags do not apply to this recovery.
 # Direct-mounted LOS FBE uses vendor Keymaster 3, not AIDL KeyMint.
@@ -37,8 +33,8 @@ legacy_fbe = true
 # Match the installed LOS 18.1 boot header and security properties.
 # The supplied recovery header is Android 13 / 2023-02; Keymaster returned
 # configure -38 when launched with the installed Android 11 properties.
-# Align the packed header and runtime properties. Full password unlock
-# was verified with the installed LOS 18.1 kernel, not the Melon kernel.
+# Align the packed header and runtime properties. Password unlock was
+# verified with the patched Wayne 4.19 kernel; stock Melon is insufficient.
 legacy_version = { release = "11.0.0", security_patch = "2022-10-05" }
 
 [display]
@@ -52,6 +48,10 @@ normal_max_brightness = 4095
 # startup blank/unblank cycle; screen-off/wake still uses the existing path.
 # Requires the matching runtime source; other devices keep their default.
 fbdev_skip_initial_power_cycle = true
+# Patched Wayne 4.19 WALT: prefer big cores only for the UI thread.
+# Advisory mode 2 keeps all CPUs allowed and preserves thermal limits.
+# Missing controls are nonfatal; other devices remain opted out.
+qcom_ui_boost = true
 # CONFIG_FB_MSM_MDSS=y, CONFIG_DRM is unset. The existing fbdev backend
 # is selected automatically; Polaris's KMS workarounds are not enabled.
 
@@ -69,9 +69,9 @@ load = []
 # CONFIG_TOUCHSCREEN_NT36xxx=y and CONFIG_TOUCHSCREEN_NVT_D2S=y;
 # no external touch module or unverified touch sysfs writes are needed.
 
-# Verified LOS 18.1's 4.4 kernel exposes the legacy timed_output driver.
-# The Melon 4.19 kernel instead needs click=0 (FF_PERIODIC), but failed
-# to open these LOS keys even after its RPMB node alias was supplied.
+# The new Lineage 4.19 build enables CONFIG_QPNP_HAPTIC / timed_output.
+# This differs from the original Melon FF_PERIODIC driver.
+# Haptic feedback still requires on-device confirmation with the new kernel.
 [haptics]
 timed_output = "/sys/class/timed_output/vibrator"
 drive = 40
@@ -109,10 +109,9 @@ filesystem = "ext4"
 options = "noatime,nosuid,nodev,barrier=1,data=ordered"
 extras = "wait,check,formattable"
 
-# Stock recovery: encryptable=footer; stock vendor: forceencrypt=footer.
-# MIUI uses FDE, which this FBE path cannot unlock. LOS 18.1 instead
-# stores direct-mounted FBE with mode ice:aes-256-cts:v1. The runtime
-# inspects actual policies/keys and never treats encrypted data as plain.
+# LOS 18.1 uses direct-mounted FBE with mode ice:aes-256-cts:v1.
+# Keep the original fstab marker; runtime inspects actual policies and keys.
+# MIUI FDE has not been validated with this Wayne profile.
 [[fstab]]
 device = "/dev/block/bootdevice/by-name/userdata"
 mount_point = "/data"
@@ -195,7 +194,7 @@ user = "system"
 groups = ["system", "readproc"]
 ready_hardware_service = "android.hidl.manager@1.2::IServiceManager/default"
 
-# The Melon 4.19 kernel exposes RPMB as /dev/mmcblk0rpmb (character
+# The SDM660 4.19 kernel exposes RPMB as /dev/mmcblk0rpmb (character
 # device), while this LOS 18.1 vendor opens the old /dev/block path.
 # Create the alias before qseecomd's first initialization. The matching
 # 4.4 kernel already has the old block device and needs no alias.
@@ -210,6 +209,7 @@ oneshot = true
 [[service]]
 when = { property = "ro.build.version.sdk", value = "30" }
 path = "/vendor/bin/qseecomd"
+preload = ["/skyward/liblegacy-rpmb-compat.so"]
 loader = "/apex/com.android.runtime/bin/linker64"
 libraries = ["/vendor/lib64", "/apex/com.android.runtime/lib64/bionic", "/apex/com.android.vndk.current/lib64", "/system_root/system/lib64"]
 user = "root"

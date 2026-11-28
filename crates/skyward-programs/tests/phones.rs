@@ -68,7 +68,7 @@ const ON_SYSTEM: [&str; 3] = ["/mnt/system/system/lib64/bootstrap", "/mnt/system
 /// of it.
 fn program(path: &str, libraries: &[&str], user: &str, groups: &[&str]) -> Service {
     Service {
-        loader: None, description: None,
+        loader: None, interpreter: None, preload: Vec::new(), description: None,
         path: path.into(),
         args: Vec::new(),
         libraries: strings(libraries),

@@ -24,6 +24,8 @@ mod haptics;
 #[cfg(target_os = "android")]
 mod input;
 #[cfg(any(target_os = "android", test))]
+mod interpreter;
+#[cfg(any(target_os = "android", test))]
 mod install_mounts;
 #[cfg(target_os = "android")]
 mod keys;
@@ -586,6 +588,8 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<k
         Some(slot) => skyward_info::installed_props(slot)?,
         None => skyward_info::legacy_installed_props()?,
     };
+    let legacy_fde = cfg.recovery.legacy_fde && !cfg.device.ab
+        && props.get("ro.build.version.sdk").is_some_and(|sdk| sdk == "28");
     if let Err(e) = adopt_installed_version(&props, cfg.recovery.legacy_version.as_ref()) {
         if slot.is_some() { return Err(e); }
         skyward_sys::kmsg(&format!("installed version not adopted: {e:#}"))?;
@@ -630,6 +634,9 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<k
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
     skyward_sys::binder::prepare()?;
+    if legacy_fde {
+        secure::prepare_legacy_fde()?;
+    }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
@@ -659,7 +666,7 @@ fn bring_up(cfg: &DeviceConfig, slot: Option<skyward_vab::Slot>, found: Result<k
     hardware.dedup();
     secure::prepare_bundles(programs())?;
     if !hardware.is_empty() {
-        secure::prepare_hardware_directory(&hardware)?;
+        secure::prepare_hardware_directory(&hardware, legacy_fde)?;
         skyward_sys::kmsg("the directory for the phone's hardware services can run")?;
     }
     // A program that registers with the service directory needs the

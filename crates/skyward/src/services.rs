@@ -121,6 +121,10 @@ fn readied(program: &Started, libraries: Option<&Path>, known: &HashMap<String, 
     }
     let who = Credentials::of(&s, known)?;
     let given = Given::of(program, known)?;
+    if let Some(loader) = &s.interpreter {
+        ensure!(s.loader.is_none(), "service cannot use both loader and interpreter");
+        s.path = crate::interpreter::stage(&s.path, loader)?.to_string_lossy().into_owned();
+    }
     if who.uid != 0 && carries_capabilities(&s.path)? {
         bring_within_reach(&s)?;
     }
@@ -492,6 +496,9 @@ fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, Own
     }
     if !libraries.is_empty() {
         cmd.env(LIBRARY_PATH, libraries.join(":"));
+    }
+    if !s.preload.is_empty() {
+        cmd.env("LD_PRELOAD", s.preload.join(":"));
     }
     for (variable, socket) in handed {
         cmd.env(variable, socket.as_raw_fd().to_string());

@@ -24,11 +24,48 @@ const BUNDLE_LIBS: &str = "lib64";
 
 // Only bundles opened by this process are ours to release.
 static OPEN_BUNDLES: Mutex<Vec<(PathBuf, Option<PathBuf>)>> = Mutex::new(Vec::new());
+static LEGACY_ALIASES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Only the opt-in API28 FDE profile uses vendor embedded in system. The
+/// cust vendor can belong to a different ROM, so don't load its HAL modules.
+pub fn prepare_legacy_fde() -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    for (path, uid, gid, mode) in [("/dev/qseecom", 1000, 1026, 0o660),
+        ("/dev/ion", 1000, 1000, 0o664), ("/dev/mmcblk0rpmb", 1000, 1000, 0o660)] {
+        std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| format!("set legacy FDE owner of {path}"))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    if !Path::new("/dev/block/mmcblk0rpmb").exists() {
+        std::os::unix::fs::symlink("/dev/mmcblk0rpmb", "/dev/block/mmcblk0rpmb")?;
+    }
+    let from = Path::new("/system_root/vendor/lib64/hw");
+    let to = Path::new("/vendor/lib64/hw");
+    ensure!(from.join("keystore.sdm660.so").is_file(), "API28 FDE vendor has no matching keystore HAL");
+    if fs::canonicalize(from)? != fs::canonicalize(to)? {
+        let mut aliases = LEGACY_ALIASES.lock().expect("legacy aliases poisoned");
+        if !aliases.iter().any(|p| p == to) {
+            let source = fs::metadata(from)?;
+            let target = fs::metadata(to)?;
+            let same = source.dev() == target.dev() && source.ino() == target.ino();
+            if !same {
+                ensure!(!skyward_block::mount::is_mount_point(to)?, "another HAL directory is already mounted over API28 vendor");
+                skyward_block::mount::bind(from, to)?;
+            }
+            aliases.push(to.to_path_buf());
+        }
+    }
+    Ok(())
+}
 
 /// Called only after the services using these libraries have exited.
 /// Drop the filesystem and the loop's backing reference before system is
 /// unmounted. An external holder aborts installation through normal umount.
 pub fn release_bundles() -> Result<()> {
+    let mut aliases = LEGACY_ALIASES.lock().expect("legacy aliases poisoned");
+    while let Some(at) = aliases.last() {
+        skyward_block::mount::umount(at)?;
+        aliases.pop();
+    }
     let mut bundles = OPEN_BUNDLES.lock().expect("bundle list poisoned");
     while let Some((at, device)) = bundles.last() {
         if skyward_block::mount::is_mount_point(at)? {
@@ -105,7 +142,7 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 /// filesystem, does not have.
 ///
 /// `wanted` names the hardware services that will be asked for.
-pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+pub fn prepare_hardware_directory(wanted: &[String], legacy_fde: bool) -> Result<()> {
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
@@ -114,7 +151,11 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     let from = bundle(RUNTIME_BUNDLE)?
         .map(|at| at.join(BUNDLE_LOADER))
         .filter(|p| p.is_file())
-        .with_context(|| format!("the installed system carries no {RUNTIME_BUNDLE}, which holds the loader its own programs ask for"))?;
+        // Android 9 and older have no runtime APEX. Their loader lives
+        // directly on system, alongside the matching bionic libraries.
+        .or_else(|| ["/system_root/system/bin/linker64", "/system_root/bin/linker64", "/mnt/system/system/bin/linker64"]
+            .into_iter().map(PathBuf::from).find(|p| p.is_file()))
+        .context("the installed system carries no runtime loader")?;
     let dir = loader.parent().expect("the loader is in a directory");
     fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
     // Made under the recovery's own umask the folder is root's alone, and
@@ -129,7 +170,7 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // Recent libhidlbase checks these standard executable paths before it
     // talks to a hardware directory, even when that directory is running.
     let hardware_program = Path::new("/system/bin/hwservicemanager");
-    let installed_hardware = ["/mnt/system_ext/bin/hwservicemanager", "/system_root/system/system_ext/bin/hwservicemanager", "/system_root/system/bin/hwservicemanager"].iter().map(Path::new).find(|p| p.is_file());
+    let installed_hardware = ["/mnt/system_ext/bin/hwservicemanager", "/system_root/system/system_ext/bin/hwservicemanager", "/system_root/system/bin/hwservicemanager", "/system_root/bin/hwservicemanager"].iter().map(Path::new).find(|p| p.is_file());
     if let Some(installed_hardware) = installed_hardware.filter(|_| !hardware_program.exists()) {
         std::os::unix::fs::symlink(installed_hardware, hardware_program).context("expose installed hardware service directory")?;
     }
@@ -150,7 +191,9 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // are given the modes the system's own copies have.
     fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    let system = if Path::new("/system_root/system/build.prop").is_file() { "/system_root/system" } else { "/mnt/system/system" };
+    let system = ["/system_root/system", "/system_root", "/mnt/system/system"]
+        .into_iter().find(|root| Path::new(root).join("build.prop").is_file())
+        .context("installed system build.prop is missing")?;
     let hardware_labels = Path::new(system).join("etc/selinux/plat_hwservice_contexts");
     let service_labels = Path::new(system).join("etc/selinux/plat_service_contexts");
     let mut labels = vec![hardware_labels.as_path()];
@@ -159,7 +202,19 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     }
     for from in labels {
         let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
-        fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+        if legacy_fde && from == hardware_labels && !from.exists() {
+            fs::write(&into, concat!(
+                "android.hardware.keymaster::IKeymasterDevice u:object_r:hal_keymaster_hwservice:s0\n",
+                "android.hidl.manager::IServiceManager u:object_r:hidl_manager_hwservice:s0\n",
+                "android.hidl.base::IBase u:object_r:hidl_base_hwservice:s0\n"))?;
+            // init may give recovery umask 0077. Unlike copy(), write()
+            // does not inherit an installed file's readable mode, while
+            // hwservicemanager runs as system rather than root.
+            fs::set_permissions(&into, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+                .with_context(|| format!("let the hardware directory read {}", into.display()))?;
+        } else {
+            fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+        }
     }
     fs::create_dir_all(RECOVERY_DESCRIPTIONS).context("make recovery service description directory")?;
     let manifest_dir = Path::new(RECOVERY_MANIFEST).parent().expect("manifest directory");
@@ -215,7 +270,7 @@ pub fn libraries() -> Result<Option<PathBuf>> {
 /// Open modules explicitly named by the selected services' loader and
 /// library paths, including legacy vendors with no ro.vndk.version.
 pub fn prepare_bundles<'a>(services: impl Iterator<Item = &'a skyward_config::Service>) -> Result<()> {
-    let names: BTreeSet<_> = services.flat_map(|s| s.loader.iter().chain(s.libraries.iter()))
+    let names: BTreeSet<_> = services.flat_map(|s| s.loader.iter().chain(&s.interpreter).chain(&s.preload).chain(&s.libraries))
         .filter_map(|path| crate::bundles::named_by(Path::new(path)))
         .collect();
     for name in names {
